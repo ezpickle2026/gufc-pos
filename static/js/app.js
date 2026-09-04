@@ -62,6 +62,7 @@ const NAV = [
   { id: "customers", label: "Customers", icon: "\u{1F465}", roles: ["ADMIN", "ATTENDANT"] },
   { id: "receivables", label: "Receivables", icon: "\u{1F4B0}", roles: ["ADMIN", "ATTENDANT"] },
   { id: "inventory", label: "Inventory", icon: "\u{1F4E6}", roles: ["ADMIN", "ATTENDANT", "DISPATCHER"] },
+  { id: "inventory_ledger", label: "Inv. Ledger", icon: "\u{1F4D2}", roles: ["ADMIN"] },
   { id: "transfers", label: "Dispatch", icon: "\u{1F69A}", roles: ["ADMIN", "DISPATCHER"] },
   { id: "reports", label: "Reports", icon: "\u{1F4CA}", roles: ["ADMIN"] },
   { id: "users", label: "Users", icon: "\u{1F464}", roles: ["ADMIN"] },
@@ -117,7 +118,7 @@ function render() {
   const views = {
     dashboard: renderDashboard, pos: renderPOS, sales: renderSales,
     customers: renderCustomers, receivables: renderReceivables,
-    inventory: renderInventory, transfers: renderTransfers, reports: renderReports,
+    inventory: renderInventory, inventory_ledger: renderInventoryLedger, transfers: renderTransfers, reports: renderReports,
     users: renderUsers, products: renderProducts, locations: renderLocations,
     audit: renderAudit,
   };
@@ -347,7 +348,8 @@ function printReceipt(result) {
   const html = `
     <div style="max-width:340px;font-family:monospace;font-size:12.5px">
       <div style="text-align:center">
-        <strong style="font-size:15px">GREAT UNLI FOOD CORP.</strong><br>
+        <img src="/images/logo.png" alt="GUFC" style="width:56px;height:56px;object-fit:contain;margin-bottom:4px">
+        <br><strong style="font-size:15px">GREAT UNLI FOOD CORP.</strong><br>
         Solane LPG Distributor<br>${esc(sale.location_name)}<br>
         --------------------------------
       </div>
@@ -379,7 +381,10 @@ async function renderSales(c) {
       <td><span class="badge ${s.sale_type === 'CASH' ? 'green' : 'warn'}">${s.sale_type}</span></td>
       <td>${money(s.total)}</td><td>${money(s.balance)}</td>
       <td><span class="badge ${s.status === 'VOIDED' ? 'danger' : 'blue'}">${s.status}</span></td>
-      <td>${state.user.role === 'ADMIN' && s.status !== 'VOIDED' ? `<button class="btn small danger" onclick="voidSale(${s.id})">Void</button>` : ""}</td>
+      <td style="display:flex;gap:6px">
+        <button class="btn small" onclick="viewSale(${s.id})">View</button>
+        ${state.user.role === 'ADMIN' && s.status !== 'VOIDED' ? `<button class="btn small danger" onclick="voidSale(${s.id})">Void</button>` : ""}
+      </td>
     </tr>`).join("")}
   </tbody></table></div>`;
 }
@@ -387,6 +392,33 @@ window.voidSale = async (id) => {
   if (!confirm("Void this sale? This will reverse the inventory and cannot be undone.")) return;
   try { await api(`/sales/${id}/void`, { method: "POST" }); toast("Sale voided", "success"); renderSales(document.getElementById("content")); }
   catch (e) {}
+};
+window.viewSale = async (id) => {
+  const result = await api(`/sales/${id}`);
+  const { sale, items, payments } = result;
+  openModal(`Sale ${sale.sale_no}`, `
+    <div class="field"><b>Date:</b> ${sale.ts} &nbsp; <b>Location:</b> ${esc(sale.location_name)}</div>
+    <div class="field"><b>Cashier:</b> ${esc(sale.cashier_name)} &nbsp; <b>Customer:</b> ${esc(sale.customer_name || "Walk-in")}</div>
+    <div class="field"><b>Status:</b> <span class="badge ${sale.status === 'VOIDED' ? 'danger' : 'blue'}">${sale.status}</span></div>
+    <div class="table-wrap"><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Subtotal</th></tr></thead><tbody>
+      ${items.map(i => `<tr><td>${esc(i.product_name)}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
+    </tbody></table></div>
+    <div style="margin-top:10px">
+      <div class="cart-total-row"><span>Subtotal</span><span>${money(sale.subtotal)}</span></div>
+      <div class="cart-total-row"><span>Discount</span><span>${money(sale.discount)}</span></div>
+      <div class="cart-total-row grand"><span>Total</span><span>${money(sale.total)}</span></div>
+    </div>
+    <div class="field" style="margin-top:10px"><b>Payments:</b><br>
+      ${payments.length ? payments.map(p => `${esc(p.method)}: ${money(p.amount)} ${p.reference ? '(' + esc(p.reference) + ')' : ''}`).join("<br>") : "None recorded"}
+    </div>
+    <div class="field"><b>Paid:</b> ${money(sale.paid)} &nbsp; <b>Balance:</b> ${money(sale.balance)}</div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()">Close</button>
+      <button class="btn green" id="reprintBtn">Reprint Receipt</button>
+    </div>
+  `, () => {
+    document.getElementById("reprintBtn").addEventListener("click", () => printReceipt(result));
+  });
 };
 
 // ================================================================== CUSTOMERS
@@ -398,11 +430,12 @@ async function renderCustomers(c) {
   async function load(q = "") {
     const list = await api("/customers?q=" + encodeURIComponent(q));
     document.getElementById("custTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>Account #</th><th>Name</th><th>Category</th><th>Phone</th><th>Terms</th><th>Credit Limit</th>
+      <th>Account #</th><th>Name</th><th>Category</th><th>Phone</th><th>Terms</th><th>Credit Limit</th><th></th>
     </tr></thead><tbody>
       ${list.map(cu => `<tr><td>${cu.account_no}</td><td>${esc(cu.name)}</td>
         <td><span class="badge blue">${esc(cu.category)}</span></td><td>${esc(cu.phone || "")}</td>
-        <td>${cu.terms_days} days</td><td>${money(cu.credit_limit)}</td></tr>`).join("")}
+        <td>${cu.terms_days} days</td><td>${money(cu.credit_limit)}</td>
+        <td><button class="btn small" onclick="openCustomerLedger(${cu.id})">Ledger / SOA</button></td></tr>`).join("")}
     </tbody></table></div>`;
   }
   document.getElementById("custSearch").addEventListener("input", e => load(e.target.value));
@@ -436,6 +469,42 @@ async function renderCustomers(c) {
   });
   load();
 }
+
+window.openCustomerLedger = async (cid) => {
+  async function loadLedger(from, to) {
+    const qs = new URLSearchParams();
+    if (from) qs.set("from", from);
+    if (to) qs.set("to", to);
+    const data = await api(`/customers/${cid}/ledger?` + qs.toString());
+    const body = document.getElementById("modalBody");
+    if (!body) return;
+    body.querySelector("#ledgerContent").innerHTML = `
+      <div class="cart-total-row"><span>Beginning Balance</span><span>${money(data.beginning_balance)}</span></div>
+      <div class="table-wrap" style="margin:8px 0"><table><thead><tr><th>Date</th><th>Type</th><th>Reference</th><th>Charges</th><th>Payments</th><th>Balance</th></tr></thead><tbody>
+        ${data.entries.length ? data.entries.map(e => `<tr><td>${e.date}</td>
+          <td><span class="badge ${e.type === 'SALE' ? 'warn' : 'green'}">${e.type}</span></td><td>${esc(e.ref)}</td>
+          <td>${e.debit ? money(e.debit) : ""}</td><td>${e.credit ? money(e.credit) : ""}</td><td>${money(e.balance)}</td></tr>`).join("")
+          : `<tr><td colspan="6" style="color:var(--muted)">No activity in this range.</td></tr>`}
+      </tbody></table></div>
+      <div class="cart-total-row grand"><span>Ending Balance</span><span>${money(data.ending_balance)}</span></div>
+      <div class="modal-actions">
+        <a class="btn green" href="/api/customers/${cid}/statement/export${qs.toString() ? '?' + qs.toString() : ''}">Download SOA (PDF)</a>
+      </div>`;
+  }
+  const cust = (await api("/customers?q=")).find(c => c.id === cid) || {};
+  openModal(`Account Ledger — ${cust.name || ""} (${cust.account_no || ""})`, `
+    <div style="display:flex;gap:8px;margin-bottom:10px;align-items:end">
+      <div class="field" style="margin:0"><label>From</label><input type="date" id="ledgerFrom"></div>
+      <div class="field" style="margin:0"><label>To</label><input type="date" id="ledgerTo"></div>
+      <button class="btn" id="ledgerApply">Apply</button>
+    </div>
+    <div id="ledgerContent">Loading...</div>
+  `, () => {
+    document.getElementById("ledgerApply").addEventListener("click", () =>
+      loadLedger(document.getElementById("ledgerFrom").value, document.getElementById("ledgerTo").value));
+    loadLedger();
+  });
+};
 
 // ================================================================== RECEIVABLES
 async function renderReceivables(c) {
@@ -479,14 +548,84 @@ window.payReceivable = (id, balance) => {
 // ================================================================== INVENTORY
 async function renderInventory(c) {
   c.innerHTML = "Loading...";
-  const rows = await api("/inventory");
-  c.innerHTML = `<div class="table-wrap"><table><thead><tr>
-    <th>Location</th><th>SKU</th><th>Product</th><th>Qty on Hand</th><th>Min Stock</th><th>Status</th>
-  </tr></thead><tbody>
-    ${rows.map(r => `<tr><td>${esc(r.location_name)}</td><td>${esc(r.sku)}</td><td>${esc(r.name)}</td>
-      <td>${r.quantity}</td><td>${r.min_stock}</td>
-      <td>${r.quantity <= r.min_stock ? '<span class="badge danger">LOW STOCK</span>' : '<span class="badge green">OK</span>'}</td></tr>`).join("")}
-  </tbody></table></div>`;
+  const isAdmin = state.user.role === "ADMIN";
+  async function load() {
+    const rows = await api("/inventory");
+    c.innerHTML = `
+      ${isAdmin ? `<div style="margin-bottom:12px;display:flex;gap:8px">
+        <button class="btn green" id="adjustStockBtn">+ Adjust Stock</button>
+        <a class="btn" href="/api/reports/inventory/export?format=xlsx">Export Excel</a>
+        <a class="btn" href="/api/reports/inventory/export?format=pdf">Export PDF</a>
+      </div>` : ""}
+      <div class="table-wrap"><table><thead><tr>
+        <th>Location</th><th>SKU</th><th>Product</th><th>Qty on Hand</th><th>Min Stock</th><th>Status</th>
+      </tr></thead><tbody>
+        ${rows.map(r => `<tr><td>${esc(r.location_name)}</td><td>${esc(r.sku)}</td><td>${esc(r.name)}</td>
+          <td>${r.quantity}</td><td>${r.min_stock}</td>
+          <td>${r.quantity <= r.min_stock ? '<span class="badge danger">LOW STOCK</span>' : '<span class="badge green">OK</span>'}</td></tr>`).join("")}
+      </tbody></table></div>`;
+    if (isAdmin) document.getElementById("adjustStockBtn").addEventListener("click", openAdjustStockModal);
+  }
+  function openAdjustStockModal() {
+    const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+    const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+    openModal("Adjust Stock", `
+      <div class="field"><label>Location</label><select id="aLoc">${locOpts}</select></div>
+      <div class="field"><label>Product</label><select id="aProd">${prodOpts}</select></div>
+      <div class="field"><label>Quantity Change</label><input type="number" id="aDelta" placeholder="e.g. 10 or -5" value="0">
+        <div style="font-size:11.5px;color:var(--muted);margin-top:3px">Positive to add stock, negative to remove.</div></div>
+      <div class="field"><label>Reason (required)</label><input type="text" id="aReason" placeholder="e.g. Physical count correction"></div>
+      <div class="field"><label style="display:flex;align-items:center;gap:6px;font-weight:400">
+        <input type="checkbox" id="aAllowNeg" style="width:auto"> Allow result to go below zero</label></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="aSaveBtn">Save Adjustment</button></div>
+    `, () => {
+      document.getElementById("aSaveBtn").addEventListener("click", async () => {
+        const delta = parseInt(document.getElementById("aDelta").value, 10);
+        const reason = document.getElementById("aReason").value.trim();
+        if (!delta) { toast("Enter a non-zero quantity change", "error"); return; }
+        if (!reason) { toast("A reason is required", "error"); return; }
+        try {
+          await api("/inventory/adjust", { method: "POST", body: {
+            location_id: document.getElementById("aLoc").value,
+            product_id: document.getElementById("aProd").value,
+            delta, reason, allow_negative: document.getElementById("aAllowNeg").checked,
+          }});
+          closeModal(); toast("Inventory adjusted", "success"); load();
+        } catch (e) {}
+      });
+    });
+  }
+  load();
+}
+
+// ================================================================== INVENTORY LEDGER (admin)
+async function renderInventoryLedger(c) {
+  c.innerHTML = `
+    <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+      <select id="ledgerLoc"><option value="">All Locations</option>${state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}</select>
+      <select id="ledgerProd"><option value="">All Products</option>${state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>
+      <button class="btn" id="ledgerFilterBtn">Filter</button>
+    </div>
+    <div id="ledgerTable">Loading...</div>`;
+  async function load() {
+    const loc = document.getElementById("ledgerLoc").value;
+    const prod = document.getElementById("ledgerProd").value;
+    const qs = new URLSearchParams();
+    if (loc) qs.set("location_id", loc);
+    if (prod) qs.set("product_id", prod);
+    const rows = await api("/inventory/movements?" + qs.toString());
+    document.getElementById("ledgerTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Date</th><th>Location</th><th>Product</th><th>Change</th><th>Type</th><th>Reference</th><th>Notes</th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(r => `<tr><td>${r.ts}</td><td>${esc(r.location_name)}</td><td>${esc(r.product_name)}</td>
+        <td style="color:${r.qty_change >= 0 ? 'var(--green-dark)' : 'var(--danger)'};font-weight:700">${r.qty_change >= 0 ? '+' : ''}${r.qty_change}</td>
+        <td><span class="badge blue">${esc(r.type)}</span></td><td>${esc(r.reference || "")}</td><td>${esc(r.notes || "")}</td></tr>`).join("")
+        : `<tr><td colspan="7" style="color:var(--muted)">No movements found.</td></tr>`}
+    </tbody></table></div>`;
+  }
+  document.getElementById("ledgerFilterBtn").addEventListener("click", load);
+  load();
 }
 
 // ================================================================== TRANSFERS / DISPATCH
@@ -541,17 +680,42 @@ async function renderReports(c) {
     <div class="grid grid-2" style="margin-bottom:16px">
       <div class="card">
         <h3 style="margin-top:0">Sales Report</h3>
-        <div style="display:flex;gap:8px;margin-bottom:10px">
+        <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
           <input type="date" id="repFrom"><input type="date" id="repTo">
           <button class="btn" id="runSalesRep">Run</button>
+          <a class="btn small" id="salesXlsx" href="#">Export Excel</a>
+          <a class="btn small" id="salesPdf" href="#">Export PDF</a>
         </div>
         <div id="salesRepOut" class="table-wrap"></div>
       </div>
       <div class="card">
         <h3 style="margin-top:0">Inventory Report</h3>
+        <div style="margin-bottom:10px">
+          <a class="btn small" href="/api/reports/inventory/export?format=xlsx">Export Excel</a>
+          <a class="btn small" href="/api/reports/inventory/export?format=pdf">Export PDF</a>
+        </div>
         <div id="invRepOut" class="table-wrap"></div>
       </div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Accounts Receivable Report</h3>
+      <div style="margin-bottom:10px">
+        <a class="btn small" href="/api/reports/receivables/export?format=xlsx">Export Excel</a>
+        <a class="btn small" href="/api/reports/receivables/export?format=pdf">Export PDF</a>
+      </div>
+      <p style="color:var(--muted);font-size:13px;margin:0">Full detail available on the Receivables tab; use these buttons for a downloadable copy.</p>
     </div>`;
+
+  function updateExportLinks() {
+    const from = document.getElementById("repFrom").value, to = document.getElementById("repTo").value;
+    const qs = new URLSearchParams(); if (from) qs.set("from", from); if (to) qs.set("to", to);
+    document.getElementById("salesXlsx").href = "/api/reports/sales/export?format=xlsx&" + qs.toString();
+    document.getElementById("salesPdf").href = "/api/reports/sales/export?format=pdf&" + qs.toString();
+  }
+  document.getElementById("repFrom").addEventListener("change", updateExportLinks);
+  document.getElementById("repTo").addEventListener("change", updateExportLinks);
+  updateExportLinks();
+
   document.getElementById("runSalesRep").addEventListener("click", async () => {
     const from = document.getElementById("repFrom").value, to = document.getElementById("repTo").value;
     const rows = await api(`/reports/sales?from=${from}&to=${to}`);
@@ -683,12 +847,26 @@ async function renderLocations(c) {
 
 // ================================================================== ADMIN: AUDIT LOG
 async function renderAudit(c) {
-  c.innerHTML = "Loading...";
-  const rows = await api("/audit-logs");
-  c.innerHTML = `<div class="table-wrap"><table><thead><tr>
-    <th>Time</th><th>User</th><th>Action</th><th>Module</th><th>Record</th><th>Details</th>
-  </tr></thead><tbody>
-    ${rows.map(r => `<tr><td>${r.ts}</td><td>${esc(r.username)}</td><td><span class="badge blue">${r.action}</span></td>
-      <td>${r.module}</td><td>${r.record_id || ""}</td><td>${esc(r.details || "")}</td></tr>`).join("")}
-  </tbody></table></div>`;
+  c.innerHTML = `
+    <div style="margin-bottom:12px;display:flex;gap:8px">
+      <select id="auditModuleFilter">
+        <option value="">All Activity</option>
+        <option value="SALES">Sales Only</option>
+        <option value="INVENTORY">Inventory Only</option>
+      </select>
+    </div>
+    <div id="auditTable">Loading...</div>`;
+  async function load() {
+    const module = document.getElementById("auditModuleFilter").value;
+    const rows = await api("/audit-logs" + (module ? "?module=" + module : ""));
+    document.getElementById("auditTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Time</th><th>User</th><th>Action</th><th>Module</th><th>Record</th><th>Details</th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(r => `<tr><td>${r.ts}</td><td>${esc(r.username)}</td><td><span class="badge blue">${r.action}</span></td>
+        <td>${r.module}</td><td>${r.record_id || ""}</td><td>${esc(r.details || "")}</td></tr>`).join("")
+        : `<tr><td colspan="6" style="color:var(--muted)">No matching activity.</td></tr>`}
+    </tbody></table></div>`;
+  }
+  document.getElementById("auditModuleFilter").addEventListener("change", load);
+  load();
 }

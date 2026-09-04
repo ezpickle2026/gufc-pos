@@ -6,6 +6,7 @@ from flask import Flask, request, jsonify, session, send_from_directory
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from db import get_db, init_db
+from reports import xlsx_response, pdf_table_response, soa_pdf_response
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
@@ -240,6 +241,76 @@ def get_customer(cid):
     return jsonify(customer=dict(cust), receivables=[dict(r) for r in recv], sales=[dict(s) for s in sales])
 
 
+def build_customer_ledger(conn, cid, date_from=None, date_to=None):
+    """Chronological charges (sales) + payments for a customer, with running balance.
+    Used for both the on-screen Account Ledger and the printable Statement of Account."""
+    sales = conn.execute(
+        "SELECT id, sale_no, ts, total, status FROM sales WHERE customer_id=? AND status='COMPLETED' ORDER BY ts",
+        (cid,),
+    ).fetchall()
+    payments = conn.execute(
+        """SELECT p.id, p.ts, p.amount, p.method, p.reference, s.sale_no
+           FROM payments p JOIN sales s ON s.id = p.sale_id
+           WHERE s.customer_id=? ORDER BY p.ts""",
+        (cid,),
+    ).fetchall()
+
+    events = []
+    for s in sales:
+        events.append({"date": s["ts"], "type": "SALE", "ref": s["sale_no"], "debit": s["total"], "credit": 0})
+    for p in payments:
+        events.append({"date": p["ts"], "type": "PAYMENT", "ref": f"{p['sale_no']} ({p['method']})", "debit": 0, "credit": p["amount"]})
+    events.sort(key=lambda e: e["date"])
+
+    beginning_balance = 0.0
+    in_range_events = []
+    for e in events:
+        before_range = date_from and e["date"] < date_from
+        after_range = date_to and e["date"] > date_to + " 23:59:59"
+        if before_range:
+            beginning_balance += e["debit"] - e["credit"]
+        elif not after_range:
+            in_range_events.append(e)
+
+    running = beginning_balance
+    out = []
+    for e in in_range_events:
+        running = round(running + e["debit"] - e["credit"], 2)
+        out.append({**e, "balance": running})
+    return out, round(beginning_balance, 2), running
+
+
+@app.get("/api/customers/<int:cid>/ledger")
+@login_required
+def customer_ledger(cid):
+    conn = get_db()
+    cust = conn.execute("SELECT * FROM customers WHERE id=?", (cid,)).fetchone()
+    if not cust:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    date_from = request.args.get("from")
+    date_to = request.args.get("to")
+    entries, beginning, ending = build_customer_ledger(conn, cid, date_from, date_to)
+    conn.close()
+    return jsonify(customer=dict(cust), entries=entries, beginning_balance=beginning, ending_balance=ending)
+
+
+@app.get("/api/customers/<int:cid>/statement/export")
+@roles_required("ADMIN", "ATTENDANT")
+def customer_statement_export(cid):
+    conn = get_db()
+    cust = conn.execute("SELECT * FROM customers WHERE id=?", (cid,)).fetchone()
+    if not cust:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    date_from = request.args.get("from")
+    date_to = request.args.get("to")
+    entries, beginning, ending = build_customer_ledger(conn, cid, date_from, date_to)
+    conn.close()
+    fname = f"SOA-{cust['account_no']}-{datetime.now().strftime('%Y%m%d')}.pdf"
+    return soa_pdf_response(dict(cust), entries, beginning, ending, fname)
+
+
 # ---------------------------------------------------------------- inventory
 
 @app.get("/api/inventory")
@@ -287,6 +358,41 @@ def inventory_movements():
     rows = conn.execute(sql, params).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/inventory/adjust")
+@roles_required("ADMIN")
+def manual_inventory_adjust():
+    d = request.get_json(force=True)
+    location_id = d.get("location_id")
+    product_id = d.get("product_id")
+    delta = d.get("delta")
+    reason = (d.get("reason") or "").strip()
+    allow_negative = bool(d.get("allow_negative", False))
+    if not location_id or not product_id or delta is None:
+        return jsonify(error="location_id, product_id and delta are required"), 400
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        return jsonify(error="delta must be a whole number (positive to add, negative to remove)"), 400
+    if delta == 0:
+        return jsonify(error="delta cannot be zero"), 400
+    if not reason:
+        return jsonify(error="A reason is required for manual inventory adjustments"), 400
+
+    conn = get_db()
+    try:
+        adjust_inventory(conn, location_id, product_id, delta, "ADJUSTMENT", "MANUAL-ADMIN",
+                          notes=reason, allow_negative=allow_negative)
+        audit(conn, "ADJUST", "INVENTORY", f"{location_id}:{product_id}",
+              f"delta={delta} reason={reason}")
+        conn.commit()
+    except ValueError as e:
+        conn.rollback()
+        conn.close()
+        return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(ok=True)
 
 
 def adjust_inventory(conn, location_id, product_id, delta, mtype, reference, notes=None, allow_negative=False):
@@ -679,6 +785,40 @@ def report_sales():
     return jsonify([dict(r) for r in rows])
 
 
+def _sales_report_rows(date_from, date_to):
+    conn = get_db()
+    sql = """SELECT s.sale_no, s.ts, l.name location_name, u.name cashier, c.name customer,
+                    s.sale_type, s.subtotal, s.discount, s.total, s.paid, s.balance, s.status
+             FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u ON u.id=s.user_id
+             LEFT JOIN customers c ON c.id=s.customer_id WHERE 1=1"""
+    params = []
+    if date_from:
+        sql += " AND date(s.ts) >= date(?)"; params.append(date_from)
+    if date_to:
+        sql += " AND date(s.ts) <= date(?)"; params.append(date_to)
+    sql += " ORDER BY s.ts DESC"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return rows
+
+
+@app.get("/api/reports/sales/export")
+@roles_required("ADMIN")
+def export_sales_report():
+    fmt = request.args.get("format", "xlsx")
+    date_from = request.args.get("from")
+    date_to = request.args.get("to")
+    rows = _sales_report_rows(date_from, date_to)
+    headers = ["Sale #", "Date", "Location", "Cashier", "Customer", "Type", "Subtotal", "Discount", "Total", "Paid", "Balance", "Status"]
+    data = [(r["sale_no"], r["ts"], r["location_name"], r["cashier"], r["customer"] or "Walk-in",
+              r["sale_type"], r["subtotal"], r["discount"], r["total"], r["paid"], r["balance"], r["status"]) for r in rows]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    if fmt == "pdf":
+        return pdf_table_response("Sales Report", headers, data, f"sales-report-{stamp}.pdf",
+                                   subtitle=f"{date_from or 'All dates'} to {date_to or 'present'}")
+    return xlsx_response(headers, data, f"sales-report-{stamp}.xlsx", "Sales Report")
+
+
 @app.get("/api/reports/inventory")
 @login_required
 def report_inventory():
@@ -690,6 +830,51 @@ def report_inventory():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.get("/api/reports/inventory/export")
+@roles_required("ADMIN")
+def export_inventory_report():
+    fmt = request.args.get("format", "xlsx")
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT l.name location_name, p.sku, p.name product_name, i.quantity, p.min_stock
+           FROM inventory i JOIN products p ON p.id=i.product_id JOIN locations l ON l.id=i.location_id
+           ORDER BY l.name, p.name"""
+    ).fetchall()
+    conn.close()
+    headers = ["Location", "SKU", "Product", "Qty on Hand", "Min Stock", "Status"]
+    data = [(r["location_name"], r["sku"], r["product_name"], r["quantity"], r["min_stock"],
+              "LOW STOCK" if r["quantity"] <= r["min_stock"] else "OK") for r in rows]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    if fmt == "pdf":
+        return pdf_table_response("Inventory Report", headers, data, f"inventory-report-{stamp}.pdf")
+    return xlsx_response(headers, data, f"inventory-report-{stamp}.xlsx", "Inventory Report")
+
+
+@app.get("/api/reports/receivables/export")
+@roles_required("ADMIN")
+def export_receivables_report():
+    fmt = request.args.get("format", "xlsx")
+    conn = get_db()
+    rows = conn.execute("SELECT id FROM receivables").fetchall()
+    for r in rows:
+        recompute_receivable_status(conn, r["id"])
+    conn.commit()
+    out = conn.execute(
+        """SELECT r.invoice_no, c.name customer_name, c.account_no, s.sale_no, r.invoice_date, r.due_date,
+                  r.amount, r.paid, r.balance, r.status
+           FROM receivables r JOIN customers c ON c.id=r.customer_id JOIN sales s ON s.id=r.sale_id
+           ORDER BY r.due_date ASC"""
+    ).fetchall()
+    conn.close()
+    headers = ["Invoice #", "Customer", "Account #", "Sale #", "Invoice Date", "Due Date", "Amount", "Paid", "Balance", "Status"]
+    data = [(r["invoice_no"], r["customer_name"], r["account_no"], r["sale_no"], r["invoice_date"], r["due_date"],
+              r["amount"], r["paid"], r["balance"], r["status"]) for r in out]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    if fmt == "pdf":
+        return pdf_table_response("Accounts Receivable", headers, data, f"receivables-{stamp}.pdf")
+    return xlsx_response(headers, data, f"receivables-{stamp}.xlsx", "Receivables")
 
 
 # ---------------------------------------------------------------- users (admin)
@@ -742,8 +927,12 @@ def disable_user(uid):
 @app.get("/api/audit-logs")
 @roles_required("ADMIN")
 def get_audit_logs():
+    module = request.args.get("module")  # SALES, INVENTORY, or omitted for all
     conn = get_db()
-    rows = conn.execute("SELECT * FROM audit_logs ORDER BY ts DESC LIMIT 300").fetchall()
+    if module:
+        rows = conn.execute("SELECT * FROM audit_logs WHERE module=? ORDER BY ts DESC LIMIT 300", (module,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM audit_logs ORDER BY ts DESC LIMIT 300").fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 

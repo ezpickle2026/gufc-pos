@@ -30,6 +30,23 @@ This is a deliberate scope-down from the Next.js/Prisma/Postgres stack in the br
 so that everything I'm handing you is real and tested, not scaffolding. The data
 model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
+## What's new in this update
+
+- **Excel & PDF export** on Sales, Inventory, and Receivables reports (real .xlsx via
+  openpyxl, real .pdf via reportlab — not print-to-PDF workarounds)
+- **Manual inventory adjustment** (Admin only) with a required reason, logged to the
+  audit trail; optional override to allow the result to go negative
+- **Inventory Ledger** page (Admin only) — every stock movement, filterable by
+  location/product
+- **Audit log filtering** — switch between All / Sales / Inventory activity
+- **Statement of Account (SOA)** — downloadable PDF per customer with beginning
+  balance, dated entries, running balance, ending balance
+- **Account Ledger** — on-screen version of the same, with a date-range filter,
+  accessible via "Ledger / SOA" on each customer row
+- **Sale detail view + reprint** — "View" on any row in Sales opens the full
+  breakdown and lets you reprint the original receipt
+- **Your logo** is now on the login screen, sidebar, and printed receipts
+
 ## What's actually implemented (and tested)
 
 - Login/logout, sessions, 3 roles (Admin, Attendant, Dispatcher) with server-side
