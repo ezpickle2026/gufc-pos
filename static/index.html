@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>GUFC | Solane LPG POS</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<!-- LOGIN -->
+<div id="loginScreen">
+  <div class="login-left">
+    <div class="logo-badge">GUFC</div>
+    <h1>Great Unli Food Corp.</h1>
+    <p>Solane LPG Distributor &mdash; Management System</p>
+  </div>
+  <div class="login-right">
+    <form class="login-form" id="loginForm">
+      <h2>Sign in</h2>
+      <label>Username</label>
+      <input type="text" id="loginUsername" autocomplete="username" required>
+      <label>Password</label>
+      <input type="password" id="loginPassword" autocomplete="current-password" required>
+      <button class="btn-primary" type="submit">Log In</button>
+      <div class="error-msg hidden" id="loginError"></div>
+    </form>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="appShell" class="hidden">
+  <div class="sidebar">
+    <div class="brand">
+      <div class="logo-badge">GUFC</div>
+      <div><strong>GUFC Solane</strong><span>LPG Operations</span></div>
+    </div>
+    <nav id="sideNav"></nav>
+    <div class="sidebar-footer">
+      <div id="sideUserName">&nbsp;</div>
+      <span class="role-badge" id="sideUserRole"></span>
+      <button id="logoutBtn">Log Out</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="topbar">
+      <h1 id="viewTitle">Dashboard</h1>
+      <div id="topbarLoc" style="font-size:13px;color:var(--muted)"></div>
+    </div>
+    <div class="content" id="content"></div>
+  </div>
+
+  <div class="bottom-nav" id="bottomNav"></div>
+</div>
+
+<div id="modalRoot"></div>
+<div id="receiptArea" class="print-only"></div>
+
+<script src="/js/app.js"></script>
+</body>
+</html>
