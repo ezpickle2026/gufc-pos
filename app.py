@@ -13,6 +13,15 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 
 init_db()
 
+# Auto-seed demo data on first boot. This means you do NOT need Railway's
+# Shell/terminal to run seed.py manually — the app seeds itself the first
+# time it starts against an empty database, then never touches it again.
+_boot_conn = get_db()
+if _boot_conn.execute("SELECT COUNT(*) c FROM locations").fetchone()["c"] == 0:
+    import seed
+    seed.run()
+_boot_conn.close()
+
 # ---------------------------------------------------------------- helpers
 
 def audit(conn, action, module, record_id=None, details=None):
