@@ -56,19 +56,25 @@ document.getElementById("logoutBtn").addEventListener("click", async () => {
 
 // ---------------------------------------------------------------- nav config
 const NAV = [
-  { id: "dashboard", label: "Dashboard", icon: "\u{1F3E0}", roles: ["ADMIN", "ATTENDANT", "DISPATCHER"] },
+  { id: "dashboard", label: "Dashboard", icon: "\u{1F3E0}", roles: ["ADMIN", "MANAGER", "ATTENDANT", "DISPATCHER"] },
   { id: "pos", label: "POS", icon: "\u{1F6D2}", roles: ["ADMIN", "ATTENDANT"] },
-  { id: "sales", label: "Sales", icon: "\u{1F9FE}", roles: ["ADMIN", "ATTENDANT"] },
-  { id: "customers", label: "Customers", icon: "\u{1F465}", roles: ["ADMIN", "ATTENDANT"] },
-  { id: "receivables", label: "Receivables", icon: "\u{1F4B0}", roles: ["ADMIN", "ATTENDANT"] },
-  { id: "inventory", label: "Inventory", icon: "\u{1F4E6}", roles: ["ADMIN", "ATTENDANT", "DISPATCHER"] },
-  { id: "inventory_ledger", label: "Inv. Ledger", icon: "\u{1F4D2}", roles: ["ADMIN"] },
+  { id: "sales", label: "Sales", icon: "\u{1F9FE}", roles: ["ADMIN", "MANAGER", "ATTENDANT"] },
+  { id: "customers", label: "Customers", icon: "\u{1F465}", roles: ["ADMIN", "MANAGER", "ATTENDANT"] },
+  { id: "receivables", label: "Receivables", icon: "\u{1F4B0}", roles: ["ADMIN", "MANAGER", "ATTENDANT"] },
+  { id: "inventory", label: "Inventory", icon: "\u{1F4E6}", roles: ["ADMIN", "MANAGER", "ATTENDANT", "DISPATCHER"] },
+  { id: "inventory_ledger", label: "Inv. Ledger", icon: "\u{1F4D2}", roles: ["ADMIN", "MANAGER"] },
+  { id: "cylinder_deposits", label: "Cylinder Deposits", icon: "\u{1F6E2}\uFE0F", roles: ["ADMIN", "MANAGER", "ATTENDANT"] },
   { id: "transfers", label: "Dispatch", icon: "\u{1F69A}", roles: ["ADMIN", "DISPATCHER"] },
-  { id: "reports", label: "Reports", icon: "\u{1F4CA}", roles: ["ADMIN"] },
-  { id: "users", label: "Users", icon: "\u{1F464}", roles: ["ADMIN"] },
+  { id: "hauling", label: "Hauling Schedule", icon: "\u{1F69B}", roles: ["ADMIN", "MANAGER"] },
+  { id: "vehicles", label: "Vehicles", icon: "\u{1F697}", roles: ["ADMIN", "MANAGER"] },
+  { id: "employees", label: "Employees", icon: "\u{1F477}", roles: ["ADMIN", "MANAGER"] },
+  { id: "staff_schedule", label: "Staff Schedule", icon: "\u{1F4C5}", roles: ["ADMIN", "MANAGER", "ATTENDANT", "DISPATCHER"] },
+  { id: "kpi", label: "Employee KPI", icon: "\u{1F4C8}", roles: ["ADMIN", "MANAGER"] },
+  { id: "reports", label: "Reports", icon: "\u{1F4CA}", roles: ["ADMIN", "MANAGER"] },
+  { id: "users", label: "Users", icon: "\u{1F464}", roles: ["ADMIN", "MANAGER"] },
   { id: "products", label: "Products", icon: "\u{1F3F7}", roles: ["ADMIN"] },
   { id: "locations", label: "Locations", icon: "\u{1F3E2}", roles: ["ADMIN"] },
-  { id: "audit", label: "Audit Log", icon: "\u{1F4DC}", roles: ["ADMIN"] },
+  { id: "audit", label: "Audit Log", icon: "\u{1F4DC}", roles: ["ADMIN", "MANAGER"] },
 ];
 
 function buildNav() {
@@ -120,7 +126,9 @@ function render() {
     customers: renderCustomers, receivables: renderReceivables,
     inventory: renderInventory, inventory_ledger: renderInventoryLedger, transfers: renderTransfers, reports: renderReports,
     users: renderUsers, products: renderProducts, locations: renderLocations,
-    audit: renderAudit,
+    audit: renderAudit, cylinder_deposits: renderCylinderDeposits,
+    hauling: renderHauling, vehicles: renderVehicles, employees: renderEmployees,
+    staff_schedule: renderStaffSchedule, kpi: renderKpi,
   };
   (views[state.view] || renderDashboard)(c);
 }
@@ -208,22 +216,39 @@ async function renderPOS(c) {
   function addToCart(pid, stockMap) {
     const prod = state.products.find(p => p.id === pid);
     const stock = stockMap[pid] ?? 0;
-    const existing = state.cart.find(i => i.product_id === pid);
+    const existing = state.cart.find(i => i.product_id === pid && i.sale_mode === "REFILL");
     const currentQty = existing ? existing.qty : 0;
     if (currentQty + 1 > stock) { toast(`Only ${stock} in stock for ${prod.name}`, "error"); return; }
     if (existing) existing.qty += 1;
-    else state.cart.push({ product_id: pid, name: prod.name, price: prod.price, qty: 1 });
+    else state.cart.push({
+      product_id: pid, name: prod.name, base_price: prod.price, deposit_price: prod.deposit_price || 0,
+      sale_mode: "REFILL", price: prod.price, qty: 1,
+    });
     drawCart(locationId);
   }
 
-  window.__posRemove = (pid) => { state.cart = state.cart.filter(i => i.product_id !== pid); drawCart(locationId); };
-  window.__posQty = (pid, val) => {
-    const item = state.cart.find(i => i.product_id === pid);
+  window.__posRemove = (pid, mode) => { state.cart = state.cart.filter(i => !(i.product_id === pid && i.sale_mode === mode)); drawCart(locationId); };
+  window.__posQty = (pid, mode, val) => {
+    const item = state.cart.find(i => i.product_id === pid && i.sale_mode === mode);
     const stock = stockMap[pid] ?? 0;
     let q = parseInt(val) || 0;
     if (q > stock) { toast(`Only ${stock} in stock`, "error"); q = stock; }
-    if (q <= 0) { state.cart = state.cart.filter(i => i.product_id !== pid); }
+    if (q <= 0) { state.cart = state.cart.filter(i => !(i.product_id === pid && i.sale_mode === mode)); }
     else item.qty = q;
+    drawCart(locationId);
+  };
+  window.__posMode = (pid, oldMode, newMode) => {
+    const item = state.cart.find(i => i.product_id === pid && i.sale_mode === oldMode);
+    if (!item) return;
+    // merge into an existing line with the same new mode, if one exists
+    const target = state.cart.find(i => i.product_id === pid && i.sale_mode === newMode);
+    if (target) {
+      target.qty += item.qty;
+      state.cart = state.cart.filter(i => i !== item);
+    } else {
+      item.sale_mode = newMode;
+      item.price = item.base_price + (newMode === "DEPOSIT" ? item.deposit_price : 0);
+    }
     drawCart(locationId);
   };
 }
@@ -240,10 +265,16 @@ function drawCart(locationId) {
     <h3 style="margin-top:0">Cart</h3>
     <div id="cartLines">${state.cart.length ? state.cart.map(i => `
       <div class="cart-line">
-        <div class="cname">${esc(i.name)}<br><span style="color:var(--muted);font-size:12px">${money(i.price)} each</span></div>
-        <input type="number" min="0" value="${i.qty}" onchange="__posQty(${i.product_id}, this.value)">
+        <div class="cname">${esc(i.name)} ${i.sale_mode === 'DEPOSIT' ? '<span class="badge warn">DEPOSIT</span>' : ''}<br>
+          <span style="color:var(--muted);font-size:12px">${money(i.price)} each</span>
+          ${i.deposit_price > 0 ? `<select style="margin-left:6px;font-size:11px;padding:2px 4px" onchange="__posMode(${i.product_id}, '${i.sale_mode}', this.value)">
+            <option value="REFILL" ${i.sale_mode === 'REFILL' ? 'selected' : ''}>Refill (exchange empty)</option>
+            <option value="DEPOSIT" ${i.sale_mode === 'DEPOSIT' ? 'selected' : ''}>New/Deposit (+${money(i.deposit_price)})</option>
+          </select>` : ""}
+        </div>
+        <input type="number" min="0" value="${i.qty}" onchange="__posQty(${i.product_id}, '${i.sale_mode}', this.value)">
         <div style="width:78px;text-align:right;font-weight:600">${money(i.price * i.qty)}</div>
-        <button class="btn small danger" onclick="__posRemove(${i.product_id})">&times;</button>
+        <button class="btn small danger" onclick="__posRemove(${i.product_id}, '${i.sale_mode}')">&times;</button>
       </div>`).join("") : `<p style="color:var(--muted)">Cart is empty. Tap a product to add it.</p>`}
     </div>
     <div style="margin-top:10px">
@@ -328,7 +359,7 @@ async function openCheckout(locationId, subtotal) {
         customer_id: document.getElementById("custSelect").value || null,
         sale_type: document.getElementById("saleType").value,
         discount,
-        items: state.cart.map(i => ({ product_id: i.product_id, qty: i.qty })),
+        items: state.cart.map(i => ({ product_id: i.product_id, qty: i.qty, sale_mode: i.sale_mode })),
         payments,
       };
       try {
@@ -356,7 +387,7 @@ function printReceipt(result) {
       <div>Txn: ${sale.sale_no}<br>Date: ${sale.ts}<br>Cashier: ${esc(sale.cashier_name)}<br>
       Customer: ${esc(sale.customer_name || "Walk-in")} ${sale.account_no ? "(" + sale.account_no + ")" : ""}</div>
       <div>--------------------------------</div>
-      ${items.map(i => `${esc(i.product_name)}<br>  ${i.qty} x ${money(i.price)} = ${money(i.subtotal)}`).join("<br>")}
+      ${items.map(i => `${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}<br>  ${i.qty} x ${money(i.price)} = ${money(i.subtotal)}`).join("<br>")}
       <div>--------------------------------</div>
       <div>Subtotal: ${money(sale.subtotal)}<br>Discount: ${money(sale.discount)}<br><b>Total: ${money(sale.total)}</b></div>
       <div>--------------------------------</div>
@@ -401,7 +432,7 @@ window.viewSale = async (id) => {
     <div class="field"><b>Cashier:</b> ${esc(sale.cashier_name)} &nbsp; <b>Customer:</b> ${esc(sale.customer_name || "Walk-in")}</div>
     <div class="field"><b>Status:</b> <span class="badge ${sale.status === 'VOIDED' ? 'danger' : 'blue'}">${sale.status}</span></div>
     <div class="table-wrap"><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Subtotal</th></tr></thead><tbody>
-      ${items.map(i => `<tr><td>${esc(i.product_name)}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
+      ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
     </tbody></table></div>
     <div style="margin-top:10px">
       <div class="cart-total-row"><span>Subtotal</span><span>${money(sale.subtotal)}</span></div>
@@ -423,50 +454,163 @@ window.viewSale = async (id) => {
 
 // ================================================================== CUSTOMERS
 async function renderCustomers(c) {
-  c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px">
-    <input type="text" id="custSearch" placeholder="Search customers..." style="flex:1">
-    <button class="btn green" id="newCustBtn">+ New Customer</button>
+  const isAdmin = state.user.role === "ADMIN";
+  const categories = await api("/customer-categories");
+  c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
+    <input type="text" id="custSearch" placeholder="Search customers..." style="flex:1;min-width:180px">
+    ${isAdmin ? `
+      <button class="btn green" id="newCustBtn">+ New Customer</button>
+      <button class="btn" id="manageCatBtn">Manage Categories</button>
+      <a class="btn" href="/api/customers/template">Download CSV Template</a>
+      <button class="btn" id="importCustBtn">Import CSV</button>
+    ` : ""}
   </div><div id="custTable"></div>`;
+
+  function categoryOptions(selected) {
+    return categories.map(cat => `<option value="${esc(cat.name)}" ${cat.name === selected ? "selected" : ""}>${esc(cat.name)}</option>`).join("");
+  }
+
   async function load(q = "") {
     const list = await api("/customers?q=" + encodeURIComponent(q));
     document.getElementById("custTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>Account #</th><th>Name</th><th>Category</th><th>Phone</th><th>Terms</th><th>Credit Limit</th><th></th>
+      <th>Account #</th><th>Name</th><th>Category</th><th>Phone</th><th>Terms</th><th>Credit Limit</th><th>Status</th><th></th>
     </tr></thead><tbody>
       ${list.map(cu => `<tr><td>${cu.account_no}</td><td>${esc(cu.name)}</td>
         <td><span class="badge blue">${esc(cu.category)}</span></td><td>${esc(cu.phone || "")}</td>
         <td>${cu.terms_days} days</td><td>${money(cu.credit_limit)}</td>
-        <td><button class="btn small" onclick="openCustomerLedger(${cu.id})">Ledger / SOA</button></td></tr>`).join("")}
+        <td><span class="badge ${cu.status === 'ACTIVE' ? 'green' : 'gray'}">${cu.status}</span></td>
+        <td style="display:flex;gap:6px">
+          <button class="btn small" onclick="openCustomerLedger(${cu.id})">Ledger / SOA</button>
+          ${isAdmin ? `<button class="btn small" onclick="editCustomer(${cu.id})">Edit</button>
+            <button class="btn small danger" onclick="deleteCustomer(${cu.id})">Delete</button>` : ""}
+        </td></tr>`).join("")}
     </tbody></table></div>`;
   }
+
+  function customerFormFields(cu = {}) {
+    return `
+      <div class="field"><label>Name</label><input id="cName" value="${esc(cu.name || "")}"></div>
+      <div class="field"><label>Business Name</label><input id="cBiz" value="${esc(cu.business_name || "")}"></div>
+      <div class="field"><label>Phone</label><input id="cPhone" value="${esc(cu.phone || "")}"></div>
+      <div class="field"><label>Address</label><input id="cAddress" value="${esc(cu.address || "")}"></div>
+      <div class="field"><label>Category</label><select id="cCat">${categoryOptions(cu.category)}</select></div>
+      <div class="field"><label>Payment Terms (days, 0 = cash only)</label><input type="number" id="cTerms" value="${cu.terms_days ?? 0}"></div>
+      <div class="field"><label>Credit Limit (₱)</label><input type="number" id="cLimit" value="${cu.credit_limit ?? 0}"></div>
+      ${cu.id ? `<div class="field"><label>Status</label><select id="cStatus">
+        <option value="ACTIVE" ${cu.status === 'ACTIVE' ? 'selected' : ''}>Active</option>
+        <option value="INACTIVE" ${cu.status === 'INACTIVE' ? 'selected' : ''}>Inactive</option></select></div>` : ""}
+    `;
+  }
+  function readCustomerForm() {
+    return {
+      name: document.getElementById("cName").value.trim(),
+      business_name: document.getElementById("cBiz").value,
+      phone: document.getElementById("cPhone").value,
+      address: document.getElementById("cAddress").value,
+      category: document.getElementById("cCat").value,
+      terms_days: document.getElementById("cTerms").value,
+      credit_limit: document.getElementById("cLimit").value,
+      status: document.getElementById("cStatus") ? document.getElementById("cStatus").value : "ACTIVE",
+    };
+  }
+
   document.getElementById("custSearch").addEventListener("input", e => load(e.target.value));
-  document.getElementById("newCustBtn").addEventListener("click", () => {
-    openModal("New Customer", `
-      <div class="field"><label>Name</label><input id="cName"></div>
-      <div class="field"><label>Business Name</label><input id="cBiz"></div>
-      <div class="field"><label>Phone</label><input id="cPhone"></div>
-      <div class="field"><label>Category</label>
-        <select id="cCat"><option>Solus</option><option>ERTO</option><option>MRTO</option><option>Commercial</option><option>DOMCOM</option><option>ETC</option></select></div>
-      <div class="field"><label>Payment Terms (days, 0 = cash only)</label><input type="number" id="cTerms" value="0"></div>
-      <div class="field"><label>Credit Limit (₱)</label><input type="number" id="cLimit" value="0"></div>
-      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
-        <button class="btn green" id="saveCustBtn">Save</button></div>
-    `, () => {
-      document.getElementById("saveCustBtn").addEventListener("click", async () => {
-        const name = document.getElementById("cName").value.trim();
-        if (!name) { toast("Name is required", "error"); return; }
-        try {
-          await api("/customers", { method: "POST", body: {
-            name, business_name: document.getElementById("cBiz").value,
-            phone: document.getElementById("cPhone").value,
-            category: document.getElementById("cCat").value,
-            terms_days: document.getElementById("cTerms").value,
-            credit_limit: document.getElementById("cLimit").value,
-          }});
-          closeModal(); toast("Customer created", "success"); load();
-        } catch (e) {}
+
+  if (isAdmin) {
+    document.getElementById("newCustBtn").addEventListener("click", () => {
+      openModal("New Customer", customerFormFields() + `
+        <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+          <button class="btn green" id="saveCustBtn">Save</button></div>`, () => {
+        document.getElementById("saveCustBtn").addEventListener("click", async () => {
+          const body = readCustomerForm();
+          if (!body.name) { toast("Name is required", "error"); return; }
+          try { await api("/customers", { method: "POST", body }); closeModal(); toast("Customer created", "success"); load(); }
+          catch (e) {}
+        });
       });
     });
-  });
+
+    document.getElementById("manageCatBtn").addEventListener("click", openCategoryManager);
+
+    document.getElementById("importCustBtn").addEventListener("click", () => {
+      openModal("Import Customers from CSV", `
+        <p style="font-size:13px;color:var(--muted)">Download the template above, fill it in, then upload it here.</p>
+        <div class="field"><input type="file" id="custCsvFile" accept=".csv"></div>
+        <div id="importResult"></div>
+        <div class="modal-actions"><button class="btn" onclick="closeModal()">Close</button>
+          <button class="btn green" id="doImportBtn">Upload</button></div>
+      `, () => {
+        document.getElementById("doImportBtn").addEventListener("click", async () => {
+          const file = document.getElementById("custCsvFile").files[0];
+          if (!file) { toast("Choose a CSV file first", "error"); return; }
+          const fd = new FormData(); fd.append("file", file);
+          try {
+            const res = await fetch("/api/customers/import", { method: "POST", body: fd, credentials: "include" });
+            const data = await res.json();
+            if (!res.ok) { toast(data.error || "Import failed", "error"); return; }
+            document.getElementById("importResult").innerHTML = `
+              <p style="color:var(--green-dark);font-weight:600">${data.created} customer(s) imported.</p>
+              ${data.errors.length ? `<p style="color:var(--danger);font-size:12.5px">${data.errors.map(esc).join("<br>")}</p>` : ""}
+            `;
+            toast(`${data.created} customers imported`, "success");
+            load();
+          } catch (e) { toast("Import failed", "error"); }
+        });
+      });
+    });
+  }
+
+  window.editCustomer = async (cid) => {
+    const { customer } = await api(`/customers/${cid}`);
+    openModal("Edit Customer", customerFormFields(customer) + `
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="saveCustBtn">Save Changes</button></div>`, () => {
+      document.getElementById("saveCustBtn").addEventListener("click", async () => {
+        const body = readCustomerForm();
+        if (!body.name) { toast("Name is required", "error"); return; }
+        try { await api(`/customers/${cid}`, { method: "PUT", body }); closeModal(); toast("Customer updated", "success"); load(); }
+        catch (e) {}
+      });
+    });
+  };
+
+  window.deleteCustomer = async (cid) => {
+    if (!confirm("Delete this customer? This only works if they have no sales history.")) return;
+    try { await api(`/customers/${cid}`, { method: "DELETE" }); toast("Customer deleted", "success"); load(); }
+    catch (e) {}
+  };
+
+  function openCategoryManager() {
+    openModal("Manage Customer Categories", `
+      <div id="catList"></div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <input type="text" id="newCatName" placeholder="New category name" style="flex:1">
+        <button class="btn green" id="addCatBtn">Add</button>
+      </div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Close</button></div>
+    `, () => {
+      async function loadCats() {
+        const cats = await api("/customer-categories");
+        document.getElementById("catList").innerHTML = cats.map(cat => `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">
+            <span>${esc(cat.name)}</span>
+            <button class="btn small danger" onclick="deleteCategory(${cat.id})">Remove</button>
+          </div>`).join("");
+      }
+      document.getElementById("addCatBtn").addEventListener("click", async () => {
+        const name = document.getElementById("newCatName").value.trim();
+        if (!name) return;
+        try { await api("/customer-categories", { method: "POST", body: { name } }); document.getElementById("newCatName").value = ""; loadCats(); toast("Category added", "success"); }
+        catch (e) {}
+      });
+      window.deleteCategory = async (id) => {
+        try { await api(`/customer-categories/${id}`, { method: "DELETE" }); loadCats(); toast("Category removed", "success"); }
+        catch (e) {}
+      };
+      loadCats();
+    });
+  }
+
   load();
 }
 
@@ -551,6 +695,7 @@ async function renderInventory(c) {
   const isAdmin = state.user.role === "ADMIN";
   async function load() {
     const rows = await api("/inventory");
+    const empties = await api("/inventory/empties");
     c.innerHTML = `
       ${isAdmin ? `<div style="margin-bottom:12px;display:flex;gap:8px">
         <button class="btn green" id="adjustStockBtn">+ Adjust Stock</button>
@@ -563,6 +708,13 @@ async function renderInventory(c) {
         ${rows.map(r => `<tr><td>${esc(r.location_name)}</td><td>${esc(r.sku)}</td><td>${esc(r.name)}</td>
           <td>${r.quantity}</td><td>${r.min_stock}</td>
           <td>${r.quantity <= r.min_stock ? '<span class="badge danger">LOW STOCK</span>' : '<span class="badge green">OK</span>'}</td></tr>`).join("")}
+      </tbody></table></div>
+      <h3 style="margin:20px 0 8px">Empty Cylinders on Hand</h3>
+      <p style="color:var(--muted);font-size:13px;margin-top:0">Returned via refill sales — ready to haul back to the plant for refilling.</p>
+      <div class="table-wrap"><table><thead><tr><th>Location</th><th>Product</th><th>Empty Qty</th></tr></thead><tbody>
+        ${empties.filter(e => e.quantity > 0).length ? empties.filter(e => e.quantity > 0).map(e => `<tr>
+          <td>${esc(e.location_name)}</td><td>${esc(e.product_name)}</td><td><b>${e.quantity}</b></td></tr>`).join("")
+          : `<tr><td colspan="3" style="color:var(--muted)">No empty cylinders on hand.</td></tr>`}
       </tbody></table></div>`;
     if (isAdmin) document.getElementById("adjustStockBtn").addEventListener("click", openAdjustStockModal);
   }
@@ -630,7 +782,10 @@ async function renderInventoryLedger(c) {
 
 // ================================================================== TRANSFERS / DISPATCH
 async function renderTransfers(c) {
-  c.innerHTML = `<div style="margin-bottom:12px"><button class="btn green" id="newXferBtn">+ New Transfer / Dispatch</button></div><div id="xferTable">Loading...</div>`;
+  c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px">
+    <button class="btn green" id="newXferBtn">+ New Transfer / Dispatch</button>
+    <button class="btn" id="importStockBtn">+ Import Stock from Supplier</button>
+  </div><div id="xferTable">Loading...</div>`;
   async function load() {
     const rows = await api("/transfers");
     document.getElementById("xferTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
@@ -643,6 +798,31 @@ async function renderTransfers(c) {
       </tr>`).join("")}
     </tbody></table></div>`;
   }
+  document.getElementById("importStockBtn").addEventListener("click", () => {
+    const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+    const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+    openModal("Import Stock from Supplier", `
+      <div class="field"><label>Receiving Location</label><select id="ibLoc">${locOpts}</select></div>
+      <div class="field"><label>Product</label><select id="ibProd">${prodOpts}</select></div>
+      <div class="field"><label>Quantity Received</label><input type="number" id="ibQty" value="1" min="1"></div>
+      <div class="field"><label>Supplier</label><input id="ibSupplier" placeholder="e.g. Solane Plant"></div>
+      <div class="field"><label>Reference # (delivery receipt, etc.)</label><input id="ibRef"></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="ibSaveBtn">Record Received Stock</button></div>
+    `, () => {
+      document.getElementById("ibSaveBtn").addEventListener("click", async () => {
+        const supplier = document.getElementById("ibSupplier").value.trim();
+        if (!supplier) { toast("Supplier name is required", "error"); return; }
+        try {
+          await api("/inventory/inbound", { method: "POST", body: {
+            location_id: document.getElementById("ibLoc").value, product_id: document.getElementById("ibProd").value,
+            qty: document.getElementById("ibQty").value, supplier, reference: document.getElementById("ibRef").value,
+          }});
+          closeModal(); toast("Stock received and recorded", "success"); load();
+        } catch (e) {}
+      });
+    });
+  });
   document.getElementById("newXferBtn").addEventListener("click", () => {
     const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
     const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
@@ -731,81 +911,169 @@ async function renderReports(c) {
 
 // ================================================================== ADMIN: USERS
 async function renderUsers(c) {
-  c.innerHTML = `<div style="margin-bottom:12px"><button class="btn green" id="newUserBtn">+ New User</button></div><div id="usersTable">Loading...</div>`;
+  const isAdmin = state.user.role === "ADMIN";
+  c.innerHTML = `<div style="margin-bottom:12px">${isAdmin ? `<button class="btn green" id="newUserBtn">+ New User</button>` : ""}</div><div id="usersTable">Loading...</div>`;
+  const roleOptions = (selected) => ["ADMIN", "MANAGER", "ATTENDANT", "DISPATCHER"]
+    .map(r => `<option value="${r}" ${r === selected ? "selected" : ""}>${r.charAt(0) + r.slice(1).toLowerCase()}</option>`).join("");
   async function load() {
     const rows = await api("/users");
     document.getElementById("usersTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>Username</th><th>Name</th><th>Role</th><th>Location</th><th>Status</th><th></th>
+      <th>Username</th><th>Name</th><th>Role</th><th>Location</th><th>Status</th>${isAdmin ? "<th></th>" : ""}
     </tr></thead><tbody>
       ${rows.map(u => `<tr><td>${u.username}</td><td>${esc(u.name)}</td><td><span class="badge blue">${u.role}</span></td>
         <td>${esc(u.location_name || "—")}</td><td>${u.active ? '<span class="badge green">Active</span>' : '<span class="badge danger">Disabled</span>'}</td>
-        <td>${u.active ? `<button class="btn small danger" onclick="disableUser(${u.id})">Disable</button>` : ""}</td></tr>`).join("")}
+        ${isAdmin ? `<td style="display:flex;gap:6px">
+          <button class="btn small" onclick="editUser(${u.id})">Edit</button>
+          ${u.active ? `<button class="btn small danger" onclick="disableUser(${u.id})">Disable</button>`
+                     : `<button class="btn small" onclick="enableUser(${u.id})">Enable</button>`}
+          <button class="btn small danger" onclick="deleteUserRow(${u.id})">Delete</button>
+        </td>` : ""}</tr>`).join("")}
     </tbody></table></div>`;
   }
-  document.getElementById("newUserBtn").addEventListener("click", () => {
-    const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
-    openModal("New User", `
-      <div class="field"><label>Username</label><input id="uUsername"></div>
-      <div class="field"><label>Full Name</label><input id="uName"></div>
-      <div class="field"><label>Temporary Password</label><input id="uPass" type="text" value="Welcome123!"></div>
-      <div class="field"><label>Role</label><select id="uRole"><option value="ADMIN">Admin</option><option value="ATTENDANT">Attendant</option><option value="DISPATCHER">Dispatcher</option></select></div>
-      <div class="field"><label>Assigned Location</label><select id="uLoc"><option value="">— None (Admin only) —</option>${locOpts}</select></div>
-      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
-        <button class="btn green" id="uSaveBtn">Create User</button></div>
-    `, () => {
-      document.getElementById("uSaveBtn").addEventListener("click", async () => {
-        try {
-          await api("/users", { method: "POST", body: {
-            username: document.getElementById("uUsername").value,
-            name: document.getElementById("uName").value,
-            password: document.getElementById("uPass").value,
-            role: document.getElementById("uRole").value,
-            location_id: document.getElementById("uLoc").value || null,
-          }});
-          closeModal(); toast("User created", "success"); load();
-        } catch (e) {}
+  if (isAdmin) {
+    document.getElementById("newUserBtn").addEventListener("click", () => {
+      const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+      openModal("New User", `
+        <div class="field"><label>Username</label><input id="uUsername"></div>
+        <div class="field"><label>Full Name</label><input id="uName"></div>
+        <div class="field"><label>Temporary Password</label><input id="uPass" type="text" value="Welcome123!"></div>
+        <div class="field"><label>Role</label><select id="uRole">${roleOptions()}</select></div>
+        <div class="field"><label>Assigned Location</label><select id="uLoc"><option value="">— None (Admin/Manager) —</option>${locOpts}</select></div>
+        <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+          <button class="btn green" id="uSaveBtn">Create User</button></div>
+      `, () => {
+        document.getElementById("uSaveBtn").addEventListener("click", async () => {
+          try {
+            await api("/users", { method: "POST", body: {
+              username: document.getElementById("uUsername").value,
+              name: document.getElementById("uName").value,
+              password: document.getElementById("uPass").value,
+              role: document.getElementById("uRole").value,
+              location_id: document.getElementById("uLoc").value || null,
+            }});
+            closeModal(); toast("User created", "success"); load();
+          } catch (e) {}
+        });
       });
     });
-  });
+    window.editUser = async (id) => {
+      const u = (await api("/users")).find(x => x.id === id);
+      const locOpts = state.locations.map(l => `<option value="${l.id}" ${u.location_id === l.id ? "selected" : ""}>${esc(l.name)}</option>`).join("");
+      openModal("Edit User", `
+        <div class="field"><label>Username</label><input value="${esc(u.username)}" disabled></div>
+        <div class="field"><label>Full Name</label><input id="uName" value="${esc(u.name)}"></div>
+        <div class="field"><label>Role</label><select id="uRole">${roleOptions(u.role)}</select></div>
+        <div class="field"><label>Assigned Location</label><select id="uLoc"><option value="">— None —</option>${locOpts}</select></div>
+        <div class="field"><label>Reset Password (leave blank to keep current)</label><input id="uPass" type="text" placeholder="New password"></div>
+        <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+          <button class="btn green" id="uSaveBtn">Save Changes</button></div>
+      `, () => {
+        document.getElementById("uSaveBtn").addEventListener("click", async () => {
+          const body = {
+            name: document.getElementById("uName").value, role: document.getElementById("uRole").value,
+            location_id: document.getElementById("uLoc").value || null,
+          };
+          const pw = document.getElementById("uPass").value;
+          if (pw) body.password = pw;
+          try { await api(`/users/${id}`, { method: "PUT", body }); closeModal(); toast("User updated", "success"); load(); }
+          catch (e) {}
+        });
+      });
+    };
+    window.disableUser = async (id) => {
+      if (!confirm("Disable this user?")) return;
+      await api(`/users/${id}/disable`, { method: "POST" }); toast("User disabled", "success"); load();
+    };
+    window.enableUser = async (id) => {
+      await api(`/users/${id}/enable`, { method: "POST" }); toast("User re-enabled", "success"); load();
+    };
+    window.deleteUserRow = async (id) => {
+      if (!confirm("Permanently delete this user? This only works if they have no activity on record.")) return;
+      try { await api(`/users/${id}`, { method: "DELETE" }); toast("User deleted", "success"); load(); }
+      catch (e) {}
+    };
+  }
   load();
-  window.disableUser = async (id) => {
-    if (!confirm("Disable this user?")) return;
-    await api(`/users/${id}/disable`, { method: "POST" }); toast("User disabled", "success"); load();
-  };
 }
 
 // ================================================================== ADMIN: PRODUCTS
 async function renderProducts(c) {
-  c.innerHTML = `<div style="margin-bottom:12px"><button class="btn green" id="newProdBtn">+ New Product</button></div><div id="prodTable">Loading...</div>`;
+  c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn green" id="newProdBtn">+ New Product</button>
+    <a class="btn" href="/api/products/template">Download CSV Template</a>
+    <button class="btn" id="importProdBtn">Import CSV</button>
+  </div><div id="prodTable">Loading...</div>`;
   async function load() {
     state.products = await api("/products");
     document.getElementById("prodTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>SKU</th><th>Name</th><th>Category</th><th>Price</th><th>Cost</th><th>Min Stock</th>
+      <th>SKU</th><th>Name</th><th>Category</th><th>Price</th><th>Cost</th><th>Deposit Price</th><th>Min Stock</th><th></th>
     </tr></thead><tbody>
       ${state.products.map(p => `<tr><td>${esc(p.sku)}</td><td>${esc(p.name)}</td><td>${esc(p.category)}</td>
-        <td>${money(p.price)}</td><td>${money(p.cost)}</td><td>${p.min_stock}</td></tr>`).join("")}
+        <td>${money(p.price)}</td><td>${money(p.cost)}</td><td>${money(p.deposit_price)}</td><td>${p.min_stock}</td>
+        <td><button class="btn small" onclick="editProduct(${p.id})">Edit</button></td></tr>`).join("")}
     </tbody></table></div>`;
   }
+  function formFields(p = {}) {
+    return `
+      <div class="field"><label>SKU</label><input id="pSku" value="${esc(p.sku || "")}" ${p.id ? "disabled" : ""}></div>
+      <div class="field"><label>Name</label><input id="pName" value="${esc(p.name || "")}"></div>
+      <div class="field"><label>Category</label><input id="pCat" value="${esc(p.category || "LPG Cylinder")}"></div>
+      <div class="field"><label>Selling Price (Refill)</label><input type="number" id="pPrice" value="${p.price ?? ""}"></div>
+      <div class="field"><label>Cost Price</label><input type="number" id="pCost" value="${p.cost ?? 0}"></div>
+      <div class="field"><label>Cylinder Deposit Fee (added on top for New/Deposit sales)</label><input type="number" id="pDeposit" value="${p.deposit_price ?? 0}"></div>
+      <div class="field"><label>Minimum Stock Level</label><input type="number" id="pMin" value="${p.min_stock ?? 10}"></div>
+    `;
+  }
+  function readForm() {
+    return {
+      sku: document.getElementById("pSku").value, name: document.getElementById("pName").value,
+      category: document.getElementById("pCat").value, price: document.getElementById("pPrice").value,
+      cost: document.getElementById("pCost").value, deposit_price: document.getElementById("pDeposit").value,
+      min_stock: document.getElementById("pMin").value,
+    };
+  }
   document.getElementById("newProdBtn").addEventListener("click", () => {
-    openModal("New Product", `
-      <div class="field"><label>SKU</label><input id="pSku"></div>
-      <div class="field"><label>Name</label><input id="pName"></div>
-      <div class="field"><label>Category</label><input id="pCat" value="LPG Cylinder"></div>
-      <div class="field"><label>Selling Price</label><input type="number" id="pPrice"></div>
-      <div class="field"><label>Cost Price</label><input type="number" id="pCost" value="0"></div>
-      <div class="field"><label>Minimum Stock Level</label><input type="number" id="pMin" value="10"></div>
-      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
-        <button class="btn green" id="pSaveBtn">Save</button></div>
-    `, () => {
+    openModal("New Product", formFields() + `<div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="pSaveBtn">Save</button></div>`, () => {
       document.getElementById("pSaveBtn").addEventListener("click", async () => {
+        try { await api("/products", { method: "POST", body: readForm() }); closeModal(); toast("Product created", "success"); load(); }
+        catch (e) {}
+      });
+    });
+  });
+  window.editProduct = (id) => {
+    const p = state.products.find(x => x.id === id);
+    openModal("Edit Product", formFields(p) + `<div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="pSaveBtn">Save Changes</button></div>`, () => {
+      document.getElementById("pSaveBtn").addEventListener("click", async () => {
+        try { await api(`/products/${id}`, { method: "PUT", body: readForm() }); closeModal(); toast("Product updated", "success"); load(); }
+        catch (e) {}
+      });
+    });
+  };
+  document.getElementById("importProdBtn").addEventListener("click", () => {
+    openModal("Import Products from CSV", `
+      <p style="font-size:13px;color:var(--muted)">Download the template above, fill it in, then upload it here.</p>
+      <div class="field"><input type="file" id="prodCsvFile" accept=".csv"></div>
+      <div id="importResult"></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Close</button>
+        <button class="btn green" id="doImportBtn">Upload</button></div>
+    `, () => {
+      document.getElementById("doImportBtn").addEventListener("click", async () => {
+        const file = document.getElementById("prodCsvFile").files[0];
+        if (!file) { toast("Choose a CSV file first", "error"); return; }
+        const fd = new FormData(); fd.append("file", file);
         try {
-          await api("/products", { method: "POST", body: {
-            sku: document.getElementById("pSku").value, name: document.getElementById("pName").value,
-            category: document.getElementById("pCat").value, price: document.getElementById("pPrice").value,
-            cost: document.getElementById("pCost").value, min_stock: document.getElementById("pMin").value,
-          }});
-          closeModal(); toast("Product created", "success"); load();
-        } catch (e) {}
+          const res = await fetch("/api/products/import", { method: "POST", body: fd, credentials: "include" });
+          const data = await res.json();
+          if (!res.ok) { toast(data.error || "Import failed", "error"); return; }
+          document.getElementById("importResult").innerHTML = `
+            <p style="color:var(--green-dark);font-weight:600">${data.created} product(s) imported.</p>
+            ${data.errors.length ? `<p style="color:var(--danger);font-size:12.5px">${data.errors.map(esc).join("<br>")}</p>` : ""}
+          `;
+          toast(`${data.created} products imported`, "success");
+          load();
+        } catch (e) { toast("Import failed", "error"); }
       });
     });
   });
@@ -818,30 +1086,56 @@ async function renderLocations(c) {
   async function load() {
     state.locations = await api("/locations");
     document.getElementById("locTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>Name</th><th>Type</th><th>Address</th><th>Status</th></tr></thead><tbody>
+      <th>Name</th><th>Type</th><th>Address</th><th>Status</th><th></th></tr></thead><tbody>
       ${state.locations.map(l => `<tr><td>${esc(l.name)}</td><td><span class="badge blue">${l.type}</span></td><td>${esc(l.address || "")}</td>
-        <td><span class="badge green">${l.status}</span></td></tr>`).join("")}
+        <td><span class="badge ${l.status === 'ACTIVE' ? 'green' : 'gray'}">${l.status}</span></td>
+        <td style="display:flex;gap:6px"><button class="btn small" onclick="editLocation(${l.id})">Edit</button>
+          <button class="btn small danger" onclick="deleteLocation(${l.id})">Delete</button></td></tr>`).join("")}
     </tbody></table></div>`;
   }
+  function formFields(l = {}) {
+    return `
+      <div class="field"><label>Name</label><input id="lName" value="${esc(l.name || "")}"></div>
+      <div class="field"><label>Type</label><select id="lType">
+        <option value="WAREHOUSE" ${l.type === 'WAREHOUSE' ? 'selected' : ''}>Warehouse</option>
+        <option value="SHOWROOM" ${l.type === 'SHOWROOM' ? 'selected' : ''}>Showroom</option></select></div>
+      <div class="field"><label>Address</label><input id="lAddr" value="${esc(l.address || "")}"></div>
+      ${l.id ? `<div class="field"><label>Status</label><select id="lStatus">
+        <option value="ACTIVE" ${l.status === 'ACTIVE' ? 'selected' : ''}>Active</option>
+        <option value="INACTIVE" ${l.status === 'INACTIVE' ? 'selected' : ''}>Inactive</option></select></div>` : ""}
+    `;
+  }
+  function readForm() {
+    return {
+      name: document.getElementById("lName").value, type: document.getElementById("lType").value,
+      address: document.getElementById("lAddr").value,
+      status: document.getElementById("lStatus") ? document.getElementById("lStatus").value : "ACTIVE",
+    };
+  }
   document.getElementById("newLocBtn").addEventListener("click", () => {
-    openModal("New Location", `
-      <div class="field"><label>Name</label><input id="lName"></div>
-      <div class="field"><label>Type</label><select id="lType"><option value="WAREHOUSE">Warehouse</option><option value="SHOWROOM">Showroom</option></select></div>
-      <div class="field"><label>Address</label><input id="lAddr"></div>
-      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
-        <button class="btn green" id="lSaveBtn">Save</button></div>
-    `, () => {
+    openModal("New Location", formFields() + `<div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="lSaveBtn">Save</button></div>`, () => {
       document.getElementById("lSaveBtn").addEventListener("click", async () => {
-        try {
-          await api("/locations", { method: "POST", body: {
-            name: document.getElementById("lName").value, type: document.getElementById("lType").value,
-            address: document.getElementById("lAddr").value,
-          }});
-          closeModal(); toast("Location created", "success"); load();
-        } catch (e) {}
+        try { await api("/locations", { method: "POST", body: readForm() }); closeModal(); toast("Location created", "success"); load(); }
+        catch (e) {}
       });
     });
   });
+  window.editLocation = (id) => {
+    const l = state.locations.find(x => x.id === id);
+    openModal("Edit Location", formFields(l) + `<div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="lSaveBtn">Save Changes</button></div>`, () => {
+      document.getElementById("lSaveBtn").addEventListener("click", async () => {
+        try { await api(`/locations/${id}`, { method: "PUT", body: readForm() }); closeModal(); toast("Location updated", "success"); load(); }
+        catch (e) {}
+      });
+    });
+  };
+  window.deleteLocation = async (id) => {
+    if (!confirm("Delete this location? This only works if it has no inventory, users, or sales.")) return;
+    try { await api(`/locations/${id}`, { method: "DELETE" }); toast("Location deleted", "success"); load(); }
+    catch (e) {}
+  };
   load();
 }
 
@@ -868,5 +1162,340 @@ async function renderAudit(c) {
     </tbody></table></div>`;
   }
   document.getElementById("auditModuleFilter").addEventListener("change", load);
+  load();
+}
+
+// ================================================================== CYLINDER DEPOSITS
+async function renderCylinderDeposits(c) {
+  c.innerHTML = `
+    <p style="color:var(--muted);font-size:13px">Cylinders currently on loan to customers from DEPOSIT sales — not yet returned.</p>
+    <div id="depTable">Loading...</div>`;
+  async function load() {
+    const rows = await api("/cylinder-deposits");
+    document.getElementById("depTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Customer</th><th>Account #</th><th>Product</th><th>Qty on Loan</th><th></th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(r => `<tr><td>${esc(r.customer_name)}</td><td>${r.account_no}</td><td>${esc(r.product_name)}</td>
+        <td><b>${r.qty_on_loan}</b></td>
+        <td><button class="btn small green" onclick="openReturnCylinder(${r.customer_id}, ${r.product_id}, ${r.qty_on_loan}, '${esc(r.customer_name)}', '${esc(r.product_name)}')">Record Return</button></td></tr>`).join("")
+        : `<tr><td colspan="5" style="color:var(--muted)">No cylinders currently on deposit.</td></tr>`}
+    </tbody></table></div>`;
+  }
+  window.openReturnCylinder = (customerId, productId, maxQty, custName, prodName) => {
+    const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+    openModal(`Return Cylinder — ${custName}`, `
+      <p>${esc(prodName)} — currently ${maxQty} on loan</p>
+      ${state.user.role === "ADMIN" ? `<div class="field"><label>Receiving Location</label><select id="retLoc">${locOpts}</select></div>` : ""}
+      <div class="field"><label>Quantity Returned</label><input type="number" id="retQty" value="1" min="1" max="${maxQty}"></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="retSaveBtn">Confirm Return</button></div>
+    `, () => {
+      document.getElementById("retSaveBtn").addEventListener("click", async () => {
+        const body = { customer_id: customerId, product_id: productId, qty: document.getElementById("retQty").value };
+        if (state.user.role === "ADMIN") body.location_id = document.getElementById("retLoc").value;
+        try {
+          await api("/cylinder-deposits/return", { method: "POST", body });
+          closeModal(); toast("Cylinder return recorded", "success"); load();
+        } catch (e) {}
+      });
+    });
+  };
+  load();
+}
+
+// ================================================================== VEHICLES
+async function renderVehicles(c) {
+  c.innerHTML = `<div style="margin-bottom:12px"><button class="btn green" id="newVehBtn">+ New Vehicle</button></div><div id="vehTable">Loading...</div>`;
+  const statusColor = s => ({ AVAILABLE: "green", DISPATCHED: "warn", "IN TRANSIT": "warn", MAINTENANCE: "danger", INACTIVE: "gray" }[s] || "gray");
+  async function load() {
+    const rows = await api("/vehicles");
+    document.getElementById("vehTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Plate #</th><th>Type</th><th>Driver</th><th>Status</th><th>Odometer</th><th>Next Maintenance</th><th>Reg. Expiry</th><th></th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(v => `<tr><td>${esc(v.plate_number)}</td><td>${esc(v.vehicle_type || "")}</td><td>${esc(v.driver || "")}</td>
+        <td><span class="badge ${statusColor(v.status)}">${v.status}</span></td><td>${v.odometer || 0}</td>
+        <td>${v.next_maintenance_date || "—"}</td><td>${v.registration_expiry || "—"}</td>
+        <td style="display:flex;gap:6px"><button class="btn small" onclick="editVehicle(${v.id})">Edit</button>
+          <button class="btn small danger" onclick="deleteVehicle(${v.id})">Delete</button></td></tr>`).join("")
+        : `<tr><td colspan="8" style="color:var(--muted)">No vehicles yet.</td></tr>`}
+    </tbody></table></div>`;
+  }
+  function formFields(v = {}) {
+    return `
+      <div class="field"><label>Plate Number</label><input id="vPlate" value="${esc(v.plate_number || "")}" ${v.id ? "disabled" : ""}></div>
+      <div class="field"><label>Vehicle Type</label><input id="vType" value="${esc(v.vehicle_type || "")}" placeholder="e.g. 6-Wheeler Truck"></div>
+      <div class="field"><label>Driver</label><input id="vDriver" value="${esc(v.driver || "")}"></div>
+      <div class="field"><label>Status</label><select id="vStatus">
+        ${["AVAILABLE", "DISPATCHED", "IN TRANSIT", "MAINTENANCE", "INACTIVE"].map(s => `<option value="${s}" ${v.status === s ? "selected" : ""}>${s}</option>`).join("")}
+      </select></div>
+      <div class="field"><label>Odometer (km)</label><input type="number" id="vOdo" value="${v.odometer || 0}"></div>
+      <div class="field"><label>Last Maintenance Date</label><input type="date" id="vLastMaint" value="${v.last_maintenance_date || ""}"></div>
+      <div class="field"><label>Next Maintenance Date</label><input type="date" id="vNextMaint" value="${v.next_maintenance_date || ""}"></div>
+      <div class="field"><label>Registration Expiry</label><input type="date" id="vReg" value="${v.registration_expiry || ""}"></div>
+      <div class="field"><label>Insurance Expiry</label><input type="date" id="vIns" value="${v.insurance_expiry || ""}"></div>
+      <div class="field"><label>Notes</label><input id="vNotes" value="${esc(v.notes || "")}"></div>
+    `;
+  }
+  function readForm() {
+    return {
+      plate_number: document.getElementById("vPlate").value.trim(),
+      vehicle_type: document.getElementById("vType").value,
+      driver: document.getElementById("vDriver").value,
+      status: document.getElementById("vStatus").value,
+      odometer: document.getElementById("vOdo").value,
+      last_maintenance_date: document.getElementById("vLastMaint").value,
+      next_maintenance_date: document.getElementById("vNextMaint").value,
+      registration_expiry: document.getElementById("vReg").value,
+      insurance_expiry: document.getElementById("vIns").value,
+      notes: document.getElementById("vNotes").value,
+    };
+  }
+  document.getElementById("newVehBtn").addEventListener("click", () => {
+    openModal("New Vehicle", formFields() + `<div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="vSaveBtn">Save</button></div>`, () => {
+      document.getElementById("vSaveBtn").addEventListener("click", async () => {
+        const body = readForm();
+        if (!body.plate_number) { toast("Plate number is required", "error"); return; }
+        try { await api("/vehicles", { method: "POST", body }); closeModal(); toast("Vehicle added", "success"); load(); }
+        catch (e) {}
+      });
+    });
+  });
+  window.editVehicle = async (id) => {
+    const v = (await api("/vehicles")).find(x => x.id === id);
+    openModal("Edit Vehicle", formFields(v) + `<div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="vSaveBtn">Save Changes</button></div>`, () => {
+      document.getElementById("vSaveBtn").addEventListener("click", async () => {
+        try { await api(`/vehicles/${id}`, { method: "PUT", body: readForm() }); closeModal(); toast("Vehicle updated", "success"); load(); }
+        catch (e) {}
+      });
+    });
+  };
+  window.deleteVehicle = async (id) => {
+    if (!confirm("Delete this vehicle?")) return;
+    try { await api(`/vehicles/${id}`, { method: "DELETE" }); toast("Vehicle deleted", "success"); load(); }
+    catch (e) {}
+  };
+  load();
+}
+
+// ================================================================== HAULING SCHEDULE
+async function renderHauling(c) {
+  c.innerHTML = `<div style="margin-bottom:12px"><button class="btn green" id="newHaulBtn">+ Schedule Hauling</button></div><div id="haulTable">Loading...</div>`;
+  const statusColor = s => ({ SCHEDULED: "blue", LOADING: "warn", "IN TRANSIT": "warn", COMPLETED: "green", CANCELLED: "danger" }[s] || "gray");
+  async function load() {
+    const rows = await api("/hauling");
+    document.getElementById("haulTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Hauling #</th><th>Date</th><th>Plant</th><th>Destination</th><th>Vehicle</th><th>Product</th><th>Qty</th><th>Status</th><th></th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(h => `<tr><td>${h.hauling_no}</td><td>${h.scheduled_date}</td><td>${esc(h.plant_name)}</td>
+        <td>${esc(h.destination_name || "")}</td><td>${esc(h.plate_number || "")}</td><td>${esc(h.product_name || "")}</td><td>${h.qty || ""}</td>
+        <td><span class="badge ${statusColor(h.status)}">${h.status}</span></td>
+        <td style="display:flex;gap:6px">
+          <select onchange="updateHaulingStatus(${h.id}, this.value)" style="font-size:12px;padding:4px">
+            ${["SCHEDULED", "LOADING", "IN TRANSIT", "COMPLETED", "CANCELLED"].map(s => `<option value="${s}" ${h.status === s ? "selected" : ""}>${s}</option>`).join("")}
+          </select>
+          <button class="btn small danger" onclick="deleteHauling(${h.id})">Delete</button>
+        </td></tr>`).join("")
+        : `<tr><td colspan="9" style="color:var(--muted)">No hauling trips scheduled.</td></tr>`}
+    </tbody></table></div>`;
+  }
+  document.getElementById("newHaulBtn").addEventListener("click", async () => {
+    const vehicles = await api("/vehicles");
+    const vehOpts = `<option value="">— Unassigned —</option>` + vehicles.map(v => `<option value="${v.id}">${esc(v.plate_number)}</option>`).join("");
+    const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+    const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+    openModal("Schedule Hauling", `
+      <div class="field"><label>Scheduled Date</label><input type="date" id="hDate"></div>
+      <div class="field"><label>Plant Name</label><input id="hPlant" placeholder="e.g. Solane Plant"></div>
+      <div class="field"><label>Vehicle</label><select id="hVeh">${vehOpts}</select></div>
+      <div class="field"><label>Driver</label><input id="hDriver"></div>
+      <div class="field"><label>Destination Location</label><select id="hDest">${locOpts}</select></div>
+      <div class="field"><label>Product</label><select id="hProd">${prodOpts}</select></div>
+      <div class="field"><label>Expected Quantity</label><input type="number" id="hQty" min="1"></div>
+      <div class="field"><label>Notes</label><input id="hNotes"></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="hSaveBtn">Save</button></div>
+    `, () => {
+      document.getElementById("hSaveBtn").addEventListener("click", async () => {
+        const scheduled_date = document.getElementById("hDate").value;
+        const plant_name = document.getElementById("hPlant").value.trim();
+        if (!scheduled_date || !plant_name) { toast("Date and plant name are required", "error"); return; }
+        try {
+          await api("/hauling", { method: "POST", body: {
+            scheduled_date, plant_name, vehicle_id: document.getElementById("hVeh").value || null,
+            driver: document.getElementById("hDriver").value, destination_location_id: document.getElementById("hDest").value,
+            product_id: document.getElementById("hProd").value, qty: document.getElementById("hQty").value,
+            notes: document.getElementById("hNotes").value,
+          }});
+          closeModal(); toast("Hauling trip scheduled", "success"); load();
+        } catch (e) {}
+      });
+    });
+  });
+  window.updateHaulingStatus = async (id, status) => {
+    const h = (await api("/hauling")).find(x => x.id === id);
+    try {
+      await api(`/hauling/${id}`, { method: "PUT", body: { ...h, status } });
+      toast("Status updated", "success"); load();
+    } catch (e) {}
+  };
+  window.deleteHauling = async (id) => {
+    if (!confirm("Delete this hauling schedule entry?")) return;
+    try { await api(`/hauling/${id}`, { method: "DELETE" }); toast("Deleted", "success"); load(); }
+    catch (e) {}
+  };
+  load();
+}
+
+// ================================================================== EMPLOYEES
+async function renderEmployees(c) {
+  c.innerHTML = `<div style="margin-bottom:12px"><button class="btn green" id="newEmpBtn">+ New Employee</button></div><div id="empTable">Loading...</div>`;
+  async function load() {
+    const rows = await api("/employees");
+    document.getElementById("empTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Name</th><th>Position</th><th>Location</th><th>Contact</th><th>Hire Date</th><th>Status</th><th></th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(e => `<tr><td>${esc(e.name)}</td><td>${esc(e.position || "")}</td><td>${esc(e.location_name || "")}</td>
+        <td>${esc(e.contact_number || "")}</td><td>${e.hire_date || ""}</td>
+        <td><span class="badge ${e.status === 'ACTIVE' ? 'green' : e.status === 'ON LEAVE' ? 'warn' : 'gray'}">${e.status}</span></td>
+        <td style="display:flex;gap:6px"><button class="btn small" onclick="editEmployee(${e.id})">Edit</button>
+          <button class="btn small danger" onclick="deleteEmployee(${e.id})">Delete</button></td></tr>`).join("")
+        : `<tr><td colspan="7" style="color:var(--muted)">No employees on file yet.</td></tr>`}
+    </tbody></table></div>`;
+  }
+  function formFields(e = {}) {
+    const locOpts = state.locations.map(l => `<option value="${l.id}" ${e.location_id === l.id ? "selected" : ""}>${esc(l.name)}</option>`).join("");
+    return `
+      <div class="field"><label>Name</label><input id="eName" value="${esc(e.name || "")}"></div>
+      <div class="field"><label>Position</label><input id="ePosition" value="${esc(e.position || "")}"></div>
+      <div class="field"><label>Location</label><select id="eLoc"><option value="">—</option>${locOpts}</select></div>
+      <div class="field"><label>Contact Number</label><input id="eContact" value="${esc(e.contact_number || "")}"></div>
+      <div class="field"><label>Hire Date</label><input type="date" id="eHire" value="${e.hire_date || ""}"></div>
+      <div class="field"><label>Status</label><select id="eStatus">
+        ${["ACTIVE", "ON LEAVE", "INACTIVE"].map(s => `<option value="${s}" ${e.status === s ? "selected" : ""}>${s}</option>`).join("")}
+      </select></div>
+      <div class="field"><label>Notes</label><input id="eNotes" value="${esc(e.notes || "")}"></div>
+    `;
+  }
+  function readForm() {
+    return {
+      name: document.getElementById("eName").value.trim(), position: document.getElementById("ePosition").value,
+      location_id: document.getElementById("eLoc").value || null, contact_number: document.getElementById("eContact").value,
+      hire_date: document.getElementById("eHire").value, status: document.getElementById("eStatus").value,
+      notes: document.getElementById("eNotes").value,
+    };
+  }
+  document.getElementById("newEmpBtn").addEventListener("click", () => {
+    openModal("New Employee", formFields() + `<div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="eSaveBtn">Save</button></div>`, () => {
+      document.getElementById("eSaveBtn").addEventListener("click", async () => {
+        const body = readForm();
+        if (!body.name) { toast("Name is required", "error"); return; }
+        try { await api("/employees", { method: "POST", body }); closeModal(); toast("Employee added", "success"); load(); }
+        catch (e) {}
+      });
+    });
+  });
+  window.editEmployee = async (id) => {
+    const e = (await api("/employees")).find(x => x.id === id);
+    openModal("Edit Employee", formFields(e) + `<div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="eSaveBtn">Save Changes</button></div>`, () => {
+      document.getElementById("eSaveBtn").addEventListener("click", async () => {
+        try { await api(`/employees/${id}`, { method: "PUT", body: readForm() }); closeModal(); toast("Employee updated", "success"); load(); }
+        catch (e) {}
+      });
+    });
+  };
+  window.deleteEmployee = async (id) => {
+    if (!confirm("Delete this employee?")) return;
+    try { await api(`/employees/${id}`, { method: "DELETE" }); toast("Employee deleted", "success"); load(); }
+    catch (e) {}
+  };
+  load();
+}
+
+// ================================================================== STAFF SCHEDULE
+async function renderStaffSchedule(c) {
+  const canEdit = state.user.role === "ADMIN" || state.user.role === "MANAGER";
+  c.innerHTML = `
+    <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+      <input type="date" id="schedFrom"><input type="date" id="schedTo">
+      <button class="btn" id="schedFilterBtn">Filter</button>
+      ${canEdit ? `<button class="btn green" id="newSchedBtn">+ Add Shift</button>` : ""}
+    </div>
+    <div id="schedTable">Loading...</div>`;
+  async function load() {
+    const from = document.getElementById("schedFrom").value, to = document.getElementById("schedTo").value;
+    const qs = new URLSearchParams(); if (from) qs.set("from", from); if (to) qs.set("to", to);
+    const rows = await api("/staff-schedule?" + qs.toString());
+    document.getElementById("schedTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Date</th><th>Employee</th><th>Shift</th><th>Location</th><th>Notes</th>${canEdit ? "<th></th>" : ""}
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(s => `<tr><td>${s.shift_date}</td><td>${esc(s.employee_name)}</td>
+        <td>${esc(s.shift_start || "")} – ${esc(s.shift_end || "")}</td><td>${esc(s.location_name || "")}</td><td>${esc(s.notes || "")}</td>
+        ${canEdit ? `<td><button class="btn small danger" onclick="deleteSchedule(${s.id})">Remove</button></td>` : ""}</tr>`).join("")
+        : `<tr><td colspan="${canEdit ? 6 : 5}" style="color:var(--muted)">No shifts scheduled in this range.</td></tr>`}
+    </tbody></table></div>`;
+  }
+  document.getElementById("schedFilterBtn").addEventListener("click", load);
+  if (canEdit) {
+    document.getElementById("newSchedBtn").addEventListener("click", async () => {
+      const employees = await api("/employees");
+      const empOpts = employees.map(e => `<option value="${e.id}">${esc(e.name)}</option>`).join("");
+      const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+      openModal("Add Shift", `
+        <div class="field"><label>Employee</label><select id="sEmp">${empOpts}</select></div>
+        <div class="field"><label>Date</label><input type="date" id="sDate"></div>
+        <div class="field"><label>Shift Start</label><input type="time" id="sStart"></div>
+        <div class="field"><label>Shift End</label><input type="time" id="sEnd"></div>
+        <div class="field"><label>Location</label><select id="sLoc">${locOpts}</select></div>
+        <div class="field"><label>Notes</label><input id="sNotes"></div>
+        <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+          <button class="btn green" id="sSaveBtn">Save</button></div>
+      `, () => {
+        document.getElementById("sSaveBtn").addEventListener("click", async () => {
+          const shift_date = document.getElementById("sDate").value;
+          if (!shift_date) { toast("Date is required", "error"); return; }
+          try {
+            await api("/staff-schedule", { method: "POST", body: {
+              employee_id: document.getElementById("sEmp").value, shift_date,
+              shift_start: document.getElementById("sStart").value, shift_end: document.getElementById("sEnd").value,
+              location_id: document.getElementById("sLoc").value, notes: document.getElementById("sNotes").value,
+            }});
+            closeModal(); toast("Shift added", "success"); load();
+          } catch (e) {}
+        });
+      });
+    });
+    window.deleteSchedule = async (id) => {
+      try { await api(`/staff-schedule/${id}`, { method: "DELETE" }); toast("Shift removed", "success"); load(); }
+      catch (e) {}
+    };
+  }
+  load();
+}
+
+// ================================================================== EMPLOYEE KPI
+async function renderKpi(c) {
+  c.innerHTML = `
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <input type="date" id="kpiFrom"><input type="date" id="kpiTo">
+      <button class="btn" id="kpiFilterBtn">Filter</button>
+    </div>
+    <p style="color:var(--muted);font-size:13px">Built from actual recorded sales per cashier — no separate data entry needed.</p>
+    <div id="kpiTable">Loading...</div>`;
+  async function load() {
+    const from = document.getElementById("kpiFrom").value, to = document.getElementById("kpiTo").value;
+    const qs = new URLSearchParams(); if (from) qs.set("from", from); if (to) qs.set("to", to);
+    const rows = await api("/reports/employee-kpi?" + qs.toString());
+    document.getElementById("kpiTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Employee</th><th>Role</th><th>Location</th><th>Transactions</th><th>Total Sales</th><th>Avg Sale Value</th><th>Items Sold</th>
+    </tr></thead><tbody>
+      ${rows.map(r => `<tr><td>${esc(r.name)}</td><td>${r.role}</td><td>${esc(r.location_name || "")}</td>
+        <td>${r.transaction_count}</td><td>${money(r.total_sales)}</td><td>${money(r.avg_sale_value)}</td><td>${r.total_items_sold}</td></tr>`).join("")}
+    </tbody></table></div>`;
+  }
+  document.getElementById("kpiFilterBtn").addEventListener("click", load);
   load();
 }

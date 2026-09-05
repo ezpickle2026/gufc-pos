@@ -32,59 +32,111 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
-- **Excel & PDF export** on Sales, Inventory, and Receivables reports (real .xlsx via
-  openpyxl, real .pdf via reportlab — not print-to-PDF workarounds)
-- **Manual inventory adjustment** (Admin only) with a required reason, logged to the
-  audit trail; optional override to allow the result to go negative
-- **Inventory Ledger** page (Admin only) — every stock movement, filterable by
-  location/product
-- **Audit log filtering** — switch between All / Sales / Inventory activity
-- **Statement of Account (SOA)** — downloadable PDF per customer with beginning
-  balance, dated entries, running balance, ending balance
-- **Account Ledger** — on-screen version of the same, with a date-range filter,
-  accessible via "Ledger / SOA" on each customer row
-- **Sale detail view + reprint** — "View" on any row in Sales opens the full
-  breakdown and lets you reprint the original receipt
-- **Your logo** is now on the login screen, sidebar, and printed receipts
+- **Refill vs. Deposit LPG sales** — the POS now distinguishes gas-only refills
+  (customer exchanges an empty cylinder, which is tracked back into stock as an
+  "empty" ready to haul to the plant) from Deposit/New sales (customer takes a
+  full cylinder with no exchange, and the cylinder is tracked as on loan to them
+  until they bring it back). Each product now has a configurable deposit fee.
+- **Supplier stock import** — record inventory received from a supplier/plant
+  directly from the Dispatch page, with supplier name and reference number
+- **Manual inventory adjustment** — Admin can correct stock counts with a
+  required reason, logged to the audit trail
+- **Customers**: CSV import with a downloadable template, admin-only create/
+  edit/delete (other roles are view-only), manageable categories, safe delete
+  guard (blocked if the customer has sales history — deactivate instead)
+- **Products**: CSV import/template, editable price/cost/deposit fee (LPG
+  pricing fluctuates — this no longer requires a code change)
+- **Locations & Users**: full edit/delete for Admins, with the same safe-delete
+  guards (a location or user with real activity on record can't be hard-deleted
+  — disable/deactivate instead)
+- **Sales report** now shows the actual items purchased per transaction
+- **Manager role** — a new role that can view (but not edit) most operational
+  data: dashboard, sales, customers, receivables, inventory, reports, exports,
+  audit log, plus full access to the new modules below
+- **Vehicles** — fleet list with maintenance/registration/insurance dates (Admin
+  + Manager)
+- **Hauling Schedule** — plan and track trips to the supplier plant (Admin +
+  Manager)
+- **Employees** — basic HR records, optionally linked to a login account (Admin
+  + Manager)
+- **Staff Schedule** — a shift list (not a drag-and-drop calendar — see note
+  below) that Admin/Manager can build and everyone can view
+- **Employee KPI report** — sales performance per cashier (transactions, total
+  sales, average sale, items sold), built from data already tracked by the
+  POS — no extra data entry required (Admin + Manager)
+
+**Honest scope note on the staffing/KPI ask:** a real drag-and-drop staffing
+calendar and a fully custom KPI dashboard are each a meaningful project on
+their own — what's shipped here is a working, functional list-based schedule
+and a KPI report built from real sales data, which covers the substance of the
+request without pretending to be a polished calendar UI. That's a good next
+increment if it's worth the investment.
+
+**Database migration:** this update changes the schema (new tables, a couple
+of new columns, and a widened user-role constraint to add MANAGER). The app
+migrates itself automatically and safely on first boot after the update — it
+was tested against a simulated copy of a populated production database and
+confirmed to preserve all existing data. You don't need to do anything by hand,
+but if you're running on Railway with a persistent volume (recommended setup),
+your existing data will carry forward untouched.
 
 ## What's actually implemented (and tested)
 
-- Login/logout, sessions, 3 roles (Admin, Attendant, Dispatcher) with server-side
-  permission checks on every endpoint (not just hidden buttons)
-- Locations (warehouse/showroom) with **per-location inventory** — never combined
+- Login/logout, sessions, **4 roles** (Admin, Manager, Attendant, Dispatcher)
+  with server-side permission checks on every endpoint (not just hidden buttons)
+- Locations (warehouse/showroom) with **per-location inventory** — never combined;
+  Admin can create, edit, and delete (delete is blocked with a clear message if
+  the location has real activity on record — deactivate instead)
 - Products with server-side pricing (POS always re-fetches price from the DB —
   the browser's price is never trusted); historical sales keep the price at time
-  of sale even if you change it later
-- Customers with categories (ERTO/MRTO/Commercial/DOMCOM/Solus/ETC), payment terms,
-  credit limits
+  of sale even if you change it later. Admin can edit price/cost/deposit fee
+  anytime, create/edit/delete, and bulk-import via CSV with a downloadable template
+- Customers with manageable categories, payment terms, credit limits. Admin-only
+  create/edit/delete (other roles are view-only); CSV import with template;
+  delete is blocked if the customer has sales history — deactivate instead
 - **POS**: search, cart, quantity edit, discount, customer select, cash or credit
   sale, **split payments across multiple methods**, automatic inventory decrement,
-  automatic receivable creation on credit balance, printable receipt
+  automatic receivable creation on credit balance, printable receipt with your logo
+- **Refill vs. Deposit LPG sales**: refill sales price gas-only and return an empty
+  cylinder to inventory automatically; deposit/new sales add the cylinder deposit
+  fee and track the cylinder as on loan to the customer until returned
 - Server-side validation: can't oversell inventory, can't exceed a customer's
   credit limit, can't complete a cash sale for less than the total, discounts can't
   exceed subtotal
 - Accounts receivable: auto due-date calc from terms, status (CURRENT/DUE SOON/
   OVERDUE/PARTIALLY PAID/PAID), partial/full payment posting that updates the
   linked sale too
-- Inventory transfers between locations (request→released→received), with
-  duplicate-receive prevention
-- Void sale (admin only) reverses inventory and keeps the record — never deletes
-- Full audit log (login/logout, sale created/voided, payment posted, product/user/
-  location created, transfer created/received) — visible to Admin only
+- **Account Ledger & Statement of Account (SOA)**: per-customer running balance
+  on-screen with date filtering, plus a downloadable PDF statement
+- Inventory transfers between locations (released→received), with duplicate-receive
+  prevention; **supplier stock import** with supplier name/reference tracking;
+  **manual inventory adjustment** (Admin) with a required reason
+- **Inventory Ledger**: every stock movement, filterable by location/product/type
+- Void sale (Admin) reverses inventory and keeps the record — never deletes;
+  **view/reprint** any past sale's full receipt
+- Full audit log (login/logout, sales, payments, inventory, transfers, and more),
+  filterable by module, visible to Admin + Manager
+- Users: Admin can create, edit (including password reset), disable/enable, and
+  delete (delete is blocked if the user has real activity on record — disable
+  instead)
 - Dashboard: today's sales, outstanding/overdue receivables, low-stock alerts,
   payments-by-method
-- Reports: sales (date-filtered), inventory snapshot
-- Mobile-responsive throughout, print-friendly receipt
+- **Reports**: sales (itemized, date-filtered), inventory, receivables aging —
+  each exportable as real **.xlsx (Excel)** or **.pdf**, not print-to-PDF workarounds
+- **Vehicles**, **Hauling Schedule**, **Employees**, **Staff Schedule**, and an
+  **Employee KPI report** (Admin + Manager) — see "Honest scope note" above
+- Mobile-responsive throughout, print-friendly receipts and reports
 
 ## What's stubbed or left out (be aware before you rely on this)
 
-- Vehicle monitoring, expense management, and expense approval workflow — not built
-- CSV/Excel/PDF export — not built (reports render as HTML tables only)
+- Expense management and expense approval workflow — not built
 - Cashier shift open/close with cash-count variance — not built
 - Barcode scanning — not built
-- Notifications — not built
-- Customer statement / PDF invoice — not built (receipt print exists; statement
-  view does not)
+- Notifications (low stock alerts, overdue accounts, etc. beyond the dashboard) — not built
+- A true drag-and-drop staffing calendar — the current Staff Schedule is a
+  filterable list, not a calendar widget (see "Honest scope note" above)
+- Fuel logs / cost-per-km tracking on vehicles — only maintenance/registration/
+  insurance dates are tracked, not fuel consumption
 - Password-change-on-first-login — not enforced (do it manually — see checklist)
 
 ## Running it locally
@@ -104,6 +156,7 @@ network — use your machine's LAN IP instead of localhost).
 | Username    | Password       | Role       | Location            |
 |-------------|----------------|------------|----------------------|
 | admin       | ChangeMe123!   | Admin      | all                  |
+| mgarcia     | Manager123!    | Manager    | all (view + oversight) |
 | jsoliven    | Attendant123!  | Attendant  | Soliven Showroom     |
 | mmadamba    | Attendant123!  | Attendant  | Madamba Warehouse    |
 | pdispatch   | Dispatch123!   | Dispatcher | Madamba Warehouse    |
