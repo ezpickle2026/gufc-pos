@@ -1618,8 +1618,6 @@ def create_user():
     d = request.get_json(force=True)
     u = session["user"]
     role = (d.get("role") or "").strip()
-    if u["role"] == "MANAGER" and role == "ADMIN":
-        return jsonify(error="Managers can't create Admin accounts"), 403
     conn = get_db()
     role_exists = conn.execute("SELECT 1 FROM roles WHERE name=?", (role,)).fetchone()
     if not role_exists:
@@ -1650,13 +1648,7 @@ def update_user(uid):
     if not existing:
         conn.close()
         return jsonify(error="Not found"), 404
-    if u["role"] == "MANAGER" and existing["role"] == "ADMIN":
-        conn.close()
-        return jsonify(error="Managers can't edit Admin accounts"), 403
     new_role = d.get("role", existing["role"])
-    if u["role"] == "MANAGER" and new_role == "ADMIN":
-        conn.close()
-        return jsonify(error="Managers can't promote a user to Admin"), 403
     if new_role != existing["role"]:
         role_exists = conn.execute("SELECT 1 FROM roles WHERE name=?", (new_role,)).fetchone()
         if not role_exists:
@@ -1684,10 +1676,6 @@ def update_user(uid):
 @roles_required("ADMIN", "MANAGER")
 def disable_user(uid):
     conn = get_db()
-    target = conn.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
-    if target and session["user"]["role"] == "MANAGER" and target["role"] == "ADMIN":
-        conn.close()
-        return jsonify(error="Managers can't disable Admin accounts"), 403
     conn.execute("UPDATE users SET active=0 WHERE id=?", (uid,))
     audit(conn, "DISABLE", "USERS", uid)
     conn.commit()
@@ -1699,10 +1687,6 @@ def disable_user(uid):
 @roles_required("ADMIN", "MANAGER")
 def enable_user(uid):
     conn = get_db()
-    target = conn.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
-    if target and session["user"]["role"] == "MANAGER" and target["role"] == "ADMIN":
-        conn.close()
-        return jsonify(error="Managers can't re-enable Admin accounts"), 403
     conn.execute("UPDATE users SET active=1 WHERE id=?", (uid,))
     audit(conn, "ENABLE", "USERS", uid)
     conn.commit()
@@ -1716,10 +1700,6 @@ def delete_user(uid):
     if uid == session["user"]["id"]:
         return jsonify(error="You can't delete your own account while logged in as it"), 400
     conn = get_db()
-    target = conn.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
-    if target and session["user"]["role"] == "MANAGER" and target["role"] == "ADMIN":
-        conn.close()
-        return jsonify(error="Managers can't delete Admin accounts"), 403
     sale_count = conn.execute("SELECT COUNT(*) c FROM sales WHERE user_id=?", (uid,)).fetchone()["c"]
     if sale_count > 0:
         conn.close()

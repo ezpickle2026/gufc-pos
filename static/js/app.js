@@ -943,13 +943,11 @@ async function renderReports(c) {
 
 // ================================================================== ADMIN: USERS
 async function renderUsers(c) {
-  const isManager = state.user.role === "MANAGER";
-  const canManage = state.user.role === "ADMIN" || isManager;
+  const canManage = state.user.role === "ADMIN" || state.user.role === "MANAGER";
   c.innerHTML = `<div style="margin-bottom:12px">${canManage ? `<button class="btn green" id="newUserBtn">+ New User</button>` : ""}</div><div id="usersTable">Loading...</div>`;
   let allRoles = [];
   function roleOptions(selected) {
     return allRoles
-      .filter(r => !(isManager && r.name === "ADMIN"))
       .map(r => `<option value="${esc(r.name)}" ${r.name === selected ? "selected" : ""}>${esc(r.name)}</option>`).join("");
   }
   async function load() {
@@ -958,19 +956,14 @@ async function renderUsers(c) {
     document.getElementById("usersTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
       <th>Username</th><th>Name</th><th>Role</th><th>Location</th><th>Status</th>${canManage ? "<th></th>" : ""}
     </tr></thead><tbody>
-      ${rows.map(u => {
-        const isProtectedAdmin = isManager && u.role === "ADMIN";
-        return `<tr><td>${u.username}</td><td>${esc(u.name)}</td><td><span class="badge blue">${esc(u.role)}</span></td>
+      ${rows.map(u => `<tr><td>${u.username}</td><td>${esc(u.name)}</td><td><span class="badge blue">${esc(u.role)}</span></td>
         <td>${esc(u.location_name || "—")}</td><td>${u.active ? '<span class="badge green">Active</span>' : '<span class="badge danger">Disabled</span>'}</td>
         ${canManage ? `<td style="display:flex;gap:6px">
-          ${isProtectedAdmin ? `<span style="color:var(--muted);font-size:12px">Admin-protected</span>` : `
-            <button class="btn small" onclick="editUser(${u.id})">Edit</button>
-            ${u.active ? `<button class="btn small danger" onclick="disableUser(${u.id})">Disable</button>`
-                       : `<button class="btn small" onclick="enableUser(${u.id})">Enable</button>`}
-            <button class="btn small danger" onclick="deleteUserRow(${u.id})">Delete</button>
-          `}
-        </td>` : ""}</tr>`;
-      }).join("")}
+          <button class="btn small" onclick="editUser(${u.id})">Edit</button>
+          ${u.active ? `<button class="btn small danger" onclick="disableUser(${u.id})">Disable</button>`
+                     : `<button class="btn small" onclick="enableUser(${u.id})">Enable</button>`}
+          <button class="btn small danger" onclick="deleteUserRow(${u.id})">Delete</button>
+        </td>` : ""}</tr>`).join("")}
     </tbody></table></div>`;
   }
   if (canManage) {

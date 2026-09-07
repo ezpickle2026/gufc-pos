@@ -40,9 +40,9 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
   down receivables for their own location; Admin/Manager still see everything
 - **Sales report PDF now exports in landscape** (verified against the actual
   PDF page dimensions, not just the code that requests it)
-- **Manager can now add and edit users** (previously view-only), with a hard
-  safety guard: Managers can't create, edit, disable, or delete Admin accounts
-  — tested against all four
+- **Manager can now add and edit users** (previously view-only), with full
+  parity to Admin — including creating, editing, disabling, and deleting Admin
+  accounts, at your explicit request
 - **Custom roles** — Admin/Manager can create new roles from scratch (e.g.
   "Senior Cashier") and tick which modules that role can access, under
   **Manage Roles**. This is a real permission system, not cosmetic — a custom
