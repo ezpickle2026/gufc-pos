@@ -1549,7 +1549,7 @@ async function renderBookedOrders(c) {
   async function load() {
     const rows = await api("/booked-orders");
     document.getElementById("ordTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>Order #</th><th>Date</th><th>Customer</th><th>Showroom</th><th>Items</th><th>Booked By</th><th>Status</th><th></th>
+      <th>Order #</th><th>Date</th><th>Customer</th><th>Location</th><th>Items</th><th>Booked By</th><th>Status</th><th></th>
     </tr></thead><tbody>
       ${rows.length ? rows.map(o => `<tr><td>${o.order_no}</td><td>${o.order_date}</td>
         <td>${esc(o.customer_name || o.customer_name_freeform || "—")}${o.customer_phone ? " (" + esc(o.customer_phone) + ")" : ""}</td>
@@ -1560,7 +1560,7 @@ async function renderBookedOrders(c) {
             ? `<button class="btn small green" onclick="updateOrderStatus(${o.id}, 'FULFILLED')">Mark Fulfilled</button>`
             : `<button class="btn small green" onclick="updateOrderStatus(${o.id}, 'FULFILLED')">Fulfill</button>
                <button class="btn small danger" onclick="updateOrderStatus(${o.id}, 'CANCELLED')">Cancel</button>`) : ""}</td>
-      </tr>`).join("") : `<tr><td colspan="8" style="color:var(--muted)">No booked orders${isAttendant ? " for your showroom" : ""} yet.</td></tr>`}
+      </tr>`).join("") : `<tr><td colspan="8" style="color:var(--muted)">No booked orders${isAttendant ? " for your location" : ""} yet.</td></tr>`}
     </tbody></table></div>`;
   }
   window.updateOrderStatus = async (id, status) => {
@@ -1572,14 +1572,14 @@ async function renderBookedOrders(c) {
       const customers = await api("/customers?q=");
       const custOptions = `<option value="">-- No account / phone-in order --</option>` +
         customers.map(cu => `<option value="${cu.id}">${esc(cu.name)} (${cu.account_no})</option>`).join("");
-      const showroomOptions = state.locations.filter(l => l.type === "SHOWROOM")
-        .map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+      const locationOptions = state.locations
+        .map(l => `<option value="${l.id}">${esc(l.name)} (${l.type === "WAREHOUSE" ? "Warehouse" : "Showroom"})</option>`).join("");
       const prodOptions = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
       openModal("Book Order", `
         <div class="field"><label>Existing Customer (optional)</label><select id="oCust">${custOptions}</select></div>
         <div class="field"><label>Or Caller Name</label><input id="oCallerName" placeholder="If no account on file"></div>
         <div class="field"><label>Phone Number</label><input id="oPhone"></div>
-        <div class="field"><label>Assign to Showroom</label><select id="oShowroom">${showroomOptions}</select></div>
+        <div class="field"><label>Assign to Location</label><select id="oShowroom">${locationOptions}</select></div>
         <div class="field"><label>Product</label><select id="oProd">${prodOptions}</select></div>
         <div class="field"><label>Quantity</label><input type="number" id="oQty" value="1" min="1"></div>
         <div class="field"><label>Notes</label><input id="oNotes"></div>
