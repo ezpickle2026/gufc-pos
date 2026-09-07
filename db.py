@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('ADMIN','MANAGER','ATTENDANT','DISPATCHER')),
+    role TEXT NOT NULL,
     location_id INTEGER REFERENCES locations(id),
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT DEFAULT (datetime('now'))
@@ -223,6 +223,55 @@ CREATE TABLE IF NOT EXISTS staff_schedule (
     notes TEXT,
     created_by INTEGER REFERENCES users(id)
 );
+
+CREATE TABLE IF NOT EXISTS roles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    is_builtin INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS role_permissions (
+    role_name TEXT NOT NULL,
+    module_key TEXT NOT NULL,
+    PRIMARY KEY (role_name, module_key)
+);
+
+CREATE TABLE IF NOT EXISTS booked_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_no TEXT UNIQUE NOT NULL,
+    order_date TEXT DEFAULT (datetime('now')),
+    customer_id INTEGER REFERENCES customers(id),
+    customer_name_freeform TEXT,
+    customer_phone TEXT,
+    showroom_location_id INTEGER NOT NULL REFERENCES locations(id),
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','FULFILLED','CANCELLED')),
+    notes TEXT,
+    created_by INTEGER REFERENCES users(id),
+    fulfilled_by INTEGER REFERENCES users(id),
+    fulfilled_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS booked_order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES booked_orders(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    qty INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS incident_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_no TEXT UNIQUE NOT NULL,
+    ts TEXT DEFAULT (datetime('now')),
+    location_id INTEGER REFERENCES locations(id),
+    reported_by INTEGER REFERENCES users(id),
+    category TEXT,
+    severity TEXT NOT NULL DEFAULT 'LOW' CHECK(severity IN ('LOW','MEDIUM','HIGH','CRITICAL')),
+    description TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','RESOLVED')),
+    resolution_notes TEXT,
+    resolved_by INTEGER REFERENCES users(id),
+    resolved_at TEXT
+);
 """
 
 
@@ -231,11 +280,46 @@ def _column_exists(conn, table, column):
     return column in cols
 
 
-def _users_table_has_manager_role(conn):
+def _users_table_has_open_role(conn):
+    """True once the users.role column has no CHECK constraint at all —
+    needed so custom role names (beyond the 5 built-ins) can be assigned."""
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
     ).fetchone()
-    return bool(row) and "MANAGER" in row[0]
+    return bool(row) and "CHECK" not in row[0]
+
+
+# Modules a role can be granted access to via the custom role/permission system.
+# NOTE: user management, product management, and location management are
+# deliberately NOT part of this list — those stay hardcoded to Admin (and
+# Manager for user management) as a safety rail, so a misconfigured custom
+# role can never grant itself financial/administrative control.
+MODULE_KEYS = [
+    "dashboard", "pos", "sales", "customers", "receivables", "inventory",
+    "inventory_ledger", "cylinder_deposits", "transfers", "hauling", "vehicles",
+    "employees", "staff_schedule", "kpi", "reports", "audit",
+    "booked_orders", "incident_reports",
+]
+
+DEFAULT_ROLE_PERMISSIONS = {
+    "ADMIN": MODULE_KEYS,  # ADMIN always has everything regardless of this table
+    "MANAGER": [
+        "dashboard", "sales", "customers", "receivables", "inventory",
+        "inventory_ledger", "cylinder_deposits", "hauling", "vehicles",
+        "employees", "staff_schedule", "kpi", "reports", "audit",
+        "booked_orders", "incident_reports",
+    ],
+    "ATTENDANT": [
+        "dashboard", "pos", "sales", "customers", "receivables", "inventory",
+        "cylinder_deposits", "staff_schedule", "booked_orders", "incident_reports",
+    ],
+    "DISPATCHER": [
+        "dashboard", "inventory", "transfers", "staff_schedule", "incident_reports",
+    ],
+    "ORDER_TAKER": [
+        "dashboard", "booked_orders", "customers", "incident_reports",
+    ],
+}
 
 
 def migrate_schema():
@@ -251,9 +335,10 @@ def migrate_schema():
         conn.execute("ALTER TABLE sale_items ADD COLUMN sale_mode TEXT NOT NULL DEFAULT 'REFILL'")
     conn.commit()
 
-    # 2. users.role CHECK constraint needs MANAGER added. SQLite can't ALTER a
-    #    CHECK constraint directly, so recreate the table and copy the data.
-    if not _users_table_has_manager_role(conn):
+    # 2. users.role needs to become a free-text field (no CHECK) so custom role
+    #    names can be assigned. SQLite can't drop a CHECK constraint directly,
+    #    so recreate the table and copy the data across.
+    if not _users_table_has_open_role(conn):
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("""
             CREATE TABLE users_new (
@@ -261,7 +346,7 @@ def migrate_schema():
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 name TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('ADMIN','MANAGER','ATTENDANT','DISPATCHER')),
+                role TEXT NOT NULL,
                 location_id INTEGER REFERENCES locations(id),
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT DEFAULT (datetime('now'))
@@ -280,6 +365,16 @@ def migrate_schema():
     if conn.execute("SELECT COUNT(*) c FROM customer_categories").fetchone()["c"] == 0:
         for name in ["ERTO", "MRTO", "Commercial", "DOMCOM", "Solus", "ETC"]:
             conn.execute("INSERT OR IGNORE INTO customer_categories (name) VALUES (?)", (name,))
+        conn.commit()
+
+    # 4. Seed the 5 built-in roles and their default module permissions, once.
+    if conn.execute("SELECT COUNT(*) c FROM roles").fetchone()["c"] == 0:
+        for role_name in DEFAULT_ROLE_PERMISSIONS:
+            conn.execute("INSERT OR IGNORE INTO roles (name, is_builtin) VALUES (?, 1)", (role_name,))
+        for role_name, modules in DEFAULT_ROLE_PERMISSIONS.items():
+            for m in modules:
+                conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES (?,?)",
+                             (role_name, m))
         conn.commit()
 
     conn.close()

@@ -9,7 +9,7 @@ from flask import send_file
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
+from reportlab.lib.pagesizes import letter, landscape
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
@@ -63,9 +63,10 @@ def _header_flowables(title, subtitle=None):
     return flow
 
 
-def pdf_table_response(title, headers, rows, filename, subtitle=None, col_widths=None):
+def pdf_table_response(title, headers, rows, filename, subtitle=None, col_widths=None, landscape_mode=False):
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=36, bottomMargin=36, leftMargin=36, rightMargin=36)
+    page_size = landscape(letter) if landscape_mode else letter
+    doc = SimpleDocTemplate(buf, pagesize=page_size, topMargin=36, bottomMargin=36, leftMargin=36, rightMargin=36)
     flow = _header_flowables(title, subtitle)
 
     data = [headers] + [[str(c) for c in row] for row in rows]

@@ -42,6 +42,7 @@ document.getElementById("loginForm").addEventListener("submit", async (e) => {
   try {
     const data = await api("/login", { method: "POST", body: { username, password } });
     state.user = data.user;
+    state.permittedModules = data.permitted_modules || [];
     await boot();
   } catch (err) {
     errEl.textContent = err.message;
@@ -56,33 +57,62 @@ document.getElementById("logoutBtn").addEventListener("click", async () => {
 
 // ---------------------------------------------------------------- nav config
 const NAV = [
-  { id: "dashboard", label: "Dashboard", icon: "\u{1F3E0}", roles: ["ADMIN", "MANAGER", "ATTENDANT", "DISPATCHER"] },
-  { id: "pos", label: "POS", icon: "\u{1F6D2}", roles: ["ADMIN", "ATTENDANT"] },
-  { id: "sales", label: "Sales", icon: "\u{1F9FE}", roles: ["ADMIN", "MANAGER", "ATTENDANT"] },
-  { id: "customers", label: "Customers", icon: "\u{1F465}", roles: ["ADMIN", "MANAGER", "ATTENDANT"] },
-  { id: "receivables", label: "Receivables", icon: "\u{1F4B0}", roles: ["ADMIN", "MANAGER", "ATTENDANT"] },
-  { id: "inventory", label: "Inventory", icon: "\u{1F4E6}", roles: ["ADMIN", "MANAGER", "ATTENDANT", "DISPATCHER"] },
-  { id: "inventory_ledger", label: "Inv. Ledger", icon: "\u{1F4D2}", roles: ["ADMIN", "MANAGER"] },
-  { id: "cylinder_deposits", label: "Cylinder Deposits", icon: "\u{1F6E2}\uFE0F", roles: ["ADMIN", "MANAGER", "ATTENDANT"] },
-  { id: "transfers", label: "Dispatch", icon: "\u{1F69A}", roles: ["ADMIN", "DISPATCHER"] },
-  { id: "hauling", label: "Hauling Schedule", icon: "\u{1F69B}", roles: ["ADMIN", "MANAGER"] },
-  { id: "vehicles", label: "Vehicles", icon: "\u{1F697}", roles: ["ADMIN", "MANAGER"] },
-  { id: "employees", label: "Employees", icon: "\u{1F477}", roles: ["ADMIN", "MANAGER"] },
-  { id: "staff_schedule", label: "Staff Schedule", icon: "\u{1F4C5}", roles: ["ADMIN", "MANAGER", "ATTENDANT", "DISPATCHER"] },
-  { id: "kpi", label: "Employee KPI", icon: "\u{1F4C8}", roles: ["ADMIN", "MANAGER"] },
-  { id: "reports", label: "Reports", icon: "\u{1F4CA}", roles: ["ADMIN", "MANAGER"] },
+  { section: "Operations" },
+  { id: "dashboard", label: "Dashboard", icon: "\u{1F3E0}", module: "dashboard" },
+  { id: "pos", label: "POS", icon: "\u{1F6D2}", module: "pos" },
+  { id: "sales", label: "Sales", icon: "\u{1F9FE}", module: "sales" },
+  { id: "booked_orders", label: "Booked Orders", icon: "\u{1F4CB}", module: "booked_orders" },
+
+  { section: "Customers & Money" },
+  { id: "customers", label: "Customers", icon: "\u{1F465}", module: "customers" },
+  { id: "receivables", label: "Receivables", icon: "\u{1F4B0}", module: "receivables" },
+  { id: "cylinder_deposits", label: "Cylinder Deposits", icon: "\u{1F6E2}\uFE0F", module: "cylinder_deposits" },
+
+  { section: "Inventory & Dispatch" },
+  { id: "inventory", label: "Inventory", icon: "\u{1F4E6}", module: "inventory" },
+  { id: "inventory_ledger", label: "Inv. Ledger", icon: "\u{1F4D2}", module: "inventory_ledger" },
+  { id: "transfers", label: "Dispatch", icon: "\u{1F69A}", module: "transfers" },
+  { id: "hauling", label: "Hauling Schedule", icon: "\u{1F69B}", module: "hauling" },
+
+  { section: "Fleet & Staff" },
+  { id: "vehicles", label: "Vehicles", icon: "\u{1F697}", module: "vehicles" },
+  { id: "employees", label: "Employees", icon: "\u{1F477}", module: "employees" },
+  { id: "staff_schedule", label: "Staff Schedule", icon: "\u{1F4C5}", module: "staff_schedule" },
+  { id: "kpi", label: "Employee KPI", icon: "\u{1F4C8}", module: "kpi" },
+
+  { section: "Reports & Admin" },
+  { id: "reports", label: "Reports", icon: "\u{1F4CA}", module: "reports" },
+  { id: "audit", label: "Audit Log", icon: "\u{1F4DC}", module: "audit" },
+  { id: "incident_reports", label: "Incident Reports", icon: "\u{26A0}\uFE0F", module: "incident_reports" },
   { id: "users", label: "Users", icon: "\u{1F464}", roles: ["ADMIN", "MANAGER"] },
+  { id: "roles", label: "Manage Roles", icon: "\u{1F511}", roles: ["ADMIN", "MANAGER"] },
   { id: "products", label: "Products", icon: "\u{1F3F7}", roles: ["ADMIN"] },
   { id: "locations", label: "Locations", icon: "\u{1F3E2}", roles: ["ADMIN"] },
-  { id: "audit", label: "Audit Log", icon: "\u{1F4DC}", roles: ["ADMIN", "MANAGER"] },
 ];
 
+function navVisible(n) {
+  // Users/Products/Locations/Roles are deliberately NOT part of the custom
+  // module-permission system — they stay hardcoded to fixed roles as a
+  // safety rail (see role_permissions design note).
+  if (n.roles) return n.roles.includes(state.user.role);
+  if (n.module) return state.user.role === "ADMIN" || state.permittedModules.includes(n.module);
+  return false;
+}
+
 function buildNav() {
-  const items = NAV.filter(n => n.roles.includes(state.user.role));
-  document.getElementById("sideNav").innerHTML = items.map(n =>
-    `<button class="nav-item" data-view="${n.id}">${n.icon}&nbsp;&nbsp;${n.label}</button>`).join("");
-  document.getElementById("bottomNav").innerHTML = items.map(n =>
-    `<button data-view="${n.id}"><span>${n.icon}</span><span>${n.label}</span></button>`).join("");
+  let sideHtml = "", bottomHtml = "", currentSectionHasItems = false, pendingSection = null;
+  for (const n of NAV) {
+    if (n.section) { pendingSection = n.section; continue; }
+    if (!navVisible(n)) continue;
+    if (pendingSection) {
+      sideHtml += `<div class="nav-section">${esc(pendingSection)}</div>`;
+      pendingSection = null;
+    }
+    sideHtml += `<button class="nav-item" data-view="${n.id}">${n.icon}&nbsp;&nbsp;${n.label}</button>`;
+    bottomHtml += `<button data-view="${n.id}"><span>${n.icon}</span><span>${n.label}</span></button>`;
+  }
+  document.getElementById("sideNav").innerHTML = sideHtml;
+  document.getElementById("bottomNav").innerHTML = bottomHtml;
   document.querySelectorAll("[data-view]").forEach(btn =>
     btn.addEventListener("click", () => switchView(btn.dataset.view)));
 }
@@ -109,12 +139,13 @@ async function boot() {
     ? "All Locations" : (myLoc ? myLoc.name : "");
   state.products = await api("/products");
   buildNav();
-  switchView("dashboard");
+  const firstVisible = NAV.find(n => !n.section && navVisible(n));
+  switchView(firstVisible ? firstVisible.id : "dashboard");
 }
 
 (async function initSession() {
   const data = await api("/me");
-  if (data.user) { state.user = data.user; boot(); }
+  if (data.user) { state.user = data.user; state.permittedModules = data.permitted_modules || []; boot(); }
 })();
 
 // ---------------------------------------------------------------- render router
@@ -129,6 +160,7 @@ function render() {
     audit: renderAudit, cylinder_deposits: renderCylinderDeposits,
     hauling: renderHauling, vehicles: renderVehicles, employees: renderEmployees,
     staff_schedule: renderStaffSchedule, kpi: renderKpi,
+    booked_orders: renderBookedOrders, incident_reports: renderIncidentReports, roles: renderRoles,
   };
   (views[state.view] || renderDashboard)(c);
 }
@@ -911,26 +943,37 @@ async function renderReports(c) {
 
 // ================================================================== ADMIN: USERS
 async function renderUsers(c) {
-  const isAdmin = state.user.role === "ADMIN";
-  c.innerHTML = `<div style="margin-bottom:12px">${isAdmin ? `<button class="btn green" id="newUserBtn">+ New User</button>` : ""}</div><div id="usersTable">Loading...</div>`;
-  const roleOptions = (selected) => ["ADMIN", "MANAGER", "ATTENDANT", "DISPATCHER"]
-    .map(r => `<option value="${r}" ${r === selected ? "selected" : ""}>${r.charAt(0) + r.slice(1).toLowerCase()}</option>`).join("");
+  const isManager = state.user.role === "MANAGER";
+  const canManage = state.user.role === "ADMIN" || isManager;
+  c.innerHTML = `<div style="margin-bottom:12px">${canManage ? `<button class="btn green" id="newUserBtn">+ New User</button>` : ""}</div><div id="usersTable">Loading...</div>`;
+  let allRoles = [];
+  function roleOptions(selected) {
+    return allRoles
+      .filter(r => !(isManager && r.name === "ADMIN"))
+      .map(r => `<option value="${esc(r.name)}" ${r.name === selected ? "selected" : ""}>${esc(r.name)}</option>`).join("");
+  }
   async function load() {
+    allRoles = await api("/roles");
     const rows = await api("/users");
     document.getElementById("usersTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>Username</th><th>Name</th><th>Role</th><th>Location</th><th>Status</th>${isAdmin ? "<th></th>" : ""}
+      <th>Username</th><th>Name</th><th>Role</th><th>Location</th><th>Status</th>${canManage ? "<th></th>" : ""}
     </tr></thead><tbody>
-      ${rows.map(u => `<tr><td>${u.username}</td><td>${esc(u.name)}</td><td><span class="badge blue">${u.role}</span></td>
+      ${rows.map(u => {
+        const isProtectedAdmin = isManager && u.role === "ADMIN";
+        return `<tr><td>${u.username}</td><td>${esc(u.name)}</td><td><span class="badge blue">${esc(u.role)}</span></td>
         <td>${esc(u.location_name || "—")}</td><td>${u.active ? '<span class="badge green">Active</span>' : '<span class="badge danger">Disabled</span>'}</td>
-        ${isAdmin ? `<td style="display:flex;gap:6px">
-          <button class="btn small" onclick="editUser(${u.id})">Edit</button>
-          ${u.active ? `<button class="btn small danger" onclick="disableUser(${u.id})">Disable</button>`
-                     : `<button class="btn small" onclick="enableUser(${u.id})">Enable</button>`}
-          <button class="btn small danger" onclick="deleteUserRow(${u.id})">Delete</button>
-        </td>` : ""}</tr>`).join("")}
+        ${canManage ? `<td style="display:flex;gap:6px">
+          ${isProtectedAdmin ? `<span style="color:var(--muted);font-size:12px">Admin-protected</span>` : `
+            <button class="btn small" onclick="editUser(${u.id})">Edit</button>
+            ${u.active ? `<button class="btn small danger" onclick="disableUser(${u.id})">Disable</button>`
+                       : `<button class="btn small" onclick="enableUser(${u.id})">Enable</button>`}
+            <button class="btn small danger" onclick="deleteUserRow(${u.id})">Delete</button>
+          `}
+        </td>` : ""}</tr>`;
+      }).join("")}
     </tbody></table></div>`;
   }
-  if (isAdmin) {
+  if (canManage) {
     document.getElementById("newUserBtn").addEventListener("click", () => {
       const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
       openModal("New User", `
@@ -982,10 +1025,12 @@ async function renderUsers(c) {
     };
     window.disableUser = async (id) => {
       if (!confirm("Disable this user?")) return;
-      await api(`/users/${id}/disable`, { method: "POST" }); toast("User disabled", "success"); load();
+      try { await api(`/users/${id}/disable`, { method: "POST" }); toast("User disabled", "success"); load(); }
+      catch (e) {}
     };
     window.enableUser = async (id) => {
-      await api(`/users/${id}/enable`, { method: "POST" }); toast("User re-enabled", "success"); load();
+      try { await api(`/users/${id}/enable`, { method: "POST" }); toast("User re-enabled", "success"); load(); }
+      catch (e) {}
     };
     window.deleteUserRow = async (id) => {
       if (!confirm("Permanently delete this user? This only works if they have no activity on record.")) return;
@@ -1497,5 +1542,202 @@ async function renderKpi(c) {
     </tbody></table></div>`;
   }
   document.getElementById("kpiFilterBtn").addEventListener("click", load);
+  load();
+}
+
+// ================================================================== BOOKED ORDERS
+async function renderBookedOrders(c) {
+  const role = state.user.role;
+  const canCreate = ["ADMIN", "MANAGER", "ORDER_TAKER"].includes(role);
+  const isAttendant = !["ADMIN", "MANAGER", "ORDER_TAKER"].includes(role);
+  c.innerHTML = `<div style="margin-bottom:12px">${canCreate ? `<button class="btn green" id="newOrderBtn">+ Book Order</button>` : ""}</div>
+    <div id="ordTable">Loading...</div>`;
+  const statusColor = s => ({ PENDING: "warn", FULFILLED: "green", CANCELLED: "danger" }[s] || "gray");
+  async function load() {
+    const rows = await api("/booked-orders");
+    document.getElementById("ordTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Order #</th><th>Date</th><th>Customer</th><th>Showroom</th><th>Items</th><th>Booked By</th><th>Status</th><th></th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(o => `<tr><td>${o.order_no}</td><td>${o.order_date}</td>
+        <td>${esc(o.customer_name || o.customer_name_freeform || "—")}${o.customer_phone ? " (" + esc(o.customer_phone) + ")" : ""}</td>
+        <td>${esc(o.showroom_name)}</td><td>${o.items.map(i => `${esc(i.product_name)} x${i.qty}`).join(", ")}</td>
+        <td>${esc(o.created_by_name || "")}</td>
+        <td><span class="badge ${statusColor(o.status)}">${o.status}</span></td>
+        <td>${o.status === "PENDING" ? (isAttendant
+            ? `<button class="btn small green" onclick="updateOrderStatus(${o.id}, 'FULFILLED')">Mark Fulfilled</button>`
+            : `<button class="btn small green" onclick="updateOrderStatus(${o.id}, 'FULFILLED')">Fulfill</button>
+               <button class="btn small danger" onclick="updateOrderStatus(${o.id}, 'CANCELLED')">Cancel</button>`) : ""}</td>
+      </tr>`).join("") : `<tr><td colspan="8" style="color:var(--muted)">No booked orders${isAttendant ? " for your showroom" : ""} yet.</td></tr>`}
+    </tbody></table></div>`;
+  }
+  window.updateOrderStatus = async (id, status) => {
+    try { await api(`/booked-orders/${id}`, { method: "PUT", body: { status } }); toast(`Order ${status.toLowerCase()}`, "success"); load(); }
+    catch (e) {}
+  };
+  if (canCreate) {
+    document.getElementById("newOrderBtn").addEventListener("click", async () => {
+      const customers = await api("/customers?q=");
+      const custOptions = `<option value="">-- No account / phone-in order --</option>` +
+        customers.map(cu => `<option value="${cu.id}">${esc(cu.name)} (${cu.account_no})</option>`).join("");
+      const showroomOptions = state.locations.filter(l => l.type === "SHOWROOM")
+        .map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+      const prodOptions = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+      openModal("Book Order", `
+        <div class="field"><label>Existing Customer (optional)</label><select id="oCust">${custOptions}</select></div>
+        <div class="field"><label>Or Caller Name</label><input id="oCallerName" placeholder="If no account on file"></div>
+        <div class="field"><label>Phone Number</label><input id="oPhone"></div>
+        <div class="field"><label>Assign to Showroom</label><select id="oShowroom">${showroomOptions}</select></div>
+        <div class="field"><label>Product</label><select id="oProd">${prodOptions}</select></div>
+        <div class="field"><label>Quantity</label><input type="number" id="oQty" value="1" min="1"></div>
+        <div class="field"><label>Notes</label><input id="oNotes"></div>
+        <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+          <button class="btn green" id="oSaveBtn">Book Order</button></div>
+      `, () => {
+        document.getElementById("oSaveBtn").addEventListener("click", async () => {
+          try {
+            await api("/booked-orders", { method: "POST", body: {
+              customer_id: document.getElementById("oCust").value || null,
+              customer_name_freeform: document.getElementById("oCallerName").value,
+              customer_phone: document.getElementById("oPhone").value,
+              showroom_location_id: document.getElementById("oShowroom").value,
+              items: [{ product_id: document.getElementById("oProd").value, qty: document.getElementById("oQty").value }],
+              notes: document.getElementById("oNotes").value,
+            }});
+            closeModal(); toast("Order booked", "success"); load();
+          } catch (e) {}
+        });
+      });
+    });
+  }
+  load();
+}
+
+// ================================================================== INCIDENT REPORTS
+async function renderIncidentReports(c) {
+  const canResolve = state.user.role === "ADMIN" || state.user.role === "MANAGER";
+  c.innerHTML = `<div style="margin-bottom:12px"><button class="btn green" id="newIncBtn">+ Report Incident</button></div>
+    <div id="incTable">Loading...</div>`;
+  const sevColor = s => ({ LOW: "blue", MEDIUM: "warn", HIGH: "danger", CRITICAL: "danger" }[s] || "gray");
+  async function load() {
+    const rows = await api("/incident-reports");
+    document.getElementById("incTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Report #</th><th>Date</th><th>Location</th><th>Reported By</th><th>Category</th><th>Severity</th><th>Description</th><th>Status</th><th></th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(r => `<tr><td>${r.report_no}</td><td>${r.ts}</td><td>${esc(r.location_name || "")}</td>
+        <td>${esc(r.reporter_name || "")}</td><td>${esc(r.category || "")}</td>
+        <td><span class="badge ${sevColor(r.severity)}">${r.severity}</span></td><td>${esc(r.description)}</td>
+        <td><span class="badge ${r.status === 'OPEN' ? 'warn' : 'green'}">${r.status}</span></td>
+        <td>${canResolve && r.status === 'OPEN' ? `<button class="btn small green" onclick="resolveIncident(${r.id})">Resolve</button>` : ""}</td>
+      </tr>`).join("") : `<tr><td colspan="9" style="color:var(--muted)">No incidents reported.</td></tr>`}
+    </tbody></table></div>`;
+  }
+  document.getElementById("newIncBtn").addEventListener("click", () => {
+    const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+    const isAdminOrMgr = state.user.role === "ADMIN" || state.user.role === "MANAGER";
+    openModal("Report Incident", `
+      ${isAdminOrMgr ? `<div class="field"><label>Location</label><select id="iLoc">${locOpts}</select></div>` : ""}
+      <div class="field"><label>Category</label><select id="iCat">
+        <option>Safety</option><option>Equipment</option><option>Customer Complaint</option><option>Inventory Discrepancy</option><option>Other</option>
+      </select></div>
+      <div class="field"><label>Severity</label><select id="iSev">
+        <option value="LOW">Low</option><option value="MEDIUM">Medium</option><option value="HIGH">High</option><option value="CRITICAL">Critical</option>
+      </select></div>
+      <div class="field"><label>Description</label><textarea id="iDesc" rows="4" style="width:100%"></textarea></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="iSaveBtn">Submit Report</button></div>
+    `, () => {
+      document.getElementById("iSaveBtn").addEventListener("click", async () => {
+        const description = document.getElementById("iDesc").value.trim();
+        if (!description) { toast("Description is required", "error"); return; }
+        try {
+          const body = { category: document.getElementById("iCat").value, severity: document.getElementById("iSev").value, description };
+          if (isAdminOrMgr) body.location_id = document.getElementById("iLoc").value;
+          await api("/incident-reports", { method: "POST", body });
+          closeModal(); toast("Incident reported", "success"); load();
+        } catch (e) {}
+      });
+    });
+  });
+  window.resolveIncident = (id) => {
+    openModal("Resolve Incident", `
+      <div class="field"><label>Resolution Notes</label><textarea id="rNotes" rows="4" style="width:100%"></textarea></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="rResolveBtn">Mark Resolved</button></div>
+    `, () => {
+      document.getElementById("rResolveBtn").addEventListener("click", async () => {
+        try {
+          await api(`/incident-reports/${id}/resolve`, { method: "PUT", body: { resolution_notes: document.getElementById("rNotes").value } });
+          closeModal(); toast("Incident resolved", "success"); load();
+        } catch (e) {}
+      });
+    });
+  };
+  load();
+}
+
+// ================================================================== MANAGE ROLES
+async function renderRoles(c) {
+  c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px">
+    <input type="text" id="newRoleName" placeholder="New role name (e.g. Senior Cashier)" style="flex:1">
+    <button class="btn green" id="addRoleBtn">+ Create Role</button>
+  </div><div id="rolesTable">Loading...</div>
+  <p style="color:var(--muted);font-size:12.5px;margin-top:14px">
+    Note: Users, Products, and Locations management always stay restricted to Admin
+    (and Manager, for Users) regardless of these settings — custom roles can only be
+    granted access to the operational and reporting modules listed below.
+  </p>`;
+  async function load() {
+    const roles = await api("/roles");
+    document.getElementById("rolesTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Role</th><th>Type</th><th></th></tr></thead><tbody>
+      ${roles.map(r => `<tr><td>${esc(r.name)}</td><td><span class="badge ${r.is_builtin ? 'blue' : 'gray'}">${r.is_builtin ? "Built-in" : "Custom"}</span></td>
+        <td style="display:flex;gap:6px">
+          <button class="btn small" onclick="editRolePermissions('${esc(r.name).replace(/'/g, "\\'")}', ${r.name === 'ADMIN'})">${r.name === 'ADMIN' ? 'View Access' : 'Edit Modules'}</button>
+          ${!r.is_builtin ? `<button class="btn small danger" onclick="deleteRole('${esc(r.name).replace(/'/g, "\\'")}')">Delete</button>` : ""}
+        </td></tr>`).join("")}
+    </tbody></table></div>`;
+  }
+  document.getElementById("addRoleBtn").addEventListener("click", async () => {
+    const name = document.getElementById("newRoleName").value.trim();
+    if (!name) { toast("Enter a role name", "error"); return; }
+    try {
+      await api("/roles", { method: "POST", body: { name } });
+      document.getElementById("newRoleName").value = ""; toast("Role created", "success"); load();
+    } catch (e) {}
+  });
+  window.deleteRole = async (name) => {
+    if (!confirm(`Delete the role "${name}"? This only works if no users currently have it.`)) return;
+    try { await api(`/roles/${encodeURIComponent(name)}`, { method: "DELETE" }); toast("Role deleted", "success"); load(); }
+    catch (e) {}
+  };
+  window.editRolePermissions = async (name, locked) => {
+    const data = await api(`/roles/${encodeURIComponent(name)}/permissions`);
+    const labels = {
+      dashboard: "Dashboard", pos: "POS", sales: "Sales", customers: "Customers (view)",
+      receivables: "Receivables", inventory: "Inventory", inventory_ledger: "Inventory Ledger",
+      cylinder_deposits: "Cylinder Deposits", transfers: "Dispatch / Transfers", hauling: "Hauling Schedule",
+      vehicles: "Vehicles", employees: "Employees", staff_schedule: "Staff Schedule", kpi: "Employee KPI",
+      reports: "Reports", audit: "Audit Log", booked_orders: "Booked Orders", incident_reports: "Incident Reports",
+    };
+    openModal(`${locked ? "View" : "Edit"} Modules — ${name}`, `
+      ${locked ? `<p style="color:var(--muted);font-size:13px">Admin always has full access to every module — this can't be changed.</p>` : ""}
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
+        ${data.all_modules.map(m => `<label style="display:flex;align-items:center;gap:6px;font-size:13.5px;font-weight:400">
+          <input type="checkbox" class="modChk" value="${m}" ${data.module_keys.includes(m) ? "checked" : ""} ${locked ? "disabled" : ""} style="width:auto">
+          ${esc(labels[m] || m)}</label>`).join("")}
+      </div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">${locked ? "Close" : "Cancel"}</button>
+        ${locked ? "" : `<button class="btn green" id="permSaveBtn">Save</button>`}</div>
+    `, () => {
+      if (locked) return;
+      document.getElementById("permSaveBtn").addEventListener("click", async () => {
+        const checked = [...document.querySelectorAll(".modChk:checked")].map(cb => cb.value);
+        try {
+          await api(`/roles/${encodeURIComponent(name)}/permissions`, { method: "PUT", body: { module_keys: checked } });
+          closeModal(); toast("Permissions updated", "success"); load();
+        } catch (e) {}
+      });
+    });
+  };
   load();
 }

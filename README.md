@@ -32,6 +32,42 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Bug fixes**: vehicle creation was crashing when the odometer field was left
+  empty — fixed, and while tracking it down I found and fixed the same fragile
+  pattern in Products, Customers, and the **POS discount field** (a real crash
+  risk mid-checkout) before you hit it there too
+- **Receivables are now location-scoped** — attendants only see and can pay
+  down receivables for their own location; Admin/Manager still see everything
+- **Sales report PDF now exports in landscape** (verified against the actual
+  PDF page dimensions, not just the code that requests it)
+- **Manager can now add and edit users** (previously view-only), with a hard
+  safety guard: Managers can't create, edit, disable, or delete Admin accounts
+  — tested against all four
+- **Custom roles** — Admin/Manager can create new roles from scratch (e.g.
+  "Senior Cashier") and tick which modules that role can access, under
+  **Manage Roles**. This is a real permission system, not cosmetic — a custom
+  role ticked for POS access can actually complete sales, not just see the menu
+  item. Users/Products/Locations management stay hardcoded to Admin (+Manager
+  for Users) regardless of what's ticked, as a safety rail — see the note
+  inside the Manage Roles screen
+- **New Order Taker role + Booked Orders module** — an Order Taker books an
+  order and assigns it to a specific showroom; that showroom's attendants see
+  it in their queue and can mark it fulfilled (but not cancel — only
+  Admin/Manager/Order Taker can cancel); other showrooms never see it
+- **Incident Reports module** — any role can file one, auto-scoped to their
+  own location; non-Admin/Manager users only see their own location's reports;
+  only Admin/Manager can resolve one
+- **Sidebar reorganized** into grouped sections (Operations / Customers & Money
+  / Inventory & Dispatch / Fleet & Staff / Reports & Admin), and now driven by
+  the same permission system above — a custom role only sees the modules it's
+  actually been granted
+
+**Database migration:** another schema change this round — a free-text user
+role column (so custom role names work), plus new tables for roles,
+permissions, booked orders, and incident reports. Same as before: it migrates
+itself automatically and safely, tested against a simulated copy of your
+actual current production database before I touched anything.
+
 - **Refill vs. Deposit LPG sales** — the POS now distinguishes gas-only refills
   (customer exchanges an empty cylinder, which is tracked back into stock as an
   "empty" ready to haul to the plant) from Deposit/New sales (customer takes a
@@ -157,6 +193,7 @@ network — use your machine's LAN IP instead of localhost).
 |-------------|----------------|------------|----------------------|
 | admin       | ChangeMe123!   | Admin      | all                  |
 | mgarcia     | Manager123!    | Manager    | all (view + oversight) |
+| otaker      | Order123!      | Order Taker | books orders for any showroom |
 | jsoliven    | Attendant123!  | Attendant  | Soliven Showroom     |
 | mmadamba    | Attendant123!  | Attendant  | Madamba Warehouse    |
 | pdispatch   | Dispatch123!   | Dispatcher | Madamba Warehouse    |

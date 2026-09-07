@@ -50,6 +50,7 @@ def run():
     users = [
         ("admin", "ChangeMe123!", "System Administrator", "ADMIN", None),
         ("mgarcia", "Manager123!", "Manuel Garcia", "MANAGER", None),
+        ("otaker", "Order123!", "Olivia Taker", "ORDER_TAKER", None),
         ("jsoliven", "Attendant123!", "Juana Soliven", "ATTENDANT", loc["Soliven Showroom"]),
         ("mmadamba", "Attendant123!", "Mario Madamba", "ATTENDANT", loc["Madamba Warehouse"]),
         ("pdispatch", "Dispatch123!", "Pedro Reyes", "DISPATCHER", loc["Madamba Warehouse"]),
@@ -78,6 +79,7 @@ def run():
     print("Seed complete.")
     print("Login  admin / ChangeMe123!  (change this immediately)")
     print("Login  mgarcia / Manager123!  (manager)")
+    print("Login  otaker / Order123!  (order taker)")
     print("Login  jsoliven / Attendant123!  (Soliven Showroom attendant)")
     print("Login  mmadamba / Attendant123!  (Madamba Warehouse attendant)")
     print("Login  pdispatch / Dispatch123!  (dispatcher)")

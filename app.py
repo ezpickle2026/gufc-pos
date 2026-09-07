@@ -71,6 +71,50 @@ def roles_required(*roles):
     return deco
 
 
+def has_module_access(conn, role, module_key):
+    """ADMIN always has every module. Everyone else is governed by the
+    role_permissions table, which Admin/Manager can edit per role."""
+    if role == "ADMIN":
+        return True
+    row = conn.execute(
+        "SELECT 1 FROM role_permissions WHERE role_name=? AND module_key=?", (role, module_key)
+    ).fetchone()
+    return row is not None
+
+
+def roles_or_module_required(*roles, module=None):
+    """Access is granted if the user's role is in the explicit `roles` list
+    (the original hardcoded behavior — never regresses), OR if their role has
+    been granted `module` access via the custom role/permission system. This
+    is what lets a custom role (e.g. a Manager-created 'Junior Cashier' role)
+    meaningfully use a module rather than just seeing it in the sidebar."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **kw):
+            if "user" not in session:
+                return jsonify(error="Not authenticated"), 401
+            u = session["user"]
+            if u["role"] in roles:
+                return fn(*a, **kw)
+            if module:
+                conn = get_db()
+                allowed = has_module_access(conn, u["role"], module)
+                conn.close()
+                if allowed:
+                    return fn(*a, **kw)
+            return jsonify(error="Forbidden: insufficient permissions"), 403
+        return wrapper
+    return deco
+
+
+def get_permitted_modules(conn, role):
+    if role == "ADMIN":
+        from db import MODULE_KEYS
+        return MODULE_KEYS
+    rows = conn.execute("SELECT module_key FROM role_permissions WHERE role_name=?", (role,)).fetchall()
+    return [r["module_key"] for r in rows]
+
+
 def location_scope(row_location_id):
     """Non-admin users may only touch their own assigned location."""
     u = session["user"]
@@ -97,9 +141,10 @@ def login():
     }
     session["user"] = user
     audit(conn, "LOGIN", "AUTH", row["id"])
+    modules = get_permitted_modules(conn, user["role"])
     conn.commit()
     conn.close()
-    return jsonify(user=user)
+    return jsonify(user=user, permitted_modules=modules)
 
 
 @app.post("/api/logout")
@@ -115,7 +160,103 @@ def logout():
 
 @app.get("/api/me")
 def me():
-    return jsonify(user=session.get("user"))
+    user = session.get("user")
+    if not user:
+        return jsonify(user=None)
+    conn = get_db()
+    modules = get_permitted_modules(conn, user["role"])
+    conn.close()
+    return jsonify(user=user, permitted_modules=modules)
+
+
+# ---------------------------------------------------------------- roles & permissions
+
+@app.get("/api/roles")
+@roles_required("ADMIN", "MANAGER")
+def list_roles():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM roles ORDER BY is_builtin DESC, name").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/roles")
+@roles_required("ADMIN", "MANAGER")
+def create_role():
+    d = request.get_json(force=True)
+    name = (d.get("name") or "").strip()
+    if not name:
+        return jsonify(error="Role name is required"), 400
+    if name.upper() in ("ADMIN",):
+        return jsonify(error="That name is reserved"), 400
+    conn = get_db()
+    try:
+        conn.execute("INSERT INTO roles (name, is_builtin) VALUES (?, 0)", (name,))
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify(error="A role with that name already exists"), 400
+    audit(conn, "CREATE", "ROLES", None, name)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True), 201
+
+
+@app.delete("/api/roles/<path:name>")
+@roles_required("ADMIN", "MANAGER")
+def delete_role(name):
+    conn = get_db()
+    role = conn.execute("SELECT * FROM roles WHERE name=?", (name,)).fetchone()
+    if not role:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    if role["is_builtin"]:
+        conn.close()
+        return jsonify(error="Built-in roles can't be deleted"), 400
+    in_use = conn.execute("SELECT COUNT(*) c FROM users WHERE role=?", (name,)).fetchone()["c"]
+    if in_use:
+        conn.close()
+        return jsonify(error=f"{in_use} user(s) still have this role — reassign them first"), 400
+    conn.execute("DELETE FROM roles WHERE name=?", (name,))
+    conn.execute("DELETE FROM role_permissions WHERE role_name=?", (name,))
+    audit(conn, "DELETE", "ROLES", None, name)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/roles/<path:name>/permissions")
+@roles_required("ADMIN", "MANAGER")
+def get_role_permissions(name):
+    from db import MODULE_KEYS
+    conn = get_db()
+    if name == "ADMIN":
+        conn.close()
+        return jsonify(module_keys=MODULE_KEYS, all_modules=MODULE_KEYS, locked=True)
+    rows = conn.execute("SELECT module_key FROM role_permissions WHERE role_name=?", (name,)).fetchall()
+    conn.close()
+    return jsonify(module_keys=[r["module_key"] for r in rows], all_modules=MODULE_KEYS, locked=False)
+
+
+@app.put("/api/roles/<path:name>/permissions")
+@roles_required("ADMIN", "MANAGER")
+def set_role_permissions(name):
+    from db import MODULE_KEYS
+    if name == "ADMIN":
+        return jsonify(error="Admin always has full access and can't be restricted"), 400
+    d = request.get_json(force=True)
+    modules = [m for m in (d.get("module_keys") or []) if m in MODULE_KEYS]
+    conn = get_db()
+    role = conn.execute("SELECT * FROM roles WHERE name=?", (name,)).fetchone()
+    if not role:
+        conn.close()
+        return jsonify(error="Role not found"), 404
+    conn.execute("DELETE FROM role_permissions WHERE role_name=?", (name,))
+    for m in modules:
+        conn.execute("INSERT INTO role_permissions (role_name, module_key) VALUES (?,?)", (name, m))
+    audit(conn, "UPDATE", "ROLES", None, f"{name}: {', '.join(modules)}")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
 
 
 # ---------------------------------------------------------------- locations
@@ -217,7 +358,7 @@ def create_product():
         cur = conn.execute(
             "INSERT INTO products (sku, name, category, unit, price, cost, deposit_price, min_stock) VALUES (?,?,?,?,?,?,?,?)",
             (d["sku"], d["name"], d.get("category", ""), d.get("unit", "cylinder"),
-             float(d["price"]), float(d.get("cost", 0)), float(d.get("deposit_price", 0)), int(d.get("min_stock", 0))),
+             float(d["price"]), float(d.get("cost") or 0), float(d.get("deposit_price") or 0), int(d.get("min_stock") or 0)),
         )
     except Exception as e:
         conn.close()
@@ -280,7 +421,7 @@ def update_product(pid):
     conn.execute(
         "UPDATE products SET name=?, category=?, unit=?, price=?, cost=?, deposit_price=?, min_stock=? WHERE id=?",
         (d["name"], d.get("category", ""), d.get("unit", "cylinder"), float(d["price"]),
-         float(d.get("cost", 0)), float(d.get("deposit_price", 0)), int(d.get("min_stock", 0)), pid),
+         float(d.get("cost") or 0), float(d.get("deposit_price") or 0), int(d.get("min_stock") or 0), pid),
     )
     audit(conn, "UPDATE", "PRODUCTS", pid, f"price={d['price']} cost={d.get('cost',0)} deposit_price={d.get('deposit_price',0)}")
     conn.commit()
@@ -327,7 +468,7 @@ def create_customer():
         """INSERT INTO customers (account_no, name, business_name, phone, address, category, terms_days, credit_limit)
            VALUES (?,?,?,?,?,?,?,?)""",
         (account_no, d["name"], d.get("business_name", ""), d.get("phone", ""), d.get("address", ""),
-         d.get("category", "Solus"), int(d.get("terms_days", 0)), float(d.get("credit_limit", 0))),
+         d.get("category", "Solus"), int(d.get("terms_days") or 0), float(d.get("credit_limit") or 0)),
     )
     audit(conn, "CREATE", "CUSTOMERS", cur.lastrowid, d["name"])
     conn.commit()
@@ -351,7 +492,7 @@ def update_customer(cid):
         """UPDATE customers SET name=?, business_name=?, phone=?, address=?, category=?, terms_days=?, credit_limit=?, status=?
            WHERE id=?""",
         (d["name"], d.get("business_name", ""), d.get("phone", ""), d.get("address", ""),
-         d.get("category", "Solus"), int(d.get("terms_days", 0)), float(d.get("credit_limit", 0)),
+         d.get("category", "Solus"), int(d.get("terms_days") or 0), float(d.get("credit_limit") or 0),
          d.get("status", "ACTIVE"), cid),
     )
     audit(conn, "UPDATE", "CUSTOMERS", cid, d["name"])
@@ -562,10 +703,169 @@ def customer_statement_export(cid):
     return soa_pdf_response(dict(cust), entries, beginning, ending, fname)
 
 
+# ---------------------------------------------------------------- booked orders
+# Order Taker books an order and assigns it to a showroom; that showroom's
+# attendants see it in their queue. Creating an order is intentionally NOT
+# governed by the generic module-permission system (unlike viewing) — only
+# Admin/Manager/Order Taker can ever create one, regardless of what modules
+# a custom role has been ticked for, so this can't be opened up by accident.
+
+@app.get("/api/booked-orders")
+@roles_or_module_required("ADMIN", "MANAGER", "ORDER_TAKER", module="booked_orders")
+def list_booked_orders():
+    u = session["user"]
+    conn = get_db()
+    sql = """SELECT bo.*, c.name customer_name, l.name showroom_name, creator.name created_by_name
+              FROM booked_orders bo LEFT JOIN customers c ON c.id=bo.customer_id
+              JOIN locations l ON l.id=bo.showroom_location_id
+              LEFT JOIN users creator ON creator.id=bo.created_by WHERE 1=1"""
+    params = []
+    if u["role"] == "ORDER_TAKER":
+        sql += " AND bo.created_by=?"
+        params.append(u["id"])
+    elif u["role"] not in ("ADMIN", "MANAGER"):
+        sql += " AND bo.showroom_location_id=?"
+        params.append(u["location_id"])
+    sql += " ORDER BY bo.order_date DESC"
+    rows = conn.execute(sql, params).fetchall()
+    out = []
+    for r in rows:
+        items = conn.execute(
+            "SELECT boi.*, p.name product_name FROM booked_order_items boi JOIN products p ON p.id=boi.product_id WHERE order_id=?",
+            (r["id"],),
+        ).fetchall()
+        out.append({**dict(r), "items": [dict(i) for i in items]})
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/booked-orders")
+@roles_required("ADMIN", "MANAGER", "ORDER_TAKER")
+def create_booked_order():
+    d = request.get_json(force=True)
+    items = d.get("items") or []
+    if not d.get("showroom_location_id") or not items:
+        return jsonify(error="showroom_location_id and at least one item are required"), 400
+    conn = get_db()
+    order_no = next_number(conn, "ORD", "booked_orders", "order_no")
+    cur = conn.execute(
+        """INSERT INTO booked_orders (order_no, customer_id, customer_name_freeform, customer_phone,
+               showroom_location_id, notes, created_by) VALUES (?,?,?,?,?,?,?)""",
+        (order_no, d.get("customer_id") or None, d.get("customer_name_freeform", ""),
+         d.get("customer_phone", ""), d["showroom_location_id"], d.get("notes", ""), session["user"]["id"]),
+    )
+    order_id = cur.lastrowid
+    for it in items:
+        conn.execute("INSERT INTO booked_order_items (order_id, product_id, qty) VALUES (?,?,?)",
+                     (order_id, it["product_id"], int(it["qty"])))
+    audit(conn, "CREATE", "BOOKED_ORDERS", order_id, order_no)
+    conn.commit()
+    conn.close()
+    return jsonify(id=order_id, order_no=order_no), 201
+
+
+@app.put("/api/booked-orders/<int:oid>")
+@roles_or_module_required("ADMIN", "MANAGER", "ORDER_TAKER", module="booked_orders")
+def update_booked_order(oid):
+    u = session["user"]
+    d = request.get_json(force=True)
+    conn = get_db()
+    order = conn.execute("SELECT * FROM booked_orders WHERE id=?", (oid,)).fetchone()
+    if not order:
+        conn.close()
+        return jsonify(error="Not found"), 404
+
+    new_status = d.get("status", order["status"])
+    if u["role"] not in ("ADMIN", "MANAGER", "ORDER_TAKER"):
+        # Attendants: can only mark orders at their own showroom as fulfilled.
+        if order["showroom_location_id"] != u["location_id"]:
+            conn.close()
+            return jsonify(error="Forbidden: this order belongs to another showroom"), 403
+        if new_status != "FULFILLED":
+            conn.close()
+            return jsonify(error="Attendants can only mark orders as fulfilled"), 403
+        conn.execute("UPDATE booked_orders SET status=?, fulfilled_by=?, fulfilled_at=datetime('now') WHERE id=?",
+                     (new_status, u["id"], oid))
+    else:
+        conn.execute("UPDATE booked_orders SET status=?, notes=? WHERE id=?",
+                     (new_status, d.get("notes", order["notes"]), oid))
+        if new_status == "FULFILLED" and order["status"] != "FULFILLED":
+            conn.execute("UPDATE booked_orders SET fulfilled_by=?, fulfilled_at=datetime('now') WHERE id=?",
+                         (u["id"], oid))
+    audit(conn, "UPDATE", "BOOKED_ORDERS", oid, f"status={new_status}")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- incident reports
+# Any logged-in role can file one for their own location; Admin/Manager see
+# and resolve everything, everyone else only sees their own location's reports.
+
+@app.get("/api/incident-reports")
+@login_required
+def list_incident_reports():
+    u = session["user"]
+    conn = get_db()
+    sql = """SELECT ir.*, l.name location_name, reporter.name reporter_name, resolver.name resolver_name
+              FROM incident_reports ir LEFT JOIN locations l ON l.id=ir.location_id
+              LEFT JOIN users reporter ON reporter.id=ir.reported_by
+              LEFT JOIN users resolver ON resolver.id=ir.resolved_by WHERE 1=1"""
+    params = []
+    if u["role"] not in ("ADMIN", "MANAGER"):
+        sql += " AND (ir.location_id=? OR ir.reported_by=?)"
+        params += [u["location_id"], u["id"]]
+    sql += " ORDER BY ir.ts DESC"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/incident-reports")
+@login_required
+def create_incident_report():
+    d = request.get_json(force=True)
+    u = session["user"]
+    description = (d.get("description") or "").strip()
+    if not description:
+        return jsonify(error="Description is required"), 400
+    location_id = d.get("location_id") if u["role"] in ("ADMIN", "MANAGER") else u["location_id"]
+    conn = get_db()
+    report_no = next_number(conn, "INC", "incident_reports", "report_no")
+    cur = conn.execute(
+        """INSERT INTO incident_reports (report_no, location_id, reported_by, category, severity, description)
+           VALUES (?,?,?,?,?,?)""",
+        (report_no, location_id, u["id"], d.get("category", "Other"), d.get("severity", "LOW"), description),
+    )
+    audit(conn, "CREATE", "INCIDENT_REPORTS", cur.lastrowid, report_no)
+    conn.commit()
+    conn.close()
+    return jsonify(id=cur.lastrowid, report_no=report_no), 201
+
+
+@app.put("/api/incident-reports/<int:iid>/resolve")
+@roles_required("ADMIN", "MANAGER")
+def resolve_incident_report(iid):
+    d = request.get_json(force=True)
+    conn = get_db()
+    report = conn.execute("SELECT report_no FROM incident_reports WHERE id=?", (iid,)).fetchone()
+    if not report:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    conn.execute(
+        "UPDATE incident_reports SET status='RESOLVED', resolution_notes=?, resolved_by=?, resolved_at=datetime('now') WHERE id=?",
+        (d.get("resolution_notes", ""), session["user"]["id"], iid),
+    )
+    audit(conn, "RESOLVE", "INCIDENT_REPORTS", iid, report["report_no"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
 # ---------------------------------------------------------------- inventory
 
 @app.get("/api/inventory")
-@login_required
+@roles_or_module_required("ADMIN", "MANAGER", "ATTENDANT", "DISPATCHER", module="inventory")
 def get_inventory():
     location_id = request.args.get("location_id", type=int)
     u = session["user"]
@@ -670,7 +970,7 @@ def record_inbound_stock():
 
 
 @app.get("/api/cylinder-deposits")
-@login_required
+@roles_or_module_required("ADMIN", "MANAGER", "ATTENDANT", module="cylinder_deposits")
 def list_cylinder_deposits():
     conn = get_db()
     rows = conn.execute(
@@ -815,7 +1115,7 @@ def adjust_inventory(conn, location_id, product_id, delta, mtype, reference, not
 # ---------------------------------------------------------------- POS / sales
 
 @app.post("/api/sales")
-@roles_required("ADMIN", "ATTENDANT")
+@roles_or_module_required("ADMIN", "ATTENDANT", module="pos")
 def create_sale():
     d = request.get_json(force=True)
     u = session["user"]
@@ -829,7 +1129,7 @@ def create_sale():
     payments = d.get("payments") or []
     sale_type = d.get("sale_type", "CASH")
     customer_id = d.get("customer_id")
-    discount = float(d.get("discount", 0))
+    discount = float(d.get("discount") or 0)
 
     conn = get_db()
     try:
@@ -960,7 +1260,7 @@ def get_sale_detail(sale_id):
 
 
 @app.get("/api/sales")
-@login_required
+@roles_or_module_required("ADMIN", "MANAGER", "ATTENDANT", module="sales")
 def list_sales():
     u = session["user"]
     conn = get_db()
@@ -1030,31 +1330,43 @@ def recompute_receivable_status(conn, rid):
 @app.get("/api/receivables")
 @login_required
 def list_receivables():
+    u = session["user"]
     conn = get_db()
     rows = conn.execute("SELECT id FROM receivables").fetchall()
     for r in rows:
         recompute_receivable_status(conn, r["id"])
     conn.commit()
-    out = conn.execute(
-        """SELECT r.*, c.name customer_name, c.account_no, s.sale_no
-           FROM receivables r JOIN customers c ON c.id=r.customer_id JOIN sales s ON s.id=r.sale_id
-           ORDER BY r.due_date ASC"""
-    ).fetchall()
+    sql = """SELECT r.*, c.name customer_name, c.account_no, s.sale_no, s.location_id
+              FROM receivables r JOIN customers c ON c.id=r.customer_id JOIN sales s ON s.id=r.sale_id
+              WHERE 1=1"""
+    params = []
+    if u["role"] not in ("ADMIN", "MANAGER"):
+        sql += " AND s.location_id=?"
+        params.append(u["location_id"])
+    sql += " ORDER BY r.due_date ASC"
+    out = conn.execute(sql, params).fetchall()
     conn.close()
     return jsonify([dict(r) for r in out])
 
 
 @app.post("/api/receivables/<int:rid>/pay")
-@roles_required("ADMIN", "ATTENDANT")
+@roles_required("ADMIN", "MANAGER", "ATTENDANT")
 def pay_receivable(rid):
     d = request.get_json(force=True)
     amount = float(d["amount"])
     method = d.get("method", "Cash")
+    u = session["user"]
     conn = get_db()
-    r = conn.execute("SELECT * FROM receivables WHERE id=?", (rid,)).fetchone()
+    r = conn.execute(
+        "SELECT r.*, s.location_id sale_location_id FROM receivables r JOIN sales s ON s.id=r.sale_id WHERE r.id=?",
+        (rid,),
+    ).fetchone()
     if not r:
         conn.close()
         return jsonify(error="Not found"), 404
+    if u["role"] not in ("ADMIN", "MANAGER") and r["sale_location_id"] != u["location_id"]:
+        conn.close()
+        return jsonify(error="Forbidden: this receivable belongs to another location"), 403
     if amount <= 0 or amount > r["balance"] + 0.009:
         conn.close()
         return jsonify(error=f"Payment must be > 0 and <= outstanding balance ({r['balance']:.2f})"), 400
@@ -1077,7 +1389,7 @@ def pay_receivable(rid):
 # ---------------------------------------------------------------- transfers (dispatch-lite)
 
 @app.get("/api/transfers")
-@login_required
+@roles_or_module_required("ADMIN", "DISPATCHER", module="transfers")
 def list_transfers():
     conn = get_db()
     rows = conn.execute(
@@ -1097,7 +1409,7 @@ def list_transfers():
 
 
 @app.post("/api/transfers")
-@roles_required("ADMIN", "DISPATCHER")
+@roles_or_module_required("ADMIN", "DISPATCHER", module="transfers")
 def create_transfer():
     d = request.get_json(force=True)
     items = d.get("items") or []
@@ -1126,7 +1438,7 @@ def create_transfer():
 
 
 @app.post("/api/transfers/<int:tid>/receive")
-@roles_required("ADMIN", "DISPATCHER")
+@roles_or_module_required("ADMIN", "DISPATCHER", module="transfers")
 def receive_transfer(tid):
     conn = get_db()
     t = conn.execute("SELECT * FROM transfers WHERE id=?", (tid,)).fetchone()
@@ -1209,7 +1521,7 @@ def _sales_report_rows(date_from, date_to):
 
 
 @app.get("/api/reports/sales/export")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="reports")
 def export_sales_report():
     fmt = request.args.get("format", "xlsx")
     date_from = request.args.get("from")
@@ -1223,7 +1535,8 @@ def export_sales_report():
     if fmt == "pdf":
         return pdf_table_response("Sales Report", headers, data, f"sales-report-{stamp}.pdf",
                                    subtitle=f"{date_from or 'All dates'} to {date_to or 'present'}",
-                                   col_widths=[70, 65, 60, 55, 60, 110, 35, 45, 40, 45, 40, 45, 45])
+                                   col_widths=[75, 70, 70, 65, 75, 160, 45, 55, 55, 55, 55, 55, 55],
+                                   landscape_mode=True)
     return xlsx_response(headers, data, f"sales-report-{stamp}.xlsx", "Sales Report")
 
 
@@ -1241,7 +1554,7 @@ def report_inventory():
 
 
 @app.get("/api/reports/inventory/export")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="reports")
 def export_inventory_report():
     fmt = request.args.get("format", "xlsx")
     conn = get_db()
@@ -1261,7 +1574,7 @@ def export_inventory_report():
 
 
 @app.get("/api/reports/receivables/export")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="reports")
 def export_receivables_report():
     fmt = request.args.get("format", "xlsx")
     conn = get_db()
@@ -1300,14 +1613,22 @@ def list_users():
 
 
 @app.post("/api/users")
-@roles_required("ADMIN")
+@roles_required("ADMIN", "MANAGER")
 def create_user():
     d = request.get_json(force=True)
+    u = session["user"]
+    role = (d.get("role") or "").strip()
+    if u["role"] == "MANAGER" and role == "ADMIN":
+        return jsonify(error="Managers can't create Admin accounts"), 403
     conn = get_db()
+    role_exists = conn.execute("SELECT 1 FROM roles WHERE name=?", (role,)).fetchone()
+    if not role_exists:
+        conn.close()
+        return jsonify(error=f"'{role}' is not a recognized role — create it first under Manage Roles"), 400
     try:
         cur = conn.execute(
             "INSERT INTO users (username, password_hash, name, role, location_id) VALUES (?,?,?,?,?)",
-            (d["username"].strip().lower(), generate_password_hash(d["password"]), d["name"], d["role"],
+            (d["username"].strip().lower(), generate_password_hash(d["password"]), d["name"], role,
              d.get("location_id")),
         )
     except Exception as e:
@@ -1320,26 +1641,38 @@ def create_user():
 
 
 @app.put("/api/users/<int:uid>")
-@roles_required("ADMIN")
+@roles_required("ADMIN", "MANAGER")
 def update_user(uid):
     d = request.get_json(force=True)
+    u = session["user"]
     conn = get_db()
     existing = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
     if not existing:
         conn.close()
         return jsonify(error="Not found"), 404
+    if u["role"] == "MANAGER" and existing["role"] == "ADMIN":
+        conn.close()
+        return jsonify(error="Managers can't edit Admin accounts"), 403
+    new_role = d.get("role", existing["role"])
+    if u["role"] == "MANAGER" and new_role == "ADMIN":
+        conn.close()
+        return jsonify(error="Managers can't promote a user to Admin"), 403
+    if new_role != existing["role"]:
+        role_exists = conn.execute("SELECT 1 FROM roles WHERE name=?", (new_role,)).fetchone()
+        if not role_exists:
+            conn.close()
+            return jsonify(error=f"'{new_role}' is not a recognized role — create it first under Manage Roles"), 400
     new_password = d.get("password")
     if new_password:
         conn.execute(
             "UPDATE users SET name=?, role=?, location_id=?, password_hash=? WHERE id=?",
-            (d.get("name", existing["name"]), d.get("role", existing["role"]),
-             d.get("location_id"), generate_password_hash(new_password), uid),
+            (d.get("name", existing["name"]), new_role, d.get("location_id"), generate_password_hash(new_password), uid),
         )
         audit(conn, "UPDATE", "USERS", uid, "details + password reset")
     else:
         conn.execute(
             "UPDATE users SET name=?, role=?, location_id=? WHERE id=?",
-            (d.get("name", existing["name"]), d.get("role", existing["role"]), d.get("location_id"), uid),
+            (d.get("name", existing["name"]), new_role, d.get("location_id"), uid),
         )
         audit(conn, "UPDATE", "USERS", uid, "details updated")
     conn.commit()
@@ -1348,9 +1681,13 @@ def update_user(uid):
 
 
 @app.post("/api/users/<int:uid>/disable")
-@roles_required("ADMIN")
+@roles_required("ADMIN", "MANAGER")
 def disable_user(uid):
     conn = get_db()
+    target = conn.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
+    if target and session["user"]["role"] == "MANAGER" and target["role"] == "ADMIN":
+        conn.close()
+        return jsonify(error="Managers can't disable Admin accounts"), 403
     conn.execute("UPDATE users SET active=0 WHERE id=?", (uid,))
     audit(conn, "DISABLE", "USERS", uid)
     conn.commit()
@@ -1359,9 +1696,13 @@ def disable_user(uid):
 
 
 @app.post("/api/users/<int:uid>/enable")
-@roles_required("ADMIN")
+@roles_required("ADMIN", "MANAGER")
 def enable_user(uid):
     conn = get_db()
+    target = conn.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
+    if target and session["user"]["role"] == "MANAGER" and target["role"] == "ADMIN":
+        conn.close()
+        return jsonify(error="Managers can't re-enable Admin accounts"), 403
     conn.execute("UPDATE users SET active=1 WHERE id=?", (uid,))
     audit(conn, "ENABLE", "USERS", uid)
     conn.commit()
@@ -1370,11 +1711,15 @@ def enable_user(uid):
 
 
 @app.delete("/api/users/<int:uid>")
-@roles_required("ADMIN")
+@roles_required("ADMIN", "MANAGER")
 def delete_user(uid):
     if uid == session["user"]["id"]:
         return jsonify(error="You can't delete your own account while logged in as it"), 400
     conn = get_db()
+    target = conn.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
+    if target and session["user"]["role"] == "MANAGER" and target["role"] == "ADMIN":
+        conn.close()
+        return jsonify(error="Managers can't delete Admin accounts"), 403
     sale_count = conn.execute("SELECT COUNT(*) c FROM sales WHERE user_id=?", (uid,)).fetchone()["c"]
     if sale_count > 0:
         conn.close()
@@ -1402,7 +1747,7 @@ def delete_user(uid):
 # ---------------------------------------------------------------- audit log
 
 @app.get("/api/audit-logs")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="audit")
 def get_audit_logs():
     module = request.args.get("module")  # SALES, INVENTORY, or omitted for all
     conn = get_db()
@@ -1417,7 +1762,7 @@ def get_audit_logs():
 # ---------------------------------------------------------------- vehicles (Admin + Manager)
 
 @app.get("/api/vehicles")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="vehicles")
 def list_vehicles():
     conn = get_db()
     rows = conn.execute("SELECT * FROM vehicles ORDER BY plate_number").fetchall()
@@ -1426,7 +1771,7 @@ def list_vehicles():
 
 
 @app.post("/api/vehicles")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="vehicles")
 def create_vehicle():
     d = request.get_json(force=True)
     if not (d.get("plate_number") or "").strip():
@@ -1438,7 +1783,7 @@ def create_vehicle():
                    last_maintenance_date, next_maintenance_date, registration_expiry, insurance_expiry, notes)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (d["plate_number"].strip(), d.get("vehicle_type", ""), d.get("description", ""), d.get("driver", ""),
-             d.get("status", "AVAILABLE"), int(d.get("odometer", 0)), d.get("last_maintenance_date") or None,
+             d.get("status", "AVAILABLE"), int(d.get("odometer") or 0), d.get("last_maintenance_date") or None,
              d.get("next_maintenance_date") or None, d.get("registration_expiry") or None,
              d.get("insurance_expiry") or None, d.get("notes", "")),
         )
@@ -1452,7 +1797,7 @@ def create_vehicle():
 
 
 @app.put("/api/vehicles/<int:vid>")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="vehicles")
 def update_vehicle(vid):
     d = request.get_json(force=True)
     conn = get_db()
@@ -1465,7 +1810,7 @@ def update_vehicle(vid):
                last_maintenance_date=?, next_maintenance_date=?, registration_expiry=?, insurance_expiry=?, notes=?
            WHERE id=?""",
         (d.get("vehicle_type", ""), d.get("description", ""), d.get("driver", ""), d.get("status", "AVAILABLE"),
-         int(d.get("odometer", 0)), d.get("last_maintenance_date") or None, d.get("next_maintenance_date") or None,
+         int(d.get("odometer") or 0), d.get("last_maintenance_date") or None, d.get("next_maintenance_date") or None,
          d.get("registration_expiry") or None, d.get("insurance_expiry") or None, d.get("notes", ""), vid),
     )
     audit(conn, "UPDATE", "VEHICLES", vid)
@@ -1475,7 +1820,7 @@ def update_vehicle(vid):
 
 
 @app.delete("/api/vehicles/<int:vid>")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="vehicles")
 def delete_vehicle(vid):
     conn = get_db()
     try:
@@ -1495,7 +1840,7 @@ def delete_vehicle(vid):
 # ---------------------------------------------------------------- hauling schedule (Admin + Manager)
 
 @app.get("/api/hauling")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="hauling")
 def list_hauling():
     conn = get_db()
     rows = conn.execute(
@@ -1509,7 +1854,7 @@ def list_hauling():
 
 
 @app.post("/api/hauling")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="hauling")
 def create_hauling():
     d = request.get_json(force=True)
     if not d.get("scheduled_date") or not (d.get("plant_name") or "").strip():
@@ -1531,7 +1876,7 @@ def create_hauling():
 
 
 @app.put("/api/hauling/<int:hid>")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="hauling")
 def update_hauling(hid):
     d = request.get_json(force=True)
     conn = get_db()
@@ -1553,7 +1898,7 @@ def update_hauling(hid):
 
 
 @app.delete("/api/hauling/<int:hid>")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="hauling")
 def delete_hauling(hid):
     conn = get_db()
     try:
@@ -1573,7 +1918,7 @@ def delete_hauling(hid):
 # ---------------------------------------------------------------- employees (Admin + Manager)
 
 @app.get("/api/employees")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="employees")
 def list_employees():
     conn = get_db()
     rows = conn.execute(
@@ -1584,7 +1929,7 @@ def list_employees():
 
 
 @app.post("/api/employees")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="employees")
 def create_employee():
     d = request.get_json(force=True)
     if not (d.get("name") or "").strip():
@@ -1603,7 +1948,7 @@ def create_employee():
 
 
 @app.put("/api/employees/<int:eid>")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="employees")
 def update_employee(eid):
     d = request.get_json(force=True)
     conn = get_db()
@@ -1624,7 +1969,7 @@ def update_employee(eid):
 
 
 @app.delete("/api/employees/<int:eid>")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="employees")
 def delete_employee(eid):
     conn = get_db()
     sched_count = conn.execute("SELECT COUNT(*) c FROM staff_schedule WHERE employee_id=?", (eid,)).fetchone()["c"]
@@ -1709,7 +2054,7 @@ def delete_staff_schedule(sid):
 # data-entry step required — pulls straight from the sales table.
 
 @app.get("/api/reports/employee-kpi")
-@roles_required("ADMIN", "MANAGER")
+@roles_or_module_required("ADMIN", "MANAGER", module="kpi")
 def employee_kpi():
     date_from = request.args.get("from")
     date_to = request.args.get("to")
