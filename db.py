@@ -250,6 +250,7 @@ CREATE TABLE IF NOT EXISTS booked_orders (
     customer_id INTEGER REFERENCES customers(id),
     customer_name_freeform TEXT,
     customer_phone TEXT,
+    delivery_address TEXT,
     showroom_location_id INTEGER REFERENCES locations(id),
     source TEXT NOT NULL DEFAULT 'STAFF' CHECK(source IN ('STAFF','CUSTOMER')),
     status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','FULFILLED','CANCELLED')),
@@ -436,6 +437,11 @@ def migrate_schema():
         conn.commit()
     elif not _column_exists(conn, "booked_orders", "source"):
         conn.execute("ALTER TABLE booked_orders ADD COLUMN source TEXT NOT NULL DEFAULT 'STAFF'")
+        conn.commit()
+
+    # 7. Delivery address on booked orders — simple additive column.
+    if not _column_exists(conn, "booked_orders", "delivery_address"):
+        conn.execute("ALTER TABLE booked_orders ADD COLUMN delivery_address TEXT")
         conn.commit()
 
     conn.close()

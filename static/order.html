@@ -62,6 +62,7 @@ h2{font-size:15px;margin:0 0 12px;color:var(--blue)}
       <h2>Your Details</h2>
       <div class="field"><label>Full Name *</label><input type="text" id="custName" required></div>
       <div class="field"><label>Phone Number *</label><input type="tel" id="custPhone" required placeholder="09XX-XXX-XXXX"></div>
+      <div class="field"><label>Delivery Address *</label><textarea id="custAddress" rows="2" required placeholder="House/unit no., street, barangay, city"></textarea></div>
       <div class="field">
         <label>Preferred Warehouse / Showroom (optional)</label>
         <select id="prefLocation"><option value="">No preference — we'll assign the nearest one</option></select>
@@ -136,6 +137,7 @@ document.getElementById('orderForm').addEventListener('submit', async (e) => {
   const body = {
     customer_name: document.getElementById('custName').value.trim(),
     customer_phone: document.getElementById('custPhone').value.trim(),
+    delivery_address: document.getElementById('custAddress').value.trim(),
     preferred_location_id: document.getElementById('prefLocation').value || null,
     items,
     notes: document.getElementById('notes').value,

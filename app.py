@@ -768,9 +768,9 @@ def create_booked_order():
     order_no = next_number(conn, "ORD", "booked_orders", "order_no")
     cur = conn.execute(
         """INSERT INTO booked_orders (order_no, customer_id, customer_name_freeform, customer_phone,
-               showroom_location_id, source, notes, created_by) VALUES (?,?,?,?,?,?,?,?)""",
+               delivery_address, showroom_location_id, source, notes, created_by) VALUES (?,?,?,?,?,?,?,?,?)""",
         (order_no, d.get("customer_id") or None, d.get("customer_name_freeform", ""),
-         d.get("customer_phone", ""), d.get("showroom_location_id") or None, "STAFF",
+         d.get("customer_phone", ""), d.get("delivery_address", ""), d.get("showroom_location_id") or None, "STAFF",
          d.get("notes", ""), session["user"]["id"]),
     )
     order_id = cur.lastrowid
@@ -810,8 +810,9 @@ def update_booked_order(oid):
         # order goes to — this is how a customer-submitted, unassigned order
         # gets routed to a specific warehouse or showroom.
         new_location = d.get("showroom_location_id", order["showroom_location_id"])
-        conn.execute("UPDATE booked_orders SET status=?, notes=?, showroom_location_id=? WHERE id=?",
-                     (new_status, d.get("notes", order["notes"]), new_location or None, oid))
+        conn.execute("UPDATE booked_orders SET status=?, notes=?, delivery_address=?, showroom_location_id=? WHERE id=?",
+                     (new_status, d.get("notes", order["notes"]), d.get("delivery_address", order["delivery_address"]),
+                      new_location or None, oid))
         if new_status == "FULFILLED" and order["status"] != "FULFILLED":
             conn.execute("UPDATE booked_orders SET fulfilled_by=?, fulfilled_at=datetime('now') WHERE id=?",
                          (u["id"], oid))
@@ -851,9 +852,12 @@ def submit_public_order():
 
     name = (d.get("customer_name") or "").strip()
     phone = (d.get("customer_phone") or "").strip()
+    address = (d.get("delivery_address") or "").strip()
     items = d.get("items") or []
     if not name or not phone:
         return jsonify(error="Name and phone number are required"), 400
+    if not address:
+        return jsonify(error="Delivery address is required"), 400
     if not items:
         return jsonify(error="Add at least one product"), 400
     if len(items) > 20:
@@ -881,9 +885,9 @@ def submit_public_order():
 
         order_no = next_number(conn, "ORD", "booked_orders", "order_no")
         cur = conn.execute(
-            """INSERT INTO booked_orders (order_no, customer_name_freeform, customer_phone,
-                   showroom_location_id, source, notes) VALUES (?,?,?,?,?,?)""",
-            (order_no, name[:200], phone[:50], preferred_location, "CUSTOMER", (d.get("notes") or "")[:500]),
+            """INSERT INTO booked_orders (order_no, customer_name_freeform, customer_phone, delivery_address,
+                   showroom_location_id, source, notes) VALUES (?,?,?,?,?,?,?)""",
+            (order_no, name[:200], phone[:50], address[:500], preferred_location, "CUSTOMER", (d.get("notes") or "")[:500]),
         )
         order_id = cur.lastrowid
         for product_id, qty in resolved:

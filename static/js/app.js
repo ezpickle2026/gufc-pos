@@ -1588,7 +1588,8 @@ async function renderBookedOrders(c) {
     </tr></thead><tbody>
       ${rows.length ? rows.map(o => `<tr>
         <td>${o.order_no}</td><td>${o.order_date}</td>
-        <td>${esc(o.customer_name || o.customer_name_freeform || "—")}${o.customer_phone ? " (" + esc(o.customer_phone) + ")" : ""}</td>
+        <td>${esc(o.customer_name || o.customer_name_freeform || "—")}${o.customer_phone ? " (" + esc(o.customer_phone) + ")" : ""}
+          ${o.delivery_address ? `<br><span style="color:var(--muted);font-size:11.5px">${esc(o.delivery_address)}</span>` : ""}</td>
         <td><span class="badge ${o.source === 'CUSTOMER' ? 'warn' : 'blue'}">${o.source === 'CUSTOMER' ? 'Online' : 'Staff'}</span></td>
         <td>${o.showroom_name ? esc(o.showroom_name) : '<span class="badge danger">Unassigned</span>'}</td>
         <td>${o.items.map(i => `${esc(i.product_name)} x${i.qty}`).join(", ")}</td>
@@ -1635,6 +1636,7 @@ async function renderBookedOrders(c) {
         <div class="field"><label>Existing Customer (optional)</label><select id="oCust">${custOptions}</select></div>
         <div class="field"><label>Or Caller Name</label><input id="oCallerName" placeholder="If no account on file"></div>
         <div class="field"><label>Phone Number</label><input id="oPhone"></div>
+        <div class="field"><label>Delivery Address</label><input id="oAddress"></div>
         <div class="field"><label>Assign to Location</label><select id="oShowroom">${locationOptions}</select></div>
         <div class="field"><label>Products</label>
           <div id="oItemRows"></div>
@@ -1669,6 +1671,7 @@ async function renderBookedOrders(c) {
               customer_id: document.getElementById("oCust").value || null,
               customer_name_freeform: document.getElementById("oCallerName").value,
               customer_phone: document.getElementById("oPhone").value,
+              delivery_address: document.getElementById("oAddress").value,
               showroom_location_id: document.getElementById("oShowroom").value || null,
               items, notes: document.getElementById("oNotes").value,
             }});
