@@ -1824,35 +1824,54 @@ def delete_vehicle(vid):
 def list_hauling():
     conn = get_db()
     rows = conn.execute(
-        """SELECT h.*, v.plate_number, l.name destination_name, p.name product_name
+        """SELECT h.*, v.plate_number, l.name destination_name
            FROM hauling_schedule h LEFT JOIN vehicles v ON v.id=h.vehicle_id
-           LEFT JOIN locations l ON l.id=h.destination_location_id LEFT JOIN products p ON p.id=h.product_id
+           LEFT JOIN locations l ON l.id=h.destination_location_id
            ORDER BY h.scheduled_date DESC"""
     ).fetchall()
+    out = []
+    for h in rows:
+        items = conn.execute(
+            "SELECT hsi.*, p.name product_name FROM hauling_schedule_items hsi JOIN products p ON p.id=hsi.product_id WHERE hauling_id=?",
+            (h["id"],),
+        ).fetchall()
+        out.append({**dict(h), "items": [dict(i) for i in items]})
     conn.close()
-    return jsonify([dict(r) for r in rows])
+    return jsonify(out)
 
 
 @app.post("/api/hauling")
 @roles_or_module_required("ADMIN", "MANAGER", module="hauling")
 def create_hauling():
     d = request.get_json(force=True)
+    items = d.get("items") or []
     if not d.get("scheduled_date") or not (d.get("plant_name") or "").strip():
         return jsonify(error="scheduled_date and plant_name are required"), 400
+    if not items:
+        return jsonify(error="At least one product is required"), 400
     conn = get_db()
     hauling_no = next_number(conn, "HAUL", "hauling_schedule", "hauling_no")
     cur = conn.execute(
         """INSERT INTO hauling_schedule (hauling_no, scheduled_date, vehicle_id, driver, plant_name,
-               destination_location_id, product_id, qty, status, notes, created_by)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+               destination_location_id, status, notes, created_by)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
         (hauling_no, d["scheduled_date"], d.get("vehicle_id") or None, d.get("driver", ""),
-         d["plant_name"].strip(), d.get("destination_location_id") or None, d.get("product_id") or None,
-         d.get("qty") or None, d.get("status", "SCHEDULED"), d.get("notes", ""), session["user"]["id"]),
+         d["plant_name"].strip(), d.get("destination_location_id") or None,
+         d.get("status", "SCHEDULED"), d.get("notes", ""), session["user"]["id"]),
     )
-    audit(conn, "CREATE", "HAULING", cur.lastrowid, hauling_no)
+    hauling_id = cur.lastrowid
+    for it in items:
+        qty = int(it["qty"])
+        if qty <= 0:
+            conn.rollback()
+            conn.close()
+            return jsonify(error="Quantities must be positive"), 400
+        conn.execute("INSERT INTO hauling_schedule_items (hauling_id, product_id, qty) VALUES (?,?,?)",
+                     (hauling_id, it["product_id"], qty))
+    audit(conn, "CREATE", "HAULING", hauling_id, hauling_no)
     conn.commit()
     conn.close()
-    return jsonify(id=cur.lastrowid, hauling_no=hauling_no), 201
+    return jsonify(id=hauling_id, hauling_no=hauling_no), 201
 
 
 @app.put("/api/hauling/<int:hid>")
@@ -1860,17 +1879,28 @@ def create_hauling():
 def update_hauling(hid):
     d = request.get_json(force=True)
     conn = get_db()
-    existing = conn.execute("SELECT hauling_no FROM hauling_schedule WHERE id=?", (hid,)).fetchone()
+    existing = conn.execute("SELECT * FROM hauling_schedule WHERE id=?", (hid,)).fetchone()
     if not existing:
         conn.close()
         return jsonify(error="Not found"), 404
     conn.execute(
         """UPDATE hauling_schedule SET scheduled_date=?, vehicle_id=?, driver=?, plant_name=?,
-               destination_location_id=?, product_id=?, qty=?, status=?, notes=? WHERE id=?""",
-        (d["scheduled_date"], d.get("vehicle_id") or None, d.get("driver", ""), d["plant_name"].strip(),
-         d.get("destination_location_id") or None, d.get("product_id") or None, d.get("qty") or None,
-         d.get("status", "SCHEDULED"), d.get("notes", ""), hid),
+               destination_location_id=?, status=?, notes=? WHERE id=?""",
+        (d.get("scheduled_date", existing["scheduled_date"]), d.get("vehicle_id", existing["vehicle_id"]) or None,
+         d.get("driver", existing["driver"]), d.get("plant_name", existing["plant_name"]).strip(),
+         d.get("destination_location_id", existing["destination_location_id"]) or None,
+         d.get("status", existing["status"]), d.get("notes", existing["notes"]), hid),
     )
+    if d.get("items") is not None:
+        conn.execute("DELETE FROM hauling_schedule_items WHERE hauling_id=?", (hid,))
+        for it in d["items"]:
+            qty = int(it["qty"])
+            if qty <= 0:
+                conn.rollback()
+                conn.close()
+                return jsonify(error="Quantities must be positive"), 400
+            conn.execute("INSERT INTO hauling_schedule_items (hauling_id, product_id, qty) VALUES (?,?,?)",
+                         (hid, it["product_id"], qty))
     audit(conn, "UPDATE", "HAULING", hid, existing["hauling_no"])
     conn.commit()
     conn.close()
@@ -1882,6 +1912,7 @@ def update_hauling(hid):
 def delete_hauling(hid):
     conn = get_db()
     try:
+        conn.execute("DELETE FROM hauling_schedule_items WHERE hauling_id=?", (hid,))
         cur = conn.execute("DELETE FROM hauling_schedule WHERE id=?", (hid,))
     except sqlite3.IntegrityError:
         conn.close()

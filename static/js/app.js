@@ -1324,10 +1324,11 @@ async function renderHauling(c) {
   async function load() {
     const rows = await api("/hauling");
     document.getElementById("haulTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>Hauling #</th><th>Date</th><th>Plant</th><th>Destination</th><th>Vehicle</th><th>Product</th><th>Qty</th><th>Status</th><th></th>
+      <th>Hauling #</th><th>Date</th><th>Plant</th><th>Destination</th><th>Vehicle</th><th>Products</th><th>Status</th><th></th>
     </tr></thead><tbody>
       ${rows.length ? rows.map(h => `<tr><td>${h.hauling_no}</td><td>${h.scheduled_date}</td><td>${esc(h.plant_name)}</td>
-        <td>${esc(h.destination_name || "")}</td><td>${esc(h.plate_number || "")}</td><td>${esc(h.product_name || "")}</td><td>${h.qty || ""}</td>
+        <td>${esc(h.destination_name || "")}</td><td>${esc(h.plate_number || "")}</td>
+        <td>${h.items.map(i => `${esc(i.product_name)} x${i.qty}`).join(", ")}</td>
         <td><span class="badge ${statusColor(h.status)}">${h.status}</span></td>
         <td style="display:flex;gap:6px">
           <select onchange="updateHaulingStatus(${h.id}, this.value)" style="font-size:12px;padding:4px">
@@ -1335,36 +1336,56 @@ async function renderHauling(c) {
           </select>
           <button class="btn small danger" onclick="deleteHauling(${h.id})">Delete</button>
         </td></tr>`).join("")
-        : `<tr><td colspan="9" style="color:var(--muted)">No hauling trips scheduled.</td></tr>`}
+        : `<tr><td colspan="8" style="color:var(--muted)">No hauling trips scheduled.</td></tr>`}
     </tbody></table></div>`;
   }
   document.getElementById("newHaulBtn").addEventListener("click", async () => {
     const vehicles = await api("/vehicles");
     const vehOpts = `<option value="">— Unassigned —</option>` + vehicles.map(v => `<option value="${v.id}">${esc(v.plate_number)}</option>`).join("");
     const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
-    const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
     openModal("Schedule Hauling", `
       <div class="field"><label>Scheduled Date</label><input type="date" id="hDate"></div>
       <div class="field"><label>Plant Name</label><input id="hPlant" placeholder="e.g. Solane Plant"></div>
       <div class="field"><label>Vehicle</label><select id="hVeh">${vehOpts}</select></div>
       <div class="field"><label>Driver</label><input id="hDriver"></div>
       <div class="field"><label>Destination Location</label><select id="hDest">${locOpts}</select></div>
-      <div class="field"><label>Product</label><select id="hProd">${prodOpts}</select></div>
-      <div class="field"><label>Expected Quantity</label><input type="number" id="hQty" min="1"></div>
+      <div class="field"><label>Products</label>
+        <div id="hItemRows"></div>
+        <button class="btn small" id="hAddItemBtn" type="button">+ Add Product</button>
+      </div>
       <div class="field"><label>Notes</label><input id="hNotes"></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
         <button class="btn green" id="hSaveBtn">Save</button></div>
     `, () => {
+      const itemRows = document.getElementById("hItemRows");
+      const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+      function addItemRow() {
+        const row = document.createElement("div");
+        row.className = "pay-row";
+        row.innerHTML = `
+          <select class="hItemProd" style="flex:1">${prodOpts}</select>
+          <input type="number" class="hItemQty" placeholder="Qty" value="1" min="1" style="width:80px">
+          <button class="btn small danger" type="button">&times;</button>`;
+        row.querySelector("button").addEventListener("click", () => row.remove());
+        itemRows.appendChild(row);
+      }
+      document.getElementById("hAddItemBtn").addEventListener("click", addItemRow);
+      addItemRow();
+
       document.getElementById("hSaveBtn").addEventListener("click", async () => {
         const scheduled_date = document.getElementById("hDate").value;
         const plant_name = document.getElementById("hPlant").value.trim();
+        const items = [...itemRows.querySelectorAll(".pay-row")].map(r => ({
+          product_id: r.querySelector(".hItemProd").value,
+          qty: r.querySelector(".hItemQty").value,
+        })).filter(i => parseInt(i.qty) > 0);
         if (!scheduled_date || !plant_name) { toast("Date and plant name are required", "error"); return; }
+        if (!items.length) { toast("Add at least one product", "error"); return; }
         try {
           await api("/hauling", { method: "POST", body: {
             scheduled_date, plant_name, vehicle_id: document.getElementById("hVeh").value || null,
             driver: document.getElementById("hDriver").value, destination_location_id: document.getElementById("hDest").value,
-            product_id: document.getElementById("hProd").value, qty: document.getElementById("hQty").value,
-            notes: document.getElementById("hNotes").value,
+            items, notes: document.getElementById("hNotes").value,
           }});
           closeModal(); toast("Hauling trip scheduled", "success"); load();
         } catch (e) {}
@@ -1372,9 +1393,8 @@ async function renderHauling(c) {
     });
   });
   window.updateHaulingStatus = async (id, status) => {
-    const h = (await api("/hauling")).find(x => x.id === id);
     try {
-      await api(`/hauling/${id}`, { method: "PUT", body: { ...h, status } });
+      await api(`/hauling/${id}`, { method: "PUT", body: { status } });
       toast("Status updated", "success"); load();
     } catch (e) {}
   };
@@ -1580,21 +1600,41 @@ async function renderBookedOrders(c) {
         <div class="field"><label>Or Caller Name</label><input id="oCallerName" placeholder="If no account on file"></div>
         <div class="field"><label>Phone Number</label><input id="oPhone"></div>
         <div class="field"><label>Assign to Location</label><select id="oShowroom">${locationOptions}</select></div>
-        <div class="field"><label>Product</label><select id="oProd">${prodOptions}</select></div>
-        <div class="field"><label>Quantity</label><input type="number" id="oQty" value="1" min="1"></div>
+        <div class="field"><label>Products</label>
+          <div id="oItemRows"></div>
+          <button class="btn small" id="oAddItemBtn" type="button">+ Add Product</button>
+        </div>
         <div class="field"><label>Notes</label><input id="oNotes"></div>
         <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
           <button class="btn green" id="oSaveBtn">Book Order</button></div>
       `, () => {
+        const itemRows = document.getElementById("oItemRows");
+        function addItemRow() {
+          const row = document.createElement("div");
+          row.className = "pay-row";
+          row.innerHTML = `
+            <select class="oItemProd" style="flex:1">${prodOptions}</select>
+            <input type="number" class="oItemQty" placeholder="Qty" value="1" min="1" style="width:80px">
+            <button class="btn small danger" type="button">&times;</button>`;
+          row.querySelector("button").addEventListener("click", () => row.remove());
+          itemRows.appendChild(row);
+        }
+        document.getElementById("oAddItemBtn").addEventListener("click", addItemRow);
+        addItemRow();
+
         document.getElementById("oSaveBtn").addEventListener("click", async () => {
+          const items = [...itemRows.querySelectorAll(".pay-row")].map(r => ({
+            product_id: r.querySelector(".oItemProd").value,
+            qty: r.querySelector(".oItemQty").value,
+          })).filter(i => parseInt(i.qty) > 0);
+          if (!items.length) { toast("Add at least one product", "error"); return; }
           try {
             await api("/booked-orders", { method: "POST", body: {
               customer_id: document.getElementById("oCust").value || null,
               customer_name_freeform: document.getElementById("oCallerName").value,
               customer_phone: document.getElementById("oPhone").value,
               showroom_location_id: document.getElementById("oShowroom").value,
-              items: [{ product_id: document.getElementById("oProd").value, qty: document.getElementById("oQty").value }],
-              notes: document.getElementById("oNotes").value,
+              items, notes: document.getElementById("oNotes").value,
             }});
             closeModal(); toast("Order booked", "success"); load();
           } catch (e) {}

@@ -201,6 +201,13 @@ CREATE TABLE IF NOT EXISTS hauling_schedule (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS hauling_schedule_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hauling_id INTEGER NOT NULL REFERENCES hauling_schedule(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    qty INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS employees (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -375,6 +382,18 @@ def migrate_schema():
             for m in modules:
                 conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES (?,?)",
                              (role_name, m))
+        conn.commit()
+
+    # 5. Backfill hauling_schedule_items from any pre-existing single-product
+    #    hauling rows (the table now supports multiple products per trip).
+    #    Only runs once — skipped if hauling_schedule_items already has rows.
+    if conn.execute("SELECT COUNT(*) c FROM hauling_schedule_items").fetchone()["c"] == 0:
+        old_rows = conn.execute(
+            "SELECT id, product_id, qty FROM hauling_schedule WHERE product_id IS NOT NULL AND qty IS NOT NULL"
+        ).fetchall()
+        for r in old_rows:
+            conn.execute("INSERT INTO hauling_schedule_items (hauling_id, product_id, qty) VALUES (?,?,?)",
+                         (r["id"], r["product_id"], r["qty"]))
         conn.commit()
 
     conn.close()
