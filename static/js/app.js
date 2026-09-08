@@ -686,8 +686,10 @@ window.openCustomerLedger = async (cid) => {
 async function renderReceivables(c) {
   c.innerHTML = "Loading...";
   const rows = await api("/receivables");
+  const canExport = state.user.role === "ADMIN" || state.user.role === "MANAGER";
   const statusColor = s => ({ PAID: "green", CURRENT: "blue", "DUE SOON": "warn", OVERDUE: "danger", "PARTIALLY PAID": "warn" }[s] || "gray");
-  c.innerHTML = `<div class="table-wrap"><table><thead><tr>
+  c.innerHTML = `<div style="margin-bottom:12px"><button class="btn" id="agingBtn">Aging Report</button></div>
+  <div class="table-wrap"><table><thead><tr>
     <th>Invoice #</th><th>Customer</th><th>Sale #</th><th>Invoice Date</th><th>Due Date</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Status</th><th></th>
   </tr></thead><tbody>
     ${rows.map(r => `<tr>
@@ -697,7 +699,41 @@ async function renderReceivables(c) {
       <td>${r.balance > 0.009 ? `<button class="btn small green" onclick="payReceivable(${r.id}, ${r.balance})">Record Payment</button>` : ""}</td>
     </tr>`).join("")}
   </tbody></table></div>`;
+  document.getElementById("agingBtn").addEventListener("click", () => openAgingReport(canExport));
 }
+
+async function openAgingReport(canExport) {
+  const data = await api("/reports/receivables-aging");
+  const bucketLabels = [
+    ["current", "Current"], ["days_1_30", "1-30 Days"], ["days_31_60", "31-60 Days"],
+    ["days_61_90", "61-90 Days"], ["days_91_120", "91-120 Days"], ["days_120_plus", "120+ Days"],
+  ];
+  openModal("Accounts Receivable Aging", `
+    ${canExport ? `<div style="margin-bottom:10px">
+      <a class="btn small" href="/api/reports/receivables-aging/export?format=xlsx">Export Excel</a>
+      <a class="btn small" href="/api/reports/receivables-aging/export?format=pdf">Export PDF</a>
+    </div>` : ""}
+    <div class="table-wrap"><table><thead><tr>
+      <th>Customer</th>${bucketLabels.map(([, l]) => `<th>${l}</th>`).join("")}<th>Total</th>
+    </tr></thead><tbody>
+      ${data.rows.length ? data.rows.map(r => `<tr>
+        <td>${esc(r.customer_name)} (${r.account_no})</td>
+        ${bucketLabels.map(([k]) => `<td>${r[k] ? money(r[k]) : ""}</td>`).join("")}
+        <td style="font-weight:700">${money(r.total)}</td>
+      </tr>`).join("") : `<tr><td colspan="8" style="color:var(--muted)">No outstanding receivables.</td></tr>`}
+    </tbody></table>
+    <table style="margin-top:2px"><tbody>
+      <tr style="font-weight:700;background:var(--bg)">
+        <td style="width:220px">TOTAL</td>
+        ${bucketLabels.map(([k]) => `<td>${data.totals[k] ? money(data.totals[k]) : ""}</td>`).join("")}
+        <td>${money(data.grand_total)}</td>
+      </tr>
+    </tbody></table>
+    </div>
+    <div class="modal-actions"><button class="btn" onclick="closeModal()">Close</button></div>
+  `);
+}
+
 window.payReceivable = (id, balance) => {
   openModal("Record Payment", `
     <div class="field"><label>Outstanding Balance</label><div style="font-weight:700">${money(balance)}</div></div>
