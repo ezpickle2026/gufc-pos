@@ -1454,6 +1454,88 @@ def list_receivables():
     return jsonify([dict(r) for r in out])
 
 
+AGING_BUCKETS = ["current", "days_1_30", "days_31_60", "days_61_90", "days_91_120", "days_120_plus"]
+
+
+def _aging_bucket_for(days_overdue):
+    if days_overdue <= 0:
+        return "current"
+    if days_overdue <= 30:
+        return "days_1_30"
+    if days_overdue <= 60:
+        return "days_31_60"
+    if days_overdue <= 90:
+        return "days_61_90"
+    if days_overdue <= 120:
+        return "days_91_120"
+    return "days_120_plus"
+
+
+def _build_aging_report(conn, u):
+    rows = conn.execute("SELECT id FROM receivables WHERE status != 'PAID'").fetchall()
+    for r in rows:
+        recompute_receivable_status(conn, r["id"])
+    conn.commit()
+
+    sql = """SELECT r.balance, r.due_date, c.id customer_id, c.name customer_name, c.account_no, s.location_id
+              FROM receivables r JOIN customers c ON c.id=r.customer_id JOIN sales s ON s.id=r.sale_id
+              WHERE r.balance > 0.009"""
+    params = []
+    if u["role"] not in ("ADMIN", "MANAGER"):
+        sql += " AND s.location_id=?"
+        params.append(u["location_id"])
+    rows = conn.execute(sql, params).fetchall()
+
+    today = datetime.now().date()
+    by_customer = {}
+    totals = {b: 0.0 for b in AGING_BUCKETS}
+    for r in rows:
+        due = datetime.strptime(r["due_date"], "%Y-%m-%d").date()
+        days_overdue = (today - due).days
+        bucket = _aging_bucket_for(days_overdue)
+        key = r["customer_id"]
+        if key not in by_customer:
+            by_customer[key] = {"customer_name": r["customer_name"], "account_no": r["account_no"],
+                                 **{b: 0.0 for b in AGING_BUCKETS}, "total": 0.0}
+        by_customer[key][bucket] = round(by_customer[key][bucket] + r["balance"], 2)
+        by_customer[key]["total"] = round(by_customer[key]["total"] + r["balance"], 2)
+        totals[bucket] = round(totals[bucket] + r["balance"], 2)
+
+    customer_rows = sorted(by_customer.values(), key=lambda x: -x["total"])
+    grand_total = round(sum(totals.values()), 2)
+    return customer_rows, totals, grand_total
+
+
+@app.get("/api/reports/receivables-aging")
+@login_required
+def receivables_aging_report():
+    conn = get_db()
+    customer_rows, totals, grand_total = _build_aging_report(conn, session["user"])
+    conn.close()
+    return jsonify(rows=customer_rows, totals=totals, grand_total=grand_total)
+
+
+@app.get("/api/reports/receivables-aging/export")
+@roles_or_module_required("ADMIN", "MANAGER", module="reports")
+def export_receivables_aging():
+    fmt = request.args.get("format", "xlsx")
+    conn = get_db()
+    customer_rows, totals, grand_total = _build_aging_report(conn, session["user"])
+    conn.close()
+
+    headers = ["Customer", "Account #", "Current", "1-30 Days", "31-60 Days", "61-90 Days", "91-120 Days", "120+ Days", "Total"]
+    data = [(r["customer_name"], r["account_no"], r["current"], r["days_1_30"], r["days_31_60"],
+              r["days_61_90"], r["days_91_120"], r["days_120_plus"], r["total"]) for r in customer_rows]
+    data.append(("TOTAL", "", totals["current"], totals["days_1_30"], totals["days_31_60"],
+                 totals["days_61_90"], totals["days_91_120"], totals["days_120_plus"], grand_total))
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    if fmt == "pdf":
+        return pdf_table_response("Accounts Receivable Aging", headers, data, f"receivables-aging-{stamp}.pdf",
+                                   subtitle=f"As of {datetime.now().strftime('%Y-%m-%d')}",
+                                   col_widths=[110, 60, 60, 60, 60, 60, 65, 60, 65], landscape_mode=True)
+    return xlsx_response(headers, data, f"receivables-aging-{stamp}.xlsx", "AR Aging")
+
+
 @app.post("/api/receivables/<int:rid>/pay")
 @roles_required("ADMIN", "MANAGER", "ATTENDANT")
 def pay_receivable(rid):
