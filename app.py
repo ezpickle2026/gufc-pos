@@ -28,6 +28,22 @@ _boot_conn.close()
 
 # ---------------------------------------------------------------- helpers
 
+def decode_csv_upload(raw_bytes):
+    """CSV files exported from Excel on Windows are very often saved as
+    Windows-1252 (or plain Latin-1), not UTF-8 — especially once a name or
+    address has an accented character (Ñ, é, etc.) in it. Try UTF-8 first
+    since that's the common/correct case, then fall back to the encodings
+    Excel actually uses. latin-1 never raises (it maps every byte), so it's
+    the guaranteed-to-succeed last resort.
+    """
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return raw_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("latin-1")
+
+
 def audit(conn, action, module, record_id=None, details=None):
     user = session.get("user")
     conn.execute(
@@ -384,7 +400,7 @@ def products_csv_import():
     if not file:
         return jsonify(error="No file uploaded"), 400
     try:
-        text = file.read().decode("utf-8-sig")
+        text = decode_csv_upload(file.read())
         reader = csv.DictReader(io.StringIO(text))
     except Exception as e:
         return jsonify(error=f"Could not read CSV: {e}"), 400
@@ -542,7 +558,7 @@ def customers_csv_import():
     if not file:
         return jsonify(error="No file uploaded"), 400
     try:
-        text = file.read().decode("utf-8-sig")
+        text = decode_csv_upload(file.read())
         reader = csv.DictReader(io.StringIO(text))
     except Exception as e:
         return jsonify(error=f"Could not read CSV: {e}"), 400
