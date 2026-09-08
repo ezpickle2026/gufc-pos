@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Place an Order | Great Unli Food Corp.</title>
+<link rel="icon" type="image/png" href="/images/favicon.png">
+<style>
+:root{
+  --blue:#0b3d66; --blue-dark:#082a47; --green:#1e9e5a; --green-dark:#157a45;
+  --bg:#f4f6f8; --card:#ffffff; --border:#e2e6ea; --text:#1c2733; --muted:#6b7785;
+  --danger:#c0392b; --radius:10px;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}
+.header{background:linear-gradient(160deg,var(--blue),var(--blue-dark));color:#fff;padding:28px 20px;text-align:center}
+.header img{width:64px;height:64px;object-fit:contain;margin-bottom:10px}
+.header h1{margin:0 0 4px;font-size:20px}
+.header p{margin:0;opacity:.85;font-size:13.5px}
+.wrap{max-width:520px;margin:0 auto;padding:20px 16px 60px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
+.field{margin-bottom:16px}
+.field label{display:block;font-size:13px;font-weight:600;color:var(--muted);margin-bottom:6px}
+input,select,textarea{width:100%;font-family:inherit;font-size:15px;padding:11px 12px;border:1px solid var(--border);border-radius:8px;background:#fff;color:var(--text)}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--blue);outline-offset:0}
+.hp-field{position:absolute;left:-9999px;top:-9999px}
+h2{font-size:15px;margin:0 0 12px;color:var(--blue)}
+.item-row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.item-row select{flex:1}
+.item-row input{width:70px;text-align:center}
+.item-row .rm{background:none;border:1px solid var(--border);border-radius:8px;width:38px;height:42px;color:var(--danger);font-size:16px;cursor:pointer;flex-shrink:0}
+.add-btn{background:none;border:1px dashed var(--border);border-radius:8px;padding:10px;width:100%;color:var(--blue);font-weight:600;font-size:13.5px;cursor:pointer}
+.submit-btn{width:100%;background:var(--green);color:#fff;border:none;border-radius:8px;padding:14px;font-size:15.5px;font-weight:700;cursor:pointer}
+.submit-btn:hover{background:var(--green-dark)}
+.submit-btn:disabled{opacity:.6;cursor:not-allowed}
+.error-box{background:#fbe6e3;color:var(--danger);padding:10px 12px;border-radius:8px;font-size:13.5px;margin-bottom:14px}
+.hidden{display:none !important}
+.success-card{text-align:center;padding:36px 20px}
+.success-card .check{width:56px;height:56px;border-radius:50%;background:var(--green);color:#fff;display:flex;align-items:center;justify-content:center;font-size:28px;margin:0 auto 16px}
+.success-card h2{color:var(--green-dark);font-size:19px}
+.success-card .ordno{font-family:monospace;font-size:16px;font-weight:700;background:var(--bg);padding:8px 14px;border-radius:8px;display:inline-block;margin:10px 0}
+.footer-note{text-align:center;color:var(--muted);font-size:12px;margin-top:10px}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <img src="/images/logo.png" alt="GUFC Logo">
+  <h1>Great Unli Food Corp.</h1>
+  <p>Solane LPG Distributor — Place Your Order</p>
+</div>
+
+<div class="wrap">
+  <div class="card" id="formCard">
+    <div id="errorBox" class="error-box hidden"></div>
+    <form id="orderForm">
+      <div class="field hp-field">
+        <label for="website">Leave this field blank</label>
+        <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+      </div>
+
+      <h2>Your Details</h2>
+      <div class="field"><label>Full Name *</label><input type="text" id="custName" required></div>
+      <div class="field"><label>Phone Number *</label><input type="tel" id="custPhone" required placeholder="09XX-XXX-XXXX"></div>
+      <div class="field">
+        <label>Preferred Warehouse / Showroom (optional)</label>
+        <select id="prefLocation"><option value="">No preference — we'll assign the nearest one</option></select>
+      </div>
+
+      <h2>What would you like to order?</h2>
+      <div id="itemRows"></div>
+      <button type="button" class="add-btn" id="addItemBtn">+ Add another product</button>
+
+      <div class="field" style="margin-top:16px">
+        <label>Notes (delivery instructions, preferred time, etc.)</label>
+        <textarea id="notes" rows="3"></textarea>
+      </div>
+
+      <button type="submit" class="submit-btn" id="submitBtn">Place Order</button>
+    </form>
+  </div>
+  <p class="footer-note">Someone from our team will confirm your order shortly.</p>
+</div>
+
+<script>
+let PRODUCTS = [];
+
+async function init() {
+  const [locations, products] = await Promise.all([
+    fetch('/api/public/locations').then(r => r.json()),
+    fetch('/api/public/products').then(r => r.json()),
+  ]);
+  PRODUCTS = products;
+
+  const locSelect = document.getElementById('prefLocation');
+  locations.forEach(l => {
+    const opt = document.createElement('option');
+    opt.value = l.id;
+    opt.textContent = `${l.name} (${l.type === 'WAREHOUSE' ? 'Warehouse' : 'Showroom'})`;
+    locSelect.appendChild(opt);
+  });
+
+  addItemRow();
+}
+
+function money(n) {
+  return '\u20b1' + Number(n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function addItemRow() {
+  const row = document.createElement('div');
+  row.className = 'item-row';
+  const options = PRODUCTS.map(p => `<option value="${p.id}">${p.name} — ${money(p.price)}</option>`).join('');
+  row.innerHTML = `
+    <select class="itemProd">${options}</select>
+    <input type="number" class="itemQty" value="1" min="1" max="500">
+    <button type="button" class="rm">&times;</button>`;
+  row.querySelector('.rm').addEventListener('click', () => {
+    if (document.querySelectorAll('.item-row').length > 1) row.remove();
+  });
+  document.getElementById('itemRows').appendChild(row);
+}
+document.getElementById('addItemBtn').addEventListener('click', addItemRow);
+
+document.getElementById('orderForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errorBox = document.getElementById('errorBox');
+  errorBox.classList.add('hidden');
+  const submitBtn = document.getElementById('submitBtn');
+
+  const items = [...document.querySelectorAll('.item-row')].map(row => ({
+    product_id: parseInt(row.querySelector('.itemProd').value, 10),
+    qty: parseInt(row.querySelector('.itemQty').value, 10) || 0,
+  })).filter(i => i.qty > 0);
+
+  const body = {
+    customer_name: document.getElementById('custName').value.trim(),
+    customer_phone: document.getElementById('custPhone').value.trim(),
+    preferred_location_id: document.getElementById('prefLocation').value || null,
+    items,
+    notes: document.getElementById('notes').value,
+    website: document.getElementById('website').value, // honeypot
+  };
+
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Placing Order...';
+  try {
+    const res = await fetch('/api/public/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      errorBox.textContent = data.error || 'Something went wrong. Please try again.';
+      errorBox.classList.remove('hidden');
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Place Order';
+      return;
+    }
+    document.getElementById('formCard').innerHTML = `
+      <div class="success-card">
+        <div class="check">&#10003;</div>
+        <h2>Order Received!</h2>
+        <p>Your order number is</p>
+        <div class="ordno">${data.order_no}</div>
+        <p style="color:var(--muted);font-size:13.5px">We'll confirm and prepare it shortly. Thank you!</p>
+      </div>`;
+  } catch (err) {
+    errorBox.textContent = 'Could not reach the server. Please check your connection and try again.';
+    errorBox.classList.remove('hidden');
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Place Order';
+  }
+});
+
+init();
+</script>
+</body>
+</html>

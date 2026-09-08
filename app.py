@@ -733,11 +733,13 @@ def list_booked_orders():
     conn = get_db()
     sql = """SELECT bo.*, c.name customer_name, l.name showroom_name, creator.name created_by_name
               FROM booked_orders bo LEFT JOIN customers c ON c.id=bo.customer_id
-              JOIN locations l ON l.id=bo.showroom_location_id
+              LEFT JOIN locations l ON l.id=bo.showroom_location_id
               LEFT JOIN users creator ON creator.id=bo.created_by WHERE 1=1"""
     params = []
     if u["role"] == "ORDER_TAKER":
-        sql += " AND bo.created_by=?"
+        # Order Takers see orders they personally booked, plus every
+        # customer-submitted order that still needs a location assigned.
+        sql += " AND (bo.created_by=? OR bo.showroom_location_id IS NULL)"
         params.append(u["id"])
     elif u["role"] not in ("ADMIN", "MANAGER"):
         sql += " AND bo.showroom_location_id=?"
@@ -760,15 +762,16 @@ def list_booked_orders():
 def create_booked_order():
     d = request.get_json(force=True)
     items = d.get("items") or []
-    if not d.get("showroom_location_id") or not items:
-        return jsonify(error="showroom_location_id and at least one item are required"), 400
+    if not items:
+        return jsonify(error="At least one item is required"), 400
     conn = get_db()
     order_no = next_number(conn, "ORD", "booked_orders", "order_no")
     cur = conn.execute(
         """INSERT INTO booked_orders (order_no, customer_id, customer_name_freeform, customer_phone,
-               showroom_location_id, notes, created_by) VALUES (?,?,?,?,?,?,?)""",
+               showroom_location_id, source, notes, created_by) VALUES (?,?,?,?,?,?,?,?)""",
         (order_no, d.get("customer_id") or None, d.get("customer_name_freeform", ""),
-         d.get("customer_phone", ""), d["showroom_location_id"], d.get("notes", ""), session["user"]["id"]),
+         d.get("customer_phone", ""), d.get("showroom_location_id") or None, "STAFF",
+         d.get("notes", ""), session["user"]["id"]),
     )
     order_id = cur.lastrowid
     for it in items:
@@ -803,8 +806,12 @@ def update_booked_order(oid):
         conn.execute("UPDATE booked_orders SET status=?, fulfilled_by=?, fulfilled_at=datetime('now') WHERE id=?",
                      (new_status, u["id"], oid))
     else:
-        conn.execute("UPDATE booked_orders SET status=?, notes=? WHERE id=?",
-                     (new_status, d.get("notes", order["notes"]), oid))
+        # Admin/Manager/Order Taker can also (re)assign which location the
+        # order goes to — this is how a customer-submitted, unassigned order
+        # gets routed to a specific warehouse or showroom.
+        new_location = d.get("showroom_location_id", order["showroom_location_id"])
+        conn.execute("UPDATE booked_orders SET status=?, notes=?, showroom_location_id=? WHERE id=?",
+                     (new_status, d.get("notes", order["notes"]), new_location or None, oid))
         if new_status == "FULFILLED" and order["status"] != "FULFILLED":
             conn.execute("UPDATE booked_orders SET fulfilled_by=?, fulfilled_at=datetime('now') WHERE id=?",
                          (u["id"], oid))
@@ -812,6 +819,84 @@ def update_booked_order(oid):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- public order form
+# No login required. A customer places an order here; it lands in Booked
+# Orders as an unassigned, customer-sourced order for an Order Taker (or
+# Admin/Manager) to route to a specific warehouse or showroom.
+
+@app.get("/api/public/locations")
+def public_locations():
+    conn = get_db()
+    rows = conn.execute("SELECT id, name, type FROM locations WHERE status='ACTIVE' ORDER BY name").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.get("/api/public/products")
+def public_products():
+    conn = get_db()
+    rows = conn.execute("SELECT id, name, unit, price FROM products WHERE active=1 ORDER BY name").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/public/orders")
+def submit_public_order():
+    d = request.get_json(force=True)
+    # Honeypot: a legitimate browser never fills this hidden field in.
+    if (d.get("website") or "").strip():
+        return jsonify(order_no="ORD-00000000-0000"), 201  # pretend success, create nothing
+
+    name = (d.get("customer_name") or "").strip()
+    phone = (d.get("customer_phone") or "").strip()
+    items = d.get("items") or []
+    if not name or not phone:
+        return jsonify(error="Name and phone number are required"), 400
+    if not items:
+        return jsonify(error="Add at least one product"), 400
+    if len(items) > 20:
+        return jsonify(error="Too many line items"), 400
+
+    conn = get_db()
+    try:
+        resolved = []
+        for it in items:
+            prod = conn.execute("SELECT id FROM products WHERE id=? AND active=1", (it.get("product_id"),)).fetchone()
+            if not prod:
+                conn.close()
+                return jsonify(error="One of the selected products is no longer available"), 400
+            qty = int(it.get("qty") or 0)
+            if qty <= 0 or qty > 500:
+                conn.close()
+                return jsonify(error="Quantity must be between 1 and 500"), 400
+            resolved.append((prod["id"], qty))
+
+        preferred_location = d.get("preferred_location_id") or None
+        if preferred_location:
+            loc = conn.execute("SELECT id FROM locations WHERE id=? AND status='ACTIVE'", (preferred_location,)).fetchone()
+            if not loc:
+                preferred_location = None
+
+        order_no = next_number(conn, "ORD", "booked_orders", "order_no")
+        cur = conn.execute(
+            """INSERT INTO booked_orders (order_no, customer_name_freeform, customer_phone,
+                   showroom_location_id, source, notes) VALUES (?,?,?,?,?,?)""",
+            (order_no, name[:200], phone[:50], preferred_location, "CUSTOMER", (d.get("notes") or "")[:500]),
+        )
+        order_id = cur.lastrowid
+        for product_id, qty in resolved:
+            conn.execute("INSERT INTO booked_order_items (order_id, product_id, qty) VALUES (?,?,?)",
+                         (order_id, product_id, qty))
+        audit(conn, "CREATE", "BOOKED_ORDERS", order_id, f"{order_no} (public submission)")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return jsonify(error=f"Could not submit order: {e}"), 400
+    conn.close()
+    return jsonify(order_no=order_no), 201
 
 
 # ---------------------------------------------------------------- incident reports
@@ -2111,6 +2196,11 @@ def employee_kpi():
 @app.get("/")
 def index():
     return send_from_directory("static", "index.html")
+
+
+@app.get("/order")
+def public_order_page():
+    return send_from_directory("static", "order.html")
 
 
 if __name__ == "__main__":

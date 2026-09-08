@@ -250,7 +250,8 @@ CREATE TABLE IF NOT EXISTS booked_orders (
     customer_id INTEGER REFERENCES customers(id),
     customer_name_freeform TEXT,
     customer_phone TEXT,
-    showroom_location_id INTEGER NOT NULL REFERENCES locations(id),
+    showroom_location_id INTEGER REFERENCES locations(id),
+    source TEXT NOT NULL DEFAULT 'STAFF' CHECK(source IN ('STAFF','CUSTOMER')),
     status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','FULFILLED','CANCELLED')),
     notes TEXT,
     created_by INTEGER REFERENCES users(id),
@@ -394,6 +395,47 @@ def migrate_schema():
         for r in old_rows:
             conn.execute("INSERT INTO hauling_schedule_items (hauling_id, product_id, qty) VALUES (?,?,?)",
                          (r["id"], r["product_id"], r["qty"]))
+        conn.commit()
+
+    # 6. booked_orders.showroom_location_id needs to become nullable (a
+    #    customer-submitted order has no location until an Order Taker
+    #    assigns one), and needs a `source` column. SQLite can't relax a
+    #    NOT NULL constraint directly, so recreate the table and copy data.
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='booked_orders'").fetchone()
+    if row and "showroom_location_id INTEGER NOT NULL" in row[0]:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        has_source = _column_exists(conn, "booked_orders", "source")
+        conn.execute("""
+            CREATE TABLE booked_orders_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_no TEXT UNIQUE NOT NULL,
+                order_date TEXT DEFAULT (datetime('now')),
+                customer_id INTEGER REFERENCES customers(id),
+                customer_name_freeform TEXT,
+                customer_phone TEXT,
+                showroom_location_id INTEGER REFERENCES locations(id),
+                source TEXT NOT NULL DEFAULT 'STAFF' CHECK(source IN ('STAFF','CUSTOMER')),
+                status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','FULFILLED','CANCELLED')),
+                notes TEXT,
+                created_by INTEGER REFERENCES users(id),
+                fulfilled_by INTEGER REFERENCES users(id),
+                fulfilled_at TEXT
+            )
+        """)
+        source_col = "source" if has_source else "'STAFF'"
+        conn.execute(f"""
+            INSERT INTO booked_orders_new (id, order_no, order_date, customer_id, customer_name_freeform,
+                customer_phone, showroom_location_id, source, status, notes, created_by, fulfilled_by, fulfilled_at)
+            SELECT id, order_no, order_date, customer_id, customer_name_freeform,
+                customer_phone, showroom_location_id, {source_col}, status, notes, created_by, fulfilled_by, fulfilled_at
+            FROM booked_orders
+        """)
+        conn.execute("DROP TABLE booked_orders")
+        conn.execute("ALTER TABLE booked_orders_new RENAME TO booked_orders")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.commit()
+    elif not _column_exists(conn, "booked_orders", "source"):
+        conn.execute("ALTER TABLE booked_orders ADD COLUMN source TEXT NOT NULL DEFAULT 'STAFF'")
         conn.commit()
 
     conn.close()

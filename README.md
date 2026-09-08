@@ -32,6 +32,21 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Public customer order form** — a standalone page at `/order` (no login
+  needed) where customers can place an order themselves: pick products, an
+  optional preferred warehouse/showroom, leave their name and phone number.
+  It lands in Booked Orders as an unassigned "Online" order for an Order
+  Taker (or Admin/Manager) to confirm and route to a specific location — or
+  it's pre-filled if the customer picked a preference. Includes a copyable
+  share link right on the Booked Orders page, basic input validation, and a
+  honeypot field to deter simple bots.
+- **Multi-product Booked Orders and Hauling Schedule** — both now support
+  adding several products to a single order/trip instead of just one
+- **CSV import fixed for Excel-saved files** — files saved by Excel on
+  Windows often use a different text encoding than the web expects, which
+  broke import when a name had an accented character (e.g. "Peña"). Import
+  now handles this automatically.
+
 - **Bug fixes**: vehicle creation was crashing when the odometer field was left
   empty — fixed, and while tracking it down I found and fixed the same fragile
   pattern in Products, Customers, and the **POS discount field** (a real crash

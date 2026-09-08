@@ -1562,37 +1562,73 @@ async function renderKpi(c) {
 async function renderBookedOrders(c) {
   const role = state.user.role;
   const canCreate = ["ADMIN", "MANAGER", "ORDER_TAKER"].includes(role);
+  const canAssign = canCreate;
   const isAttendant = !["ADMIN", "MANAGER", "ORDER_TAKER"].includes(role);
-  c.innerHTML = `<div style="margin-bottom:12px">${canCreate ? `<button class="btn green" id="newOrderBtn">+ Book Order</button>` : ""}</div>
+  const publicUrl = `${location.origin}/order`;
+  c.innerHTML = `
+    ${canCreate ? `<div class="card" style="margin-bottom:14px;padding:12px 16px">
+      <div style="font-size:12.5px;color:var(--muted);margin-bottom:4px">Share this link so customers can place orders themselves — they'll land here as unassigned for you to route:</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <code style="background:var(--bg);padding:6px 10px;border-radius:6px;font-size:13px">${esc(publicUrl)}</code>
+        <button class="btn small" id="copyLinkBtn">Copy Link</button>
+      </div>
+    </div>` : ""}
+    <div style="margin-bottom:12px">${canCreate ? `<button class="btn green" id="newOrderBtn">+ Book Order</button>` : ""}</div>
     <div id="ordTable">Loading...</div>`;
+  if (canCreate) {
+    document.getElementById("copyLinkBtn").addEventListener("click", () => {
+      navigator.clipboard.writeText(publicUrl).then(() => toast("Link copied", "success"));
+    });
+  }
   const statusColor = s => ({ PENDING: "warn", FULFILLED: "green", CANCELLED: "danger" }[s] || "gray");
   async function load() {
     const rows = await api("/booked-orders");
     document.getElementById("ordTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>Order #</th><th>Date</th><th>Customer</th><th>Location</th><th>Items</th><th>Booked By</th><th>Status</th><th></th>
+      <th>Order #</th><th>Date</th><th>Customer</th><th>Source</th><th>Location</th><th>Items</th><th>Booked By</th><th>Status</th><th></th>
     </tr></thead><tbody>
-      ${rows.length ? rows.map(o => `<tr><td>${o.order_no}</td><td>${o.order_date}</td>
+      ${rows.length ? rows.map(o => `<tr>
+        <td>${o.order_no}</td><td>${o.order_date}</td>
         <td>${esc(o.customer_name || o.customer_name_freeform || "—")}${o.customer_phone ? " (" + esc(o.customer_phone) + ")" : ""}</td>
-        <td>${esc(o.showroom_name)}</td><td>${o.items.map(i => `${esc(i.product_name)} x${i.qty}`).join(", ")}</td>
-        <td>${esc(o.created_by_name || "")}</td>
+        <td><span class="badge ${o.source === 'CUSTOMER' ? 'warn' : 'blue'}">${o.source === 'CUSTOMER' ? 'Online' : 'Staff'}</span></td>
+        <td>${o.showroom_name ? esc(o.showroom_name) : '<span class="badge danger">Unassigned</span>'}</td>
+        <td>${o.items.map(i => `${esc(i.product_name)} x${i.qty}`).join(", ")}</td>
+        <td>${esc(o.created_by_name || "—")}</td>
         <td><span class="badge ${statusColor(o.status)}">${o.status}</span></td>
-        <td>${o.status === "PENDING" ? (isAttendant
-            ? `<button class="btn small green" onclick="updateOrderStatus(${o.id}, 'FULFILLED')">Mark Fulfilled</button>`
-            : `<button class="btn small green" onclick="updateOrderStatus(${o.id}, 'FULFILLED')">Fulfill</button>
-               <button class="btn small danger" onclick="updateOrderStatus(${o.id}, 'CANCELLED')">Cancel</button>`) : ""}</td>
-      </tr>`).join("") : `<tr><td colspan="8" style="color:var(--muted)">No booked orders${isAttendant ? " for your location" : ""} yet.</td></tr>`}
+        <td style="display:flex;gap:6px;flex-wrap:wrap">
+          ${canAssign && o.status === "PENDING" ? `<button class="btn small" onclick="assignOrderLocation(${o.id}, ${o.showroom_location_id || 'null'})">${o.showroom_location_id ? 'Reassign' : 'Assign'}</button>` : ""}
+          ${o.status === "PENDING" ? (isAttendant
+              ? `<button class="btn small green" onclick="updateOrderStatus(${o.id}, 'FULFILLED')">Mark Fulfilled</button>`
+              : `<button class="btn small green" onclick="updateOrderStatus(${o.id}, 'FULFILLED')">Fulfill</button>
+                 <button class="btn small danger" onclick="updateOrderStatus(${o.id}, 'CANCELLED')">Cancel</button>`) : ""}
+        </td>
+      </tr>`).join("") : `<tr><td colspan="9" style="color:var(--muted)">No booked orders${isAttendant ? " for your location" : ""} yet.</td></tr>`}
     </tbody></table></div>`;
   }
   window.updateOrderStatus = async (id, status) => {
     try { await api(`/booked-orders/${id}`, { method: "PUT", body: { status } }); toast(`Order ${status.toLowerCase()}`, "success"); load(); }
     catch (e) {}
   };
+  window.assignOrderLocation = (id, currentLocationId) => {
+    const locOpts = state.locations.map(l => `<option value="${l.id}" ${l.id === currentLocationId ? "selected" : ""}>${esc(l.name)} (${l.type === "WAREHOUSE" ? "Warehouse" : "Showroom"})</option>`).join("");
+    openModal("Assign Order to Location", `
+      <div class="field"><label>Warehouse / Showroom</label><select id="assignLoc">${locOpts}</select></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="assignSaveBtn">Assign</button></div>
+    `, () => {
+      document.getElementById("assignSaveBtn").addEventListener("click", async () => {
+        try {
+          await api(`/booked-orders/${id}`, { method: "PUT", body: { showroom_location_id: document.getElementById("assignLoc").value } });
+          closeModal(); toast("Order assigned", "success"); load();
+        } catch (e) {}
+      });
+    });
+  };
   if (canCreate) {
     document.getElementById("newOrderBtn").addEventListener("click", async () => {
       const customers = await api("/customers?q=");
       const custOptions = `<option value="">-- No account / phone-in order --</option>` +
         customers.map(cu => `<option value="${cu.id}">${esc(cu.name)} (${cu.account_no})</option>`).join("");
-      const locationOptions = state.locations
+      const locationOptions = `<option value="">-- Leave unassigned for now --</option>` + state.locations
         .map(l => `<option value="${l.id}">${esc(l.name)} (${l.type === "WAREHOUSE" ? "Warehouse" : "Showroom"})</option>`).join("");
       const prodOptions = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
       openModal("Book Order", `
@@ -1633,7 +1669,7 @@ async function renderBookedOrders(c) {
               customer_id: document.getElementById("oCust").value || null,
               customer_name_freeform: document.getElementById("oCallerName").value,
               customer_phone: document.getElementById("oPhone").value,
-              showroom_location_id: document.getElementById("oShowroom").value,
+              showroom_location_id: document.getElementById("oShowroom").value || null,
               items, notes: document.getElementById("oNotes").value,
             }});
             closeModal(); toast("Order booked", "success"); load();
