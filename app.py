@@ -372,9 +372,10 @@ def create_product():
     conn = get_db()
     try:
         cur = conn.execute(
-            "INSERT INTO products (sku, name, category, unit, price, cost, deposit_price, min_stock) VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO products (sku, name, category, unit, price, cost, deposit_price, price_per_kg, min_stock) VALUES (?,?,?,?,?,?,?,?,?)",
             (d["sku"], d["name"], d.get("category", ""), d.get("unit", "cylinder"),
-             float(d["price"]), float(d.get("cost") or 0), float(d.get("deposit_price") or 0), int(d.get("min_stock") or 0)),
+             float(d["price"]), float(d.get("cost") or 0), float(d.get("deposit_price") or 0),
+             float(d.get("price_per_kg") or 0), int(d.get("min_stock") or 0)),
         )
     except Exception as e:
         conn.close()
@@ -388,7 +389,7 @@ def create_product():
 @app.get("/api/products/template")
 @roles_required("ADMIN")
 def products_csv_template():
-    csv_text = "sku,name,category,unit,price,cost,deposit_price,min_stock\nLPG-11KG,Solane LPG 11kg,LPG Cylinder,cylinder,1150,950,1500,50\n"
+    csv_text = "sku,name,category,unit,price,cost,deposit_price,price_per_kg,min_stock\nLPG-11KG,Solane LPG 11kg,LPG Cylinder,cylinder,1150,950,1500,0,50\n"
     return Response(csv_text, mimetype="text/csv",
                      headers={"Content-Disposition": "attachment; filename=products-template.csv"})
 
@@ -415,9 +416,10 @@ def products_csv_import():
                 raise ValueError("sku and name are required")
             price = float(row.get("price") or 0)
             conn.execute(
-                "INSERT INTO products (sku, name, category, unit, price, cost, deposit_price, min_stock) VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO products (sku, name, category, unit, price, cost, deposit_price, price_per_kg, min_stock) VALUES (?,?,?,?,?,?,?,?,?)",
                 (sku, name, (row.get("category") or "").strip(), (row.get("unit") or "cylinder").strip(),
-                 price, float(row.get("cost") or 0), float(row.get("deposit_price") or 0), int(row.get("min_stock") or 0)),
+                 price, float(row.get("cost") or 0), float(row.get("deposit_price") or 0),
+                 float(row.get("price_per_kg") or 0), int(row.get("min_stock") or 0)),
             )
             created += 1
         except Exception as e:
@@ -435,9 +437,10 @@ def update_product(pid):
     d = request.get_json(force=True)
     conn = get_db()
     conn.execute(
-        "UPDATE products SET name=?, category=?, unit=?, price=?, cost=?, deposit_price=?, min_stock=? WHERE id=?",
+        "UPDATE products SET name=?, category=?, unit=?, price=?, cost=?, deposit_price=?, price_per_kg=?, min_stock=? WHERE id=?",
         (d["name"], d.get("category", ""), d.get("unit", "cylinder"), float(d["price"]),
-         float(d.get("cost") or 0), float(d.get("deposit_price") or 0), int(d.get("min_stock") or 0), pid),
+         float(d.get("cost") or 0), float(d.get("deposit_price") or 0), float(d.get("price_per_kg") or 0),
+         int(d.get("min_stock") or 0), pid),
     )
     audit(conn, "UPDATE", "PRODUCTS", pid, f"price={d['price']} cost={d.get('cost',0)} deposit_price={d.get('deposit_price',0)}")
     conn.commit()
@@ -2111,6 +2114,267 @@ def delete_hauling(hid):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- commercial 50kg weight billing
+# For commercial 50kg accounts: dispatcher weighs cylinders in (gross/tare ->
+# net) at delivery, weighs them out again at pickup/exchange, and the system
+# computes actual LPG consumed as the difference — that's the billable
+# weight. Billing (Admin/Manager, standing in for "the accountant") converts
+# that into a normal credit sale + receivable, reusing all the existing AR
+# machinery (aging report, SOA, payments) rather than building a parallel one.
+
+@app.get("/api/commercial-deliveries")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+def list_commercial_deliveries():
+    u = session["user"]
+    conn = get_db()
+    sql = """SELECT cd.*, c.name customer_name, c.account_no, l.name location_name, p.name product_name,
+                     creator.name created_by_name
+              FROM commercial_deliveries cd JOIN customers c ON c.id=cd.customer_id
+              JOIN locations l ON l.id=cd.location_id JOIN products p ON p.id=cd.product_id
+              LEFT JOIN users creator ON creator.id=cd.created_by WHERE 1=1"""
+    params = []
+    if u["role"] not in ("ADMIN", "MANAGER"):
+        sql += " AND cd.location_id=?"
+        params.append(u["location_id"])
+    sql += " ORDER BY cd.delivery_date DESC"
+    rows = conn.execute(sql, params).fetchall()
+    out = []
+    for r in rows:
+        cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (r["id"],)).fetchall()
+        total_net_in = round(sum(c["net_weight_in"] for c in cyls), 2)
+        total_consumption = round(sum(c["consumption_weight"] or 0 for c in cyls), 2) if r["status"] in ("PICKED_UP", "BILLED") else None
+        out.append({**dict(r), "cylinders": [dict(c) for c in cyls],
+                    "total_net_weight_in": total_net_in, "total_consumption_weight": total_consumption})
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/commercial-deliveries")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+def create_commercial_delivery():
+    d = request.get_json(force=True)
+    u = session["user"]
+    location_id = u["location_id"] if u["role"] not in ("ADMIN", "MANAGER") else d.get("location_id")
+    cylinders = d.get("cylinders") or []
+    if not d.get("customer_id") or not d.get("product_id") or not location_id:
+        return jsonify(error="customer_id, product_id and location_id are required"), 400
+    if not cylinders:
+        return jsonify(error="At least one cylinder is required"), 400
+
+    resolved = []
+    for cyl in cylinders:
+        try:
+            gw = float(cyl.get("gross_weight_in"))
+            tw = float(cyl.get("tare_weight"))
+        except (TypeError, ValueError):
+            return jsonify(error="Gross weight and tare weight must be numbers"), 400
+        if gw <= 0 or tw <= 0:
+            return jsonify(error="Gross weight and tare weight must be positive"), 400
+        if gw <= tw:
+            return jsonify(error=f"Gross weight ({gw}) must be greater than tare weight ({tw}) for each cylinder"), 400
+        resolved.append((cyl.get("cylinder_label", ""), gw, tw, round(gw - tw, 2)))
+
+    conn = get_db()
+    delivery_no = next_number(conn, "CD", "commercial_deliveries", "delivery_no")
+    cur = conn.execute(
+        """INSERT INTO commercial_deliveries (delivery_no, customer_id, location_id, product_id, notes, created_by)
+           VALUES (?,?,?,?,?,?)""",
+        (delivery_no, d["customer_id"], location_id, d["product_id"], d.get("notes", ""), u["id"]),
+    )
+    delivery_id = cur.lastrowid
+    for label, gw, tw, nw in resolved:
+        conn.execute(
+            """INSERT INTO commercial_delivery_cylinders (delivery_id, cylinder_label, gross_weight_in, tare_weight, net_weight_in)
+               VALUES (?,?,?,?,?)""",
+            (delivery_id, label, gw, tw, nw),
+        )
+    total_nw = round(sum(r[3] for r in resolved), 2)
+    audit(conn, "CREATE", "COMMERCIAL_DELIVERIES", delivery_id, f"{delivery_no}: {len(resolved)} cylinder(s), {total_nw}kg total")
+    conn.commit()
+    conn.close()
+    return jsonify(id=delivery_id, delivery_no=delivery_no, total_net_weight_in=total_nw), 201
+
+
+@app.get("/api/commercial-deliveries/<int:did>")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+def get_commercial_delivery(did):
+    conn = get_db()
+    row = conn.execute(
+        """SELECT cd.*, c.name customer_name, c.account_no, l.name location_name, p.name product_name
+           FROM commercial_deliveries cd JOIN customers c ON c.id=cd.customer_id
+           JOIN locations l ON l.id=cd.location_id JOIN products p ON p.id=cd.product_id WHERE cd.id=?""",
+        (did,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (did,)).fetchall()
+    conn.close()
+    return jsonify({**dict(row), "cylinders": [dict(c) for c in cyls]})
+
+
+@app.put("/api/commercial-deliveries/<int:did>/pickup")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+def record_commercial_pickup(did):
+    """Weigh-out: record the residual weight for each cylinder. Consumption
+    (billable weight) = net weight delivered - net weight residual."""
+    d = request.get_json(force=True)
+    cylinders = d.get("cylinders") or []
+    if not cylinders:
+        return jsonify(error="At least one cylinder weigh-out reading is required"), 400
+
+    conn = get_db()
+    delivery = conn.execute("SELECT * FROM commercial_deliveries WHERE id=?", (did,)).fetchone()
+    if not delivery:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    if delivery["status"] != "DELIVERED":
+        conn.close()
+        return jsonify(error=f"This delivery is already {delivery['status']} — pickup can't be recorded again"), 400
+
+    existing_cyls = {c["id"]: c for c in conn.execute(
+        "SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (did,)
+    ).fetchall()}
+
+    for cyl in cylinders:
+        cid = cyl.get("id")
+        row = existing_cyls.get(cid)
+        if not row:
+            conn.close()
+            return jsonify(error=f"Cylinder {cid} does not belong to this delivery"), 400
+        try:
+            gw_out = float(cyl.get("gross_weight_out"))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="Gross weight out must be a number for every cylinder"), 400
+        if gw_out < 0:
+            conn.close()
+            return jsonify(error="Gross weight out can't be negative"), 400
+        nw_out = round(gw_out - row["tare_weight"], 2)
+        if nw_out < 0:
+            conn.close()
+            return jsonify(error=(
+                f"Cylinder '{row['cylinder_label'] or cid}': weight-out ({gw_out}kg) is less than its tare "
+                f"weight ({row['tare_weight']}kg) — check the reading."
+            )), 400
+        consumption = round(row["net_weight_in"] - nw_out, 2)
+        if consumption < 0:
+            conn.close()
+            return jsonify(error=(
+                f"Cylinder '{row['cylinder_label'] or cid}': residual weight ({nw_out}kg) exceeds what was "
+                f"delivered ({row['net_weight_in']}kg) — check the reading."
+            )), 400
+        conn.execute(
+            "UPDATE commercial_delivery_cylinders SET gross_weight_out=?, net_weight_out=?, consumption_weight=? WHERE id=?",
+            (gw_out, nw_out, consumption, cid),
+        )
+
+    if len(cylinders) != len(existing_cyls):
+        conn.close()
+        return jsonify(error="A weigh-out reading is required for every cylinder in this delivery"), 400
+
+    conn.execute("UPDATE commercial_deliveries SET status='PICKED_UP', pickup_date=datetime('now'), collected_by=? WHERE id=?",
+                 (session["user"]["id"], did))
+    audit(conn, "PICKUP", "COMMERCIAL_DELIVERIES", did, delivery["delivery_no"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/commercial-deliveries/<int:did>/bill")
+@roles_required("ADMIN", "MANAGER")
+def bill_commercial_delivery(did):
+    """The accountant's step: convert consumed weight into a credit sale +
+    receivable at a price per kg. Deliberately restricted to Admin/Manager
+    only (not extensible via the custom role/module permission system, same
+    as other financial-generating actions) since this creates real billing."""
+    d = request.get_json(force=True)
+    conn = get_db()
+    delivery = conn.execute("SELECT * FROM commercial_deliveries WHERE id=?", (did,)).fetchone()
+    if not delivery:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    if delivery["status"] != "PICKED_UP":
+        conn.close()
+        return jsonify(error=f"Delivery must be picked up (weighed out) before billing — currently {delivery['status']}"), 400
+
+    product = conn.execute("SELECT * FROM products WHERE id=?", (delivery["product_id"],)).fetchone()
+    price_per_kg = d.get("price_per_kg")
+    price_per_kg = float(price_per_kg) if price_per_kg is not None else float(product["price_per_kg"] or 0)
+    if price_per_kg <= 0:
+        conn.close()
+        return jsonify(error="A positive price per kg is required (set a default on the product, or enter one now)"), 400
+
+    cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (did,)).fetchall()
+    total_consumption = round(sum(c["consumption_weight"] or 0 for c in cyls), 2)
+    if total_consumption <= 0:
+        conn.close()
+        return jsonify(error="Total consumption is zero — nothing to bill"), 400
+    billed_amount = round(total_consumption * price_per_kg, 2)
+
+    customer = conn.execute("SELECT * FROM customers WHERE id=?", (delivery["customer_id"],)).fetchone()
+    u = session["user"]
+    try:
+        sale_no = next_number(conn, "SALE", "sales", "sale_no")
+        cur = conn.execute(
+            """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance, notes)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (sale_no, delivery["location_id"], u["id"], delivery["customer_id"], "CREDIT",
+             billed_amount, 0, billed_amount, 0, billed_amount,
+             f"Commercial 50kg billing for {delivery['delivery_no']}: {total_consumption}kg @ {money_fmt(price_per_kg)}/kg"),
+        )
+        sale_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode) VALUES (?,?,?,?,?,?,?)",
+            (sale_id, product["id"], f"{product['name']} (weight-billed)", total_consumption, price_per_kg, billed_amount, "REFILL"),
+        )
+        terms_days = customer["terms_days"] or 0
+        invoice_date = datetime.now().date()
+        due_date = invoice_date + timedelta(days=terms_days)
+        invoice_no = next_number(conn, "INV", "receivables", "invoice_no")
+        conn.execute(
+            """INSERT INTO receivables (sale_id, customer_id, invoice_no, invoice_date, due_date, amount, paid, balance, status)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (sale_id, delivery["customer_id"], invoice_no, str(invoice_date), str(due_date), billed_amount, 0, billed_amount, "CURRENT"),
+        )
+        conn.execute(
+            """UPDATE commercial_deliveries SET status='BILLED', price_per_kg=?, billed_amount=?, sale_id=?, billed_by=? WHERE id=?""",
+            (price_per_kg, billed_amount, sale_id, u["id"], did),
+        )
+        audit(conn, "BILL", "COMMERCIAL_DELIVERIES", did,
+              f"{delivery['delivery_no']} -> {sale_no}: {total_consumption}kg @ {price_per_kg}/kg = {billed_amount}")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return jsonify(error=f"Could not generate invoice: {e}"), 500
+    conn.close()
+    return jsonify(sale_id=sale_id, sale_no=sale_no, total_consumption=total_consumption,
+                    price_per_kg=price_per_kg, billed_amount=billed_amount), 201
+
+
+@app.post("/api/commercial-deliveries/<int:did>/cancel")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+def cancel_commercial_delivery(did):
+    conn = get_db()
+    delivery = conn.execute("SELECT * FROM commercial_deliveries WHERE id=?", (did,)).fetchone()
+    if not delivery:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    if delivery["status"] == "BILLED":
+        conn.close()
+        return jsonify(error="This delivery has already been billed and can't be cancelled"), 400
+    conn.execute("UPDATE commercial_deliveries SET status='CANCELLED' WHERE id=?", (did,))
+    audit(conn, "CANCEL", "COMMERCIAL_DELIVERIES", did, delivery["delivery_no"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+def money_fmt(n):
+    return f"\u20b1{n:,.2f}"
 
 
 # ---------------------------------------------------------------- employees (Admin + Manager)

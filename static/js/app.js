@@ -73,6 +73,7 @@ const NAV = [
   { id: "inventory_ledger", label: "Inv. Ledger", icon: "\u{1F4D2}", module: "inventory_ledger" },
   { id: "transfers", label: "Dispatch", icon: "\u{1F69A}", module: "transfers" },
   { id: "hauling", label: "Hauling Schedule", icon: "\u{1F69B}", module: "hauling" },
+  { id: "commercial_deliveries", label: "50kg Commercial Billing", icon: "\u2696\uFE0F", module: "commercial_deliveries" },
 
   { section: "Fleet & Staff" },
   { id: "vehicles", label: "Vehicles", icon: "\u{1F697}", module: "vehicles" },
@@ -161,6 +162,7 @@ function render() {
     hauling: renderHauling, vehicles: renderVehicles, employees: renderEmployees,
     staff_schedule: renderStaffSchedule, kpi: renderKpi,
     booked_orders: renderBookedOrders, incident_reports: renderIncidentReports, roles: renderRoles,
+    commercial_deliveries: renderCommercialDeliveries,
   };
   (views[state.view] || renderDashboard)(c);
 }
@@ -1095,6 +1097,7 @@ async function renderProducts(c) {
       <div class="field"><label>Selling Price (Refill)</label><input type="number" id="pPrice" value="${p.price ?? ""}"></div>
       <div class="field"><label>Cost Price</label><input type="number" id="pCost" value="${p.cost ?? 0}"></div>
       <div class="field"><label>Cylinder Deposit Fee (added on top for New/Deposit sales)</label><input type="number" id="pDeposit" value="${p.deposit_price ?? 0}"></div>
+      <div class="field"><label>Price per KG (for 50kg commercial weight-billing)</label><input type="number" step="0.01" id="pPricePerKg" value="${p.price_per_kg ?? 0}"></div>
       <div class="field"><label>Minimum Stock Level</label><input type="number" id="pMin" value="${p.min_stock ?? 10}"></div>
     `;
   }
@@ -1103,6 +1106,7 @@ async function renderProducts(c) {
       sku: document.getElementById("pSku").value, name: document.getElementById("pName").value,
       category: document.getElementById("pCat").value, price: document.getElementById("pPrice").value,
       cost: document.getElementById("pCost").value, deposit_price: document.getElementById("pDeposit").value,
+      price_per_kg: document.getElementById("pPricePerKg").value,
       min_stock: document.getElementById("pMin").value,
     };
   }
@@ -1847,5 +1851,193 @@ async function renderRoles(c) {
       });
     });
   };
+  load();
+}
+
+// ================================================================== COMMERCIAL 50kg BILLING
+async function renderCommercialDeliveries(c) {
+  const role = state.user.role;
+  const canCreate = ["ADMIN", "MANAGER", "DISPATCHER"].includes(role);
+  const canBill = role === "ADMIN" || role === "MANAGER";
+  c.innerHTML = `<div style="margin-bottom:12px">${canCreate ? `<button class="btn green" id="newDeliveryBtn">+ New Commercial Delivery</button>` : ""}</div>
+    <div id="cdTable">Loading...</div>`;
+  const statusColor = s => ({ DELIVERED: "warn", PICKED_UP: "blue", BILLED: "green", CANCELLED: "danger" }[s] || "gray");
+  async function load() {
+    const rows = await api("/commercial-deliveries");
+    document.getElementById("cdTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Delivery #</th><th>Date</th><th>Customer</th><th>Location</th><th>Product</th><th>Cylinders</th>
+      <th>Net Wt In</th><th>Consumed</th><th>Billed</th><th>Status</th><th></th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(d => `<tr>
+        <td>${d.delivery_no}</td><td>${d.delivery_date}</td>
+        <td>${esc(d.customer_name)} (${d.account_no})</td><td>${esc(d.location_name)}</td><td>${esc(d.product_name)}</td>
+        <td>${d.cylinders.length}</td><td>${d.total_net_weight_in} kg</td>
+        <td>${d.total_consumption_weight !== null ? d.total_consumption_weight + ' kg' : '—'}</td>
+        <td>${d.billed_amount ? money(d.billed_amount) : '—'}</td>
+        <td><span class="badge ${statusColor(d.status)}">${d.status}</span></td>
+        <td style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn small" onclick="viewCommercialDelivery(${d.id})">View</button>
+          ${d.status === 'DELIVERED' && canCreate ? `<button class="btn small" onclick="openRecordPickup(${d.id})">Record Pickup</button>` : ""}
+          ${d.status === 'PICKED_UP' && canBill ? `<button class="btn small green" onclick="openBillDelivery(${d.id}, ${d.total_consumption_weight})">Generate Invoice</button>` : ""}
+          ${d.status !== 'BILLED' && d.status !== 'CANCELLED' && canCreate ? `<button class="btn small danger" onclick="cancelCommercialDelivery(${d.id})">Cancel</button>` : ""}
+        </td>
+      </tr>`).join("") : `<tr><td colspan="11" style="color:var(--muted)">No commercial deliveries yet.</td></tr>`}
+    </tbody></table></div>`;
+  }
+
+  if (canCreate) {
+    document.getElementById("newDeliveryBtn").addEventListener("click", async () => {
+      const customers = await api("/customers?q=");
+      const custOpts = customers.map(cu => `<option value="${cu.id}">${esc(cu.name)} (${cu.account_no})</option>`).join("");
+      const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+      const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+      const isAdminOrMgr = role === "ADMIN" || role === "MANAGER";
+      openModal("New Commercial Delivery (Weigh-In)", `
+        <div class="field"><label>Customer</label><select id="cdCust">${custOpts}</select></div>
+        ${isAdminOrMgr ? `<div class="field"><label>Location</label><select id="cdLoc">${locOpts}</select></div>` : ""}
+        <div class="field"><label>Product</label><select id="cdProd">${prodOpts}</select></div>
+        <div class="field"><label>Cylinders</label>
+          <div id="cdCylRows"></div>
+          <button class="btn small" id="cdAddCylBtn" type="button">+ Add Cylinder</button>
+        </div>
+        <div class="field"><label>Notes</label><input id="cdNotes"></div>
+        <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+          <button class="btn green" id="cdSaveBtn">Save Delivery</button></div>
+      `, () => {
+        const cylRows = document.getElementById("cdCylRows");
+        function addCylRow() {
+          const row = document.createElement("div");
+          row.className = "pay-row";
+          row.innerHTML = `
+            <input type="text" class="cdLabel" placeholder="Cylinder ID (optional)" style="width:110px">
+            <input type="number" step="0.01" class="cdGW" placeholder="Gross Wt (kg)" style="width:100px">
+            <input type="number" step="0.01" class="cdTW" placeholder="Tare Wt (kg)" style="width:100px">
+            <span class="cdNW" style="width:75px;text-align:right;font-weight:600;color:var(--green-dark)">— kg</span>
+            <button class="btn small danger" type="button">&times;</button>`;
+          const recalc = () => {
+            const gw = parseFloat(row.querySelector(".cdGW").value) || 0;
+            const tw = parseFloat(row.querySelector(".cdTW").value) || 0;
+            const nw = gw - tw;
+            row.querySelector(".cdNW").textContent = (gw && tw) ? `${nw.toFixed(2)} kg` : "— kg";
+          };
+          row.querySelector(".cdGW").addEventListener("input", recalc);
+          row.querySelector(".cdTW").addEventListener("input", recalc);
+          row.querySelector("button").addEventListener("click", () => row.remove());
+          cylRows.appendChild(row);
+        }
+        document.getElementById("cdAddCylBtn").addEventListener("click", addCylRow);
+        addCylRow();
+
+        document.getElementById("cdSaveBtn").addEventListener("click", async () => {
+          const cylinders = [...cylRows.querySelectorAll(".pay-row")].map(r => ({
+            cylinder_label: r.querySelector(".cdLabel").value,
+            gross_weight_in: r.querySelector(".cdGW").value,
+            tare_weight: r.querySelector(".cdTW").value,
+          })).filter(cy => cy.gross_weight_in && cy.tare_weight);
+          if (!cylinders.length) { toast("Add at least one cylinder with weights", "error"); return; }
+          try {
+            await api("/commercial-deliveries", { method: "POST", body: {
+              customer_id: document.getElementById("cdCust").value,
+              location_id: isAdminOrMgr ? document.getElementById("cdLoc").value : undefined,
+              product_id: document.getElementById("cdProd").value,
+              cylinders, notes: document.getElementById("cdNotes").value,
+            }});
+            closeModal(); toast("Delivery recorded", "success"); load();
+          } catch (e) {}
+        });
+      });
+    });
+  }
+
+  window.viewCommercialDelivery = async (id) => {
+    const d = await api(`/commercial-deliveries/${id}`);
+    openModal(`${d.delivery_no}`, `
+      <div class="field"><b>Customer:</b> ${esc(d.customer_name)} (${d.account_no})</div>
+      <div class="field"><b>Location:</b> ${esc(d.location_name)} &nbsp; <b>Product:</b> ${esc(d.product_name)}</div>
+      <div class="field"><b>Status:</b> <span class="badge ${statusColor(d.status)}">${d.status}</span></div>
+      <div class="table-wrap"><table><thead><tr>
+        <th>Cylinder</th><th>GW In</th><th>Tare</th><th>NW In</th><th>GW Out</th><th>NW Out</th><th>Consumed</th>
+      </tr></thead><tbody>
+        ${d.cylinders.map(cy => `<tr><td>${esc(cy.cylinder_label || '—')}</td><td>${cy.gross_weight_in}</td>
+          <td>${cy.tare_weight}</td><td>${cy.net_weight_in}</td><td>${cy.gross_weight_out ?? '—'}</td>
+          <td>${cy.net_weight_out ?? '—'}</td><td>${cy.consumption_weight ?? '—'}</td></tr>`).join("")}
+      </tbody></table></div>
+      ${d.billed_amount ? `<div class="field" style="margin-top:10px"><b>Billed:</b> ${d.price_per_kg}/kg x ${d.cylinders.reduce((s,c)=>s+(c.consumption_weight||0),0).toFixed(2)}kg = ${money(d.billed_amount)}</div>` : ""}
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Close</button></div>
+    `);
+  };
+
+  window.openRecordPickup = async (id) => {
+    const d = await api(`/commercial-deliveries/${id}`);
+    openModal(`Record Pickup — ${d.delivery_no}`, `
+      <p style="font-size:13px;color:var(--muted)">Enter the gross weight-out reading for each cylinder. Net residual and consumption are calculated automatically.</p>
+      <div id="pickupRows">
+        ${d.cylinders.map(cy => `<div class="pay-row" data-cyl-id="${cy.id}">
+          <span style="width:90px">${esc(cy.cylinder_label || 'Cylinder ' + cy.id)}</span>
+          <span style="width:70px;font-size:12px;color:var(--muted)">NW in: ${cy.net_weight_in}kg</span>
+          <input type="number" step="0.01" class="pickupGW" placeholder="Gross Wt Out" style="width:110px">
+          <span class="pickupCalc" style="width:110px;text-align:right;font-size:12.5px;color:var(--green-dark)">—</span>
+        </div>`).join("")}
+      </div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="pickupSaveBtn">Save Pickup</button></div>
+    `, () => {
+      document.querySelectorAll("#pickupRows .pay-row").forEach(row => {
+        const cyl = d.cylinders.find(c => c.id === parseInt(row.dataset.cylId));
+        row.querySelector(".pickupGW").addEventListener("input", (e) => {
+          const gwOut = parseFloat(e.target.value) || 0;
+          const nwOut = gwOut - cyl.tare_weight;
+          const consumption = cyl.net_weight_in - nwOut;
+          row.querySelector(".pickupCalc").textContent = gwOut ? `NW ${nwOut.toFixed(2)} | used ${consumption.toFixed(2)}kg` : "—";
+        });
+      });
+      document.getElementById("pickupSaveBtn").addEventListener("click", async () => {
+        const cylinders = [...document.querySelectorAll("#pickupRows .pay-row")].map(row => ({
+          id: parseInt(row.dataset.cylId),
+          gross_weight_out: row.querySelector(".pickupGW").value,
+        })).filter(cy => cy.gross_weight_out);
+        if (cylinders.length !== d.cylinders.length) { toast("Enter a weight-out reading for every cylinder", "error"); return; }
+        try {
+          await api(`/commercial-deliveries/${id}/pickup`, { method: "PUT", body: { cylinders } });
+          closeModal(); toast("Pickup recorded", "success"); load();
+        } catch (e) {}
+      });
+    });
+  };
+
+  window.openBillDelivery = async (id, totalConsumption) => {
+    const products = state.products;
+    const d = await api(`/commercial-deliveries/${id}`);
+    const prod = products.find(p => p.id === d.product_id);
+    const defaultRate = prod ? prod.price_per_kg : 0;
+    openModal("Generate Invoice", `
+      <div class="field"><b>Total Consumption:</b> ${totalConsumption} kg</div>
+      <div class="field"><label>Price per KG</label><input type="number" step="0.01" id="billRate" value="${defaultRate}"></div>
+      <div class="field"><b>Estimated Total:</b> <span id="billTotal">${money(totalConsumption * defaultRate)}</span></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="billSaveBtn">Generate Invoice</button></div>
+    `, () => {
+      document.getElementById("billRate").addEventListener("input", (e) => {
+        document.getElementById("billTotal").textContent = money(totalConsumption * (parseFloat(e.target.value) || 0));
+      });
+      document.getElementById("billSaveBtn").addEventListener("click", async () => {
+        const rate = parseFloat(document.getElementById("billRate").value);
+        if (!rate || rate <= 0) { toast("Enter a valid price per kg", "error"); return; }
+        try {
+          const result = await api(`/commercial-deliveries/${id}/bill`, { method: "POST", body: { price_per_kg: rate } });
+          closeModal();
+          toast(`Invoice ${result.sale_no} created for ${money(result.billed_amount)}`, "success");
+          load();
+        } catch (e) {}
+      });
+    });
+  };
+
+  window.cancelCommercialDelivery = async (id) => {
+    if (!confirm("Cancel this commercial delivery?")) return;
+    try { await api(`/commercial-deliveries/${id}/cancel`, { method: "POST" }); toast("Delivery cancelled", "success"); load(); }
+    catch (e) {}
+  };
+
   load();
 }

@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS products (
     price REAL NOT NULL,
     cost REAL NOT NULL DEFAULT 0,
     deposit_price REAL NOT NULL DEFAULT 0,
+    price_per_kg REAL NOT NULL DEFAULT 0,
     min_stock INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1
 );
@@ -231,6 +232,41 @@ CREATE TABLE IF NOT EXISTS staff_schedule (
     created_by INTEGER REFERENCES users(id)
 );
 
+CREATE TABLE IF NOT EXISTS commercial_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_no TEXT UNIQUE NOT NULL,
+    delivery_date TEXT DEFAULT (datetime('now')),
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    location_id INTEGER NOT NULL REFERENCES locations(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    status TEXT NOT NULL DEFAULT 'DELIVERED' CHECK(status IN ('DELIVERED','PICKED_UP','BILLED','CANCELLED')),
+    pickup_date TEXT,
+    price_per_kg REAL,
+    billed_amount REAL,
+    sale_id INTEGER REFERENCES sales(id),
+    notes TEXT,
+    created_by INTEGER REFERENCES users(id),
+    collected_by INTEGER REFERENCES users(id),
+    billed_by INTEGER REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS commercial_delivery_cylinders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id INTEGER NOT NULL REFERENCES commercial_deliveries(id),
+    cylinder_label TEXT,
+    gross_weight_in REAL NOT NULL,
+    tare_weight REAL NOT NULL,
+    net_weight_in REAL NOT NULL,
+    gross_weight_out REAL,
+    net_weight_out REAL,
+    consumption_weight REAL
+);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    migration_key TEXT PRIMARY KEY,
+    applied_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS roles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE NOT NULL,
@@ -307,7 +343,7 @@ MODULE_KEYS = [
     "dashboard", "pos", "sales", "customers", "receivables", "inventory",
     "inventory_ledger", "cylinder_deposits", "transfers", "hauling", "vehicles",
     "employees", "staff_schedule", "kpi", "reports", "audit",
-    "booked_orders", "incident_reports",
+    "booked_orders", "incident_reports", "commercial_deliveries",
 ]
 
 DEFAULT_ROLE_PERMISSIONS = {
@@ -316,7 +352,7 @@ DEFAULT_ROLE_PERMISSIONS = {
         "dashboard", "sales", "customers", "receivables", "inventory",
         "inventory_ledger", "cylinder_deposits", "hauling", "vehicles",
         "employees", "staff_schedule", "kpi", "reports", "audit",
-        "booked_orders", "incident_reports",
+        "booked_orders", "incident_reports", "commercial_deliveries",
     ],
     "ATTENDANT": [
         "dashboard", "pos", "sales", "customers", "receivables", "inventory",
@@ -324,6 +360,7 @@ DEFAULT_ROLE_PERMISSIONS = {
     ],
     "DISPATCHER": [
         "dashboard", "inventory", "transfers", "staff_schedule", "incident_reports",
+        "commercial_deliveries",
     ],
     "ORDER_TAKER": [
         "dashboard", "booked_orders", "customers", "incident_reports",
@@ -340,6 +377,8 @@ def migrate_schema():
     # 1. New nullable columns — plain ALTER TABLE, always safe.
     if not _column_exists(conn, "products", "deposit_price"):
         conn.execute("ALTER TABLE products ADD COLUMN deposit_price REAL NOT NULL DEFAULT 0")
+    if not _column_exists(conn, "products", "price_per_kg"):
+        conn.execute("ALTER TABLE products ADD COLUMN price_per_kg REAL NOT NULL DEFAULT 0")
     if not _column_exists(conn, "sale_items", "sale_mode"):
         conn.execute("ALTER TABLE sale_items ADD COLUMN sale_mode TEXT NOT NULL DEFAULT 'REFILL'")
     conn.commit()
@@ -442,6 +481,20 @@ def migrate_schema():
     # 7. Delivery address on booked orders — simple additive column.
     if not _column_exists(conn, "booked_orders", "delivery_address"):
         conn.execute("ALTER TABLE booked_orders ADD COLUMN delivery_address TEXT")
+        conn.commit()
+
+    # 8. Grant the new commercial_deliveries module to Manager/Dispatcher by
+    #    default, for databases that were already seeded before this module
+    #    existed. Runs exactly once (tracked in schema_migrations) so it
+    #    never fights a user who later removes this permission on purpose.
+    #    Custom (non-built-in) roles are never touched.
+    MIGRATION_KEY = "grant_commercial_deliveries_default"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        for role_name in ("MANAGER", "DISPATCHER"):
+            if conn.execute("SELECT 1 FROM roles WHERE name=?", (role_name,)).fetchone():
+                conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES (?, 'commercial_deliveries')",
+                             (role_name,))
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 
     conn.close()

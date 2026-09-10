@@ -32,6 +32,28 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **50kg Commercial Weight-Billing** — a dedicated module for commercial LPG
+  accounts billed by actual consumption rather than a fixed price:
+  1. Dispatcher weighs cylinders in at delivery (Gross Weight, Tare Weight —
+     Net Weight is calculated automatically), for one or many cylinders in a
+     single delivery, with a running total
+  2. Later, at pickup/exchange, weigh-out readings are recorded per cylinder;
+     the system computes the residual and the actual amount consumed
+     (delivered − residual) automatically
+  3. Admin/Manager ("the accountant") generates an invoice from the total
+     consumed weight × a price-per-kg rate — this creates a normal credit
+     sale and receivable, so it shows up in Receivables, the Aging Report,
+     and Statements of Account exactly like any other sale
+  New "Price per KG" field on Products sets the default rate; it can be
+  overridden per invoice. Validates that gross weight always exceeds tare,
+  and that residual weight can never exceed what was delivered.
+
+- **Accounts Receivable Aging Report** — standard aging buckets (Current,
+  1-30, 31-60, 61-90, 91-120, 120+ days past due), grouped by customer with
+  totals, accessible via an "Aging Report" button right on the Receivables
+  page. Exportable as Excel or landscape PDF (Admin/Manager). Attendants see
+  it too, correctly scoped to just their own location.
+
 - **Public customer order form** — a standalone page at `/order` (no login
   needed) where customers can place an order themselves: pick products, an
   optional preferred warehouse/showroom, leave their name and phone number.
