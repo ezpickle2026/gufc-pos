@@ -32,6 +32,16 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Incident Report attachments** — attach photos, PDFs, Excel/CSV, or Word
+  docs (up to 10 files per report, 10MB each) when filing a report or any
+  time after. Images and PDFs preview inline in the browser; other types
+  download. Only the person who filed the report (or Admin/Manager) can add
+  attachments; deleting one is Admin/Manager only. Files are stored in the
+  database itself, so they survive redeploys automatically without needing a
+  separate storage volume.
+- **Printable Incident Reports** — a "Print" button on any report generates
+  a clean, branded printout with the full report and resolution details.
+
 - **50kg Commercial Weight-Billing** — a dedicated module for commercial LPG
   accounts billed by actual consumption rather than a fixed price:
   1. Dispatcher weighs cylinders in at delivery (Gross Weight, Tare Weight —

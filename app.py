@@ -910,12 +910,38 @@ def submit_public_order():
 # Any logged-in role can file one for their own location; Admin/Manager see
 # and resolve everything, everyone else only sees their own location's reports.
 
+ALLOWED_ATTACHMENT_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "pdf", "xls", "xlsx", "csv", "doc", "docx"}
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB per file
+MAX_ATTACHMENTS_PER_INCIDENT = 10
+
+PREVIEWABLE_MIMETYPES = {
+    "image/png", "image/jpeg", "image/gif", "application/pdf",
+}
+
+EXTENSION_MIMETYPES = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+    "pdf": "application/pdf",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "csv": "text/csv",
+    "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+
+def _can_view_incident(u, report_row):
+    if u["role"] in ("ADMIN", "MANAGER"):
+        return True
+    return report_row["location_id"] == u["location_id"] or report_row["reported_by"] == u["id"]
+
+
 @app.get("/api/incident-reports")
 @login_required
 def list_incident_reports():
     u = session["user"]
     conn = get_db()
-    sql = """SELECT ir.*, l.name location_name, reporter.name reporter_name, resolver.name resolver_name
+    sql = """SELECT ir.*, l.name location_name, reporter.name reporter_name, resolver.name resolver_name,
+                     (SELECT COUNT(*) FROM incident_report_attachments a WHERE a.incident_id=ir.id) attachment_count
               FROM incident_reports ir LEFT JOIN locations l ON l.id=ir.location_id
               LEFT JOIN users reporter ON reporter.id=ir.reported_by
               LEFT JOIN users resolver ON resolver.id=ir.resolved_by WHERE 1=1"""
@@ -951,6 +977,25 @@ def create_incident_report():
     return jsonify(id=cur.lastrowid, report_no=report_no), 201
 
 
+@app.get("/api/incident-reports/<int:iid>")
+@login_required
+def get_incident_report(iid):
+    u = session["user"]
+    conn = get_db()
+    row = conn.execute(
+        """SELECT ir.*, l.name location_name, reporter.name reporter_name, resolver.name resolver_name
+           FROM incident_reports ir LEFT JOIN locations l ON l.id=ir.location_id
+           LEFT JOIN users reporter ON reporter.id=ir.reported_by
+           LEFT JOIN users resolver ON resolver.id=ir.resolved_by WHERE ir.id=?""",
+        (iid,),
+    ).fetchone()
+    if not row or not _can_view_incident(u, row):
+        conn.close()
+        return jsonify(error="Not found"), 404
+    conn.close()
+    return jsonify(dict(row))
+
+
 @app.put("/api/incident-reports/<int:iid>/resolve")
 @roles_required("ADMIN", "MANAGER")
 def resolve_incident_report(iid):
@@ -965,6 +1010,117 @@ def resolve_incident_report(iid):
         (d.get("resolution_notes", ""), session["user"]["id"], iid),
     )
     audit(conn, "RESOLVE", "INCIDENT_REPORTS", iid, report["report_no"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/incident-reports/<int:iid>/attachments")
+@login_required
+def list_incident_attachments(iid):
+    u = session["user"]
+    conn = get_db()
+    report = conn.execute("SELECT * FROM incident_reports WHERE id=?", (iid,)).fetchone()
+    if not report or not _can_view_incident(u, report):
+        conn.close()
+        return jsonify(error="Not found"), 404
+    rows = conn.execute(
+        """SELECT a.id, a.filename, a.mimetype, a.size_bytes, a.uploaded_at, up.name uploaded_by_name
+           FROM incident_report_attachments a LEFT JOIN users up ON up.id=a.uploaded_by
+           WHERE a.incident_id=? ORDER BY a.uploaded_at""",
+        (iid,),
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/incident-reports/<int:iid>/attachments")
+@login_required
+def upload_incident_attachments(iid):
+    u = session["user"]
+    conn = get_db()
+    report = conn.execute("SELECT * FROM incident_reports WHERE id=?", (iid,)).fetchone()
+    if not report:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    # Only the person who filed it, or Admin/Manager, can attach evidence to it.
+    if u["role"] not in ("ADMIN", "MANAGER") and report["reported_by"] != u["id"]:
+        conn.close()
+        return jsonify(error="Forbidden: only the reporter or Admin/Manager can add attachments"), 403
+
+    files = request.files.getlist("files")
+    if not files:
+        conn.close()
+        return jsonify(error="No files uploaded"), 400
+
+    existing_count = conn.execute(
+        "SELECT COUNT(*) c FROM incident_report_attachments WHERE incident_id=?", (iid,)
+    ).fetchone()["c"]
+    if existing_count + len(files) > MAX_ATTACHMENTS_PER_INCIDENT:
+        conn.close()
+        return jsonify(error=f"Too many attachments — max {MAX_ATTACHMENTS_PER_INCIDENT} per report"), 400
+
+    saved, errors = [], []
+    for f in files:
+        filename = f.filename or "file"
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if ext not in ALLOWED_ATTACHMENT_EXTENSIONS:
+            errors.append(f"{filename}: file type not allowed (allowed: {', '.join(sorted(ALLOWED_ATTACHMENT_EXTENSIONS))})")
+            continue
+        data = f.read()
+        if len(data) > MAX_ATTACHMENT_SIZE:
+            errors.append(f"{filename}: exceeds 10 MB limit")
+            continue
+        if len(data) == 0:
+            errors.append(f"{filename}: empty file")
+            continue
+        mimetype = EXTENSION_MIMETYPES.get(ext, f.content_type or "application/octet-stream")
+        cur = conn.execute(
+            """INSERT INTO incident_report_attachments (incident_id, filename, mimetype, size_bytes, file_data, uploaded_by)
+               VALUES (?,?,?,?,?,?)""",
+            (iid, filename[:255], mimetype, len(data), data, u["id"]),
+        )
+        saved.append({"id": cur.lastrowid, "filename": filename})
+
+    if saved:
+        audit(conn, "ATTACH", "INCIDENT_REPORTS", iid, f"{len(saved)} file(s) attached: {', '.join(s['filename'] for s in saved)}")
+        conn.commit()
+    conn.close()
+    return jsonify(saved=saved, errors=errors), (201 if saved else 400)
+
+
+@app.get("/api/incident-attachments/<int:aid>")
+@login_required
+def download_incident_attachment(aid):
+    u = session["user"]
+    conn = get_db()
+    row = conn.execute(
+        """SELECT a.*, ir.location_id, ir.reported_by FROM incident_report_attachments a
+           JOIN incident_reports ir ON ir.id=a.incident_id WHERE a.id=?""",
+        (aid,),
+    ).fetchone()
+    if not row or not _can_view_incident(u, row):
+        conn.close()
+        return jsonify(error="Not found"), 404
+    data, filename, mimetype = row["file_data"], row["filename"], row["mimetype"]
+    conn.close()
+    disposition = "inline" if mimetype in PREVIEWABLE_MIMETYPES else "attachment"
+    return Response(
+        data, mimetype=mimetype,
+        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+    )
+
+
+@app.delete("/api/incident-attachments/<int:aid>")
+@roles_required("ADMIN", "MANAGER")
+def delete_incident_attachment(aid):
+    conn = get_db()
+    row = conn.execute("SELECT incident_id, filename FROM incident_report_attachments WHERE id=?", (aid,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    conn.execute("DELETE FROM incident_report_attachments WHERE id=?", (aid,))
+    audit(conn, "DELETE_ATTACHMENT", "INCIDENT_REPORTS", row["incident_id"], row["filename"])
     conn.commit()
     conn.close()
     return jsonify(ok=True)

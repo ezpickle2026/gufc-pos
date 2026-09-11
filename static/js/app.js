@@ -1733,14 +1733,19 @@ async function renderIncidentReports(c) {
   async function load() {
     const rows = await api("/incident-reports");
     document.getElementById("incTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>Report #</th><th>Date</th><th>Location</th><th>Reported By</th><th>Category</th><th>Severity</th><th>Description</th><th>Status</th><th></th>
+      <th>Report #</th><th>Date</th><th>Location</th><th>Reported By</th><th>Category</th><th>Severity</th><th>Description</th><th>Files</th><th>Status</th><th></th>
     </tr></thead><tbody>
       ${rows.length ? rows.map(r => `<tr><td>${r.report_no}</td><td>${r.ts}</td><td>${esc(r.location_name || "")}</td>
         <td>${esc(r.reporter_name || "")}</td><td>${esc(r.category || "")}</td>
         <td><span class="badge ${sevColor(r.severity)}">${r.severity}</span></td><td>${esc(r.description)}</td>
+        <td>${r.attachment_count > 0 ? `<span class="badge blue">${r.attachment_count} \u{1F4CE}</span>` : "—"}</td>
         <td><span class="badge ${r.status === 'OPEN' ? 'warn' : 'green'}">${r.status}</span></td>
-        <td>${canResolve && r.status === 'OPEN' ? `<button class="btn small green" onclick="resolveIncident(${r.id})">Resolve</button>` : ""}</td>
-      </tr>`).join("") : `<tr><td colspan="9" style="color:var(--muted)">No incidents reported.</td></tr>`}
+        <td style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn small" onclick="openIncidentDetail(${r.id})">View</button>
+          <button class="btn small" onclick="printIncidentReport(${r.id})">Print</button>
+          ${canResolve && r.status === 'OPEN' ? `<button class="btn small green" onclick="resolveIncident(${r.id})">Resolve</button>` : ""}
+        </td>
+      </tr>`).join("") : `<tr><td colspan="10" style="color:var(--muted)">No incidents reported.</td></tr>`}
     </tbody></table></div>`;
   }
   document.getElementById("newIncBtn").addEventListener("click", () => {
@@ -1755,6 +1760,7 @@ async function renderIncidentReports(c) {
         <option value="LOW">Low</option><option value="MEDIUM">Medium</option><option value="HIGH">High</option><option value="CRITICAL">Critical</option>
       </select></div>
       <div class="field"><label>Description</label><textarea id="iDesc" rows="4" style="width:100%"></textarea></div>
+      <div class="field"><label>Attach Files (optional — photos, PDF, Excel, etc.)</label><input type="file" id="iFiles" multiple accept=".png,.jpg,.jpeg,.gif,.pdf,.xls,.xlsx,.csv,.doc,.docx"></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
         <button class="btn green" id="iSaveBtn">Submit Report</button></div>
     `, () => {
@@ -1764,7 +1770,15 @@ async function renderIncidentReports(c) {
         try {
           const body = { category: document.getElementById("iCat").value, severity: document.getElementById("iSev").value, description };
           if (isAdminOrMgr) body.location_id = document.getElementById("iLoc").value;
-          await api("/incident-reports", { method: "POST", body });
+          const result = await api("/incident-reports", { method: "POST", body });
+          const files = document.getElementById("iFiles").files;
+          if (files.length) {
+            const fd = new FormData();
+            for (const f of files) fd.append("files", f);
+            const res = await fetch(`/api/incident-reports/${result.id}/attachments`, { method: "POST", body: fd, credentials: "include" });
+            const uploadResult = await res.json();
+            if (uploadResult.errors && uploadResult.errors.length) toast(uploadResult.errors.join("; "), "error");
+          }
           closeModal(); toast("Incident reported", "success"); load();
         } catch (e) {}
       });
@@ -1784,6 +1798,107 @@ async function renderIncidentReports(c) {
       });
     });
   };
+
+  function fileSize(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  }
+  const PREVIEWABLE_EXT = ["png", "jpg", "jpeg", "gif", "pdf"];
+
+  window.openIncidentDetail = async (id) => {
+    const report = await api(`/incident-reports/${id}`);
+    const canManage = report.reported_by === state.user.id || canResolve;
+    async function renderAttachments() {
+      const attachments = await api(`/incident-reports/${id}/attachments`);
+      const box = document.getElementById("attachList");
+      if (!box) return;
+      box.innerHTML = attachments.length ? attachments.map(a => {
+        const ext = a.filename.split(".").pop().toLowerCase();
+        const canPreview = PREVIEWABLE_EXT.includes(ext);
+        return `<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--border)">
+          <div style="font-size:13px">
+            ${esc(a.filename)} <span style="color:var(--muted);font-size:11.5px">(${fileSize(a.size_bytes)}, by ${esc(a.uploaded_by_name || "?")})</span>
+          </div>
+          <div style="display:flex;gap:6px">
+            <a class="btn small" href="/api/incident-attachments/${a.id}" target="_blank">${canPreview ? "Preview" : "Download"}</a>
+            ${canResolve ? `<button class="btn small danger" onclick="deleteIncidentAttachment(${id}, ${a.id})">Delete</button>` : ""}
+          </div>
+        </div>`;
+      }).join("") : `<p style="color:var(--muted);font-size:13px">No attachments yet.</p>`;
+    }
+    openModal(`${report.report_no}`, `
+      <div class="field"><b>Location:</b> ${esc(report.location_name || "")} &nbsp; <b>Reported by:</b> ${esc(report.reporter_name || "")}</div>
+      <div class="field"><b>Date:</b> ${report.ts} &nbsp; <b>Category:</b> ${esc(report.category || "")} &nbsp;
+        <span class="badge ${sevColor(report.severity)}">${report.severity}</span></div>
+      <div class="field"><b>Description:</b><br>${esc(report.description)}</div>
+      <div class="field"><span class="badge ${report.status === 'OPEN' ? 'warn' : 'green'}">${report.status}</span></div>
+      ${report.status === 'RESOLVED' ? `<div class="field"><b>Resolution:</b><br>${esc(report.resolution_notes || "")}
+        <br><span style="color:var(--muted);font-size:12px">By ${esc(report.resolver_name || "")} on ${report.resolved_at}</span></div>` : ""}
+      <h3 style="margin:16px 0 8px;font-size:14px">Attachments</h3>
+      <div id="attachList">Loading...</div>
+      ${canManage ? `<div class="field" style="margin-top:10px">
+        <input type="file" id="addFiles" multiple accept=".png,.jpg,.jpeg,.gif,.pdf,.xls,.xlsx,.csv,.doc,.docx">
+        <button class="btn small" id="addFilesBtn" style="margin-top:6px">Upload</button>
+      </div>` : ""}
+      <div class="modal-actions">
+        <button class="btn" onclick="closeModal()">Close</button>
+        <button class="btn" onclick="printIncidentReport(${id})">Print</button>
+      </div>
+    `, () => {
+      renderAttachments();
+      if (canManage) {
+        document.getElementById("addFilesBtn").addEventListener("click", async () => {
+          const files = document.getElementById("addFiles").files;
+          if (!files.length) { toast("Choose file(s) first", "error"); return; }
+          const fd = new FormData();
+          for (const f of files) fd.append("files", f);
+          const res = await fetch(`/api/incident-reports/${id}/attachments`, { method: "POST", body: fd, credentials: "include" });
+          const result = await res.json();
+          if (result.errors && result.errors.length) toast(result.errors.join("; "), "error");
+          if (result.saved && result.saved.length) toast(`${result.saved.length} file(s) uploaded`, "success");
+          renderAttachments();
+        });
+      }
+    });
+  };
+
+  window.deleteIncidentAttachment = async (incidentId, attachmentId) => {
+    if (!confirm("Delete this attachment?")) return;
+    try {
+      await api(`/incident-attachments/${attachmentId}`, { method: "DELETE" });
+      toast("Attachment deleted", "success");
+      openIncidentDetail(incidentId);
+    } catch (e) {}
+  };
+
+  window.printIncidentReport = async (id) => {
+    const report = await api(`/incident-reports/${id}`);
+    const html = `
+      <div style="max-width:640px;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:13px">
+        <div style="text-align:center;margin-bottom:14px">
+          <img src="/images/logo.png" alt="GUFC" style="width:56px;height:56px;object-fit:contain">
+          <div style="font-weight:800;font-size:16px;margin-top:4px">GREAT UNLI FOOD CORP.</div>
+          <div style="color:#6b7785">Incident Report</div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;margin-bottom:14px">
+          <tr><td style="padding:4px 0;width:140px"><b>Report #</b></td><td>${report.report_no}</td></tr>
+          <tr><td style="padding:4px 0"><b>Date</b></td><td>${report.ts}</td></tr>
+          <tr><td style="padding:4px 0"><b>Location</b></td><td>${esc(report.location_name || "")}</td></tr>
+          <tr><td style="padding:4px 0"><b>Reported By</b></td><td>${esc(report.reporter_name || "")}</td></tr>
+          <tr><td style="padding:4px 0"><b>Category</b></td><td>${esc(report.category || "")}</td></tr>
+          <tr><td style="padding:4px 0"><b>Severity</b></td><td>${report.severity}</td></tr>
+          <tr><td style="padding:4px 0"><b>Status</b></td><td>${report.status}</td></tr>
+        </table>
+        <div style="margin-bottom:14px"><b>Description</b><br>${esc(report.description).replace(/\n/g, "<br>")}</div>
+        ${report.status === 'RESOLVED' ? `<div style="margin-bottom:14px"><b>Resolution</b><br>${esc(report.resolution_notes || "").replace(/\n/g, "<br>")}
+          <br><span style="color:#6b7785;font-size:12px">Resolved by ${esc(report.resolver_name || "")} on ${report.resolved_at}</span></div>` : ""}
+        <div style="margin-top:24px;color:#6b7785;font-size:11px;text-align:center">Printed ${new Date().toLocaleString()}</div>
+      </div>`;
+    document.getElementById("receiptArea").innerHTML = html;
+    setTimeout(() => window.print(), 200);
+  };
+
   load();
 }
 

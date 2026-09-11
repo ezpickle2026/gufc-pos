@@ -317,6 +317,17 @@ CREATE TABLE IF NOT EXISTS incident_reports (
     resolved_by INTEGER REFERENCES users(id),
     resolved_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS incident_report_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES incident_reports(id),
+    filename TEXT NOT NULL,
+    mimetype TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    file_data BLOB NOT NULL,
+    uploaded_by INTEGER REFERENCES users(id),
+    uploaded_at TEXT DEFAULT (datetime('now'))
+);
 """
 
 
