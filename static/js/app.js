@@ -1974,29 +1974,34 @@ async function renderCommercialDeliveries(c) {
   const role = state.user.role;
   const canCreate = ["ADMIN", "MANAGER", "DISPATCHER"].includes(role);
   const canBill = role === "ADMIN" || role === "MANAGER";
-  c.innerHTML = `<div style="margin-bottom:12px">${canCreate ? `<button class="btn green" id="newDeliveryBtn">+ New Commercial Delivery</button>` : ""}</div>
+  c.innerHTML = `<div style="margin-bottom:12px">${canCreate ? `<button class="btn green" id="newDeliveryBtn">+ New Commercial Billing</button>` : ""}</div>
     <div id="cdTable">Loading...</div>`;
   const statusColor = s => ({ DELIVERED: "warn", PICKED_UP: "blue", BILLED: "green", CANCELLED: "danger" }[s] || "gray");
   async function load() {
     const rows = await api("/commercial-deliveries");
     document.getElementById("cdTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>Delivery #</th><th>Date</th><th>Customer</th><th>Location</th><th>Product</th><th>Cylinders</th>
-      <th>Net Wt In</th><th>Consumed</th><th>Billed</th><th>Status</th><th></th>
+      <th>Delivery #</th><th>Date</th><th>Customer</th><th>Location</th><th>Type</th><th>Product</th>
+      <th>Detail</th><th>Consumed</th><th>Billed</th><th>Status</th><th></th>
     </tr></thead><tbody>
       ${rows.length ? rows.map(d => `<tr>
         <td>${d.delivery_no}</td><td>${d.delivery_date}</td>
-        <td>${esc(d.customer_name)} (${d.account_no})</td><td>${esc(d.location_name)}</td><td>${esc(d.product_name)}</td>
-        <td>${d.cylinders.length}</td><td>${d.total_net_weight_in} kg</td>
-        <td>${d.total_consumption_weight !== null ? d.total_consumption_weight + ' kg' : '—'}</td>
+        <td>${esc(d.customer_name)} (${d.account_no})</td><td>${esc(d.location_name)}</td>
+        <td><span class="badge ${d.billing_type === 'WIWO' ? 'blue' : 'warn'}">${d.billing_type}</span></td>
+        <td>${esc(d.product_name)}</td>
+        <td>${d.billing_type === 'WIWO' ? `${d.cylinders.length} cylinder(s), ${d.total_net_weight_in}kg in`
+              : `${esc(d.meter_label || 'meter')}: ${d.previous_reading} \u2192 ${d.current_reading}`}</td>
+        <td>${d.total_consumption_weight !== null ? d.total_consumption_weight + (d.billing_type === 'WIWO' ? ' kg' : '') : '—'}</td>
         <td>${d.billed_amount ? money(d.billed_amount) : '—'}</td>
         <td><span class="badge ${statusColor(d.status)}">${d.status}</span></td>
         <td style="display:flex;gap:6px;flex-wrap:wrap">
           <button class="btn small" onclick="viewCommercialDelivery(${d.id})">View</button>
-          ${d.status === 'DELIVERED' && canCreate ? `<button class="btn small" onclick="openRecordPickup(${d.id})">Record Pickup</button>` : ""}
+          <button class="btn small" onclick="printCommercialDelivery(${d.id})">Print</button>
+          <a class="btn small" href="/api/commercial-deliveries/${d.id}/export/pdf">PDF</a>
+          ${d.status === 'DELIVERED' && d.billing_type === 'WIWO' && canCreate ? `<button class="btn small" onclick="openRecordPickup(${d.id})">Record Pickup</button>` : ""}
           ${d.status === 'PICKED_UP' && canBill ? `<button class="btn small green" onclick="openBillDelivery(${d.id}, ${d.total_consumption_weight})">Generate Invoice</button>` : ""}
           ${d.status !== 'BILLED' && d.status !== 'CANCELLED' && canCreate ? `<button class="btn small danger" onclick="cancelCommercialDelivery(${d.id})">Cancel</button>` : ""}
         </td>
-      </tr>`).join("") : `<tr><td colspan="11" style="color:var(--muted)">No commercial deliveries yet.</td></tr>`}
+      </tr>`).join("") : `<tr><td colspan="11" style="color:var(--muted)">No commercial billing records yet.</td></tr>`}
     </tbody></table></div>`;
   }
 
@@ -2007,17 +2012,31 @@ async function renderCommercialDeliveries(c) {
       const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
       const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
       const isAdminOrMgr = role === "ADMIN" || role === "MANAGER";
-      openModal("New Commercial Delivery (Weigh-In)", `
+      openModal("New Commercial Billing", `
+        <div class="field"><label>Billing Type</label><select id="cdType">
+          <option value="WIWO">WIWO — Weight In / Weight Out (cylinders)</option>
+          <option value="READING">READING — Meter Reading</option>
+        </select></div>
         <div class="field"><label>Customer</label><select id="cdCust">${custOpts}</select></div>
         ${isAdminOrMgr ? `<div class="field"><label>Location</label><select id="cdLoc">${locOpts}</select></div>` : ""}
         <div class="field"><label>Product</label><select id="cdProd">${prodOpts}</select></div>
-        <div class="field"><label>Cylinders</label>
-          <div id="cdCylRows"></div>
-          <button class="btn small" id="cdAddCylBtn" type="button">+ Add Cylinder</button>
+
+        <div id="wiwoFields">
+          <div class="field"><label>Cylinders</label>
+            <div id="cdCylRows"></div>
+            <button class="btn small" id="cdAddCylBtn" type="button">+ Add Cylinder</button>
+          </div>
         </div>
+        <div id="readingFields" class="hidden">
+          <div class="field"><label>Meter / Tank Label</label><input id="cdMeterLabel" placeholder="e.g. Bulk Tank A"></div>
+          <div class="field"><label>Previous Reading</label><input type="number" step="0.01" id="cdPrevReading" placeholder="Auto-filled from last bill if available"></div>
+          <div class="field"><label>Current Reading</label><input type="number" step="0.01" id="cdCurrReading"></div>
+          <div class="field"><b>Consumption:</b> <span id="cdConsumptionPreview">—</span></div>
+        </div>
+
         <div class="field"><label>Notes</label><input id="cdNotes"></div>
         <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
-          <button class="btn green" id="cdSaveBtn">Save Delivery</button></div>
+          <button class="btn green" id="cdSaveBtn">Save</button></div>
       `, () => {
         const cylRows = document.getElementById("cdCylRows");
         function addCylRow() {
@@ -2043,21 +2062,65 @@ async function renderCommercialDeliveries(c) {
         document.getElementById("cdAddCylBtn").addEventListener("click", addCylRow);
         addCylRow();
 
-        document.getElementById("cdSaveBtn").addEventListener("click", async () => {
-          const cylinders = [...cylRows.querySelectorAll(".pay-row")].map(r => ({
-            cylinder_label: r.querySelector(".cdLabel").value,
-            gross_weight_in: r.querySelector(".cdGW").value,
-            tare_weight: r.querySelector(".cdTW").value,
-          })).filter(cy => cy.gross_weight_in && cy.tare_weight);
-          if (!cylinders.length) { toast("Add at least one cylinder with weights", "error"); return; }
+        function updateConsumptionPreview() {
+          const prev = parseFloat(document.getElementById("cdPrevReading").value);
+          const curr = parseFloat(document.getElementById("cdCurrReading").value);
+          document.getElementById("cdConsumptionPreview").textContent =
+            (!isNaN(prev) && !isNaN(curr)) ? (curr - prev).toFixed(2) : "—";
+        }
+        document.getElementById("cdPrevReading").addEventListener("input", updateConsumptionPreview);
+        document.getElementById("cdCurrReading").addEventListener("input", updateConsumptionPreview);
+
+        async function suggestPreviousReading() {
+          const custId = document.getElementById("cdCust").value;
+          if (!custId) return;
           try {
-            await api("/commercial-deliveries", { method: "POST", body: {
-              customer_id: document.getElementById("cdCust").value,
-              location_id: isAdminOrMgr ? document.getElementById("cdLoc").value : undefined,
-              product_id: document.getElementById("cdProd").value,
-              cylinders, notes: document.getElementById("cdNotes").value,
-            }});
-            closeModal(); toast("Delivery recorded", "success"); load();
+            const r = await api(`/commercial-deliveries/last-reading?customer_id=${custId}`);
+            if (r.previous_reading !== null) {
+              document.getElementById("cdPrevReading").value = r.previous_reading;
+              updateConsumptionPreview();
+            }
+          } catch (e) {}
+        }
+
+        document.getElementById("cdType").addEventListener("change", (e) => {
+          const isReading = e.target.value === "READING";
+          document.getElementById("wiwoFields").classList.toggle("hidden", isReading);
+          document.getElementById("readingFields").classList.toggle("hidden", !isReading);
+          if (isReading) suggestPreviousReading();
+        });
+        document.getElementById("cdCust").addEventListener("change", () => {
+          if (document.getElementById("cdType").value === "READING") suggestPreviousReading();
+        });
+
+        document.getElementById("cdSaveBtn").addEventListener("click", async () => {
+          const billingType = document.getElementById("cdType").value;
+          const base = {
+            customer_id: document.getElementById("cdCust").value,
+            location_id: isAdminOrMgr ? document.getElementById("cdLoc").value : undefined,
+            product_id: document.getElementById("cdProd").value,
+            billing_type: billingType,
+            notes: document.getElementById("cdNotes").value,
+          };
+          if (billingType === "WIWO") {
+            const cylinders = [...cylRows.querySelectorAll(".pay-row")].map(r => ({
+              cylinder_label: r.querySelector(".cdLabel").value,
+              gross_weight_in: r.querySelector(".cdGW").value,
+              tare_weight: r.querySelector(".cdTW").value,
+            })).filter(cy => cy.gross_weight_in && cy.tare_weight);
+            if (!cylinders.length) { toast("Add at least one cylinder with weights", "error"); return; }
+            base.cylinders = cylinders;
+          } else {
+            const prev = document.getElementById("cdPrevReading").value;
+            const curr = document.getElementById("cdCurrReading").value;
+            if (!prev || !curr) { toast("Enter both previous and current readings", "error"); return; }
+            base.meter_label = document.getElementById("cdMeterLabel").value;
+            base.previous_reading = prev;
+            base.current_reading = curr;
+          }
+          try {
+            await api("/commercial-deliveries", { method: "POST", body: base });
+            closeModal(); toast("Billing record saved", "success"); load();
           } catch (e) {}
         });
       });
@@ -2066,10 +2129,7 @@ async function renderCommercialDeliveries(c) {
 
   window.viewCommercialDelivery = async (id) => {
     const d = await api(`/commercial-deliveries/${id}`);
-    openModal(`${d.delivery_no}`, `
-      <div class="field"><b>Customer:</b> ${esc(d.customer_name)} (${d.account_no})</div>
-      <div class="field"><b>Location:</b> ${esc(d.location_name)} &nbsp; <b>Product:</b> ${esc(d.product_name)}</div>
-      <div class="field"><b>Status:</b> <span class="badge ${statusColor(d.status)}">${d.status}</span></div>
+    const detailHtml = d.billing_type === "WIWO" ? `
       <div class="table-wrap"><table><thead><tr>
         <th>Cylinder</th><th>GW In</th><th>Tare</th><th>NW In</th><th>GW Out</th><th>NW Out</th><th>Consumed</th>
       </tr></thead><tbody>
@@ -2077,8 +2137,23 @@ async function renderCommercialDeliveries(c) {
           <td>${cy.tare_weight}</td><td>${cy.net_weight_in}</td><td>${cy.gross_weight_out ?? '—'}</td>
           <td>${cy.net_weight_out ?? '—'}</td><td>${cy.consumption_weight ?? '—'}</td></tr>`).join("")}
       </tbody></table></div>
-      ${d.billed_amount ? `<div class="field" style="margin-top:10px"><b>Billed:</b> ${d.price_per_kg}/kg x ${d.cylinders.reduce((s,c)=>s+(c.consumption_weight||0),0).toFixed(2)}kg = ${money(d.billed_amount)}</div>` : ""}
-      <div class="modal-actions"><button class="btn" onclick="closeModal()">Close</button></div>
+    ` : `
+      <div class="field"><b>Meter/Tank:</b> ${esc(d.meter_label || '—')}</div>
+      <div class="field"><b>Previous Reading:</b> ${d.previous_reading} &nbsp; <b>Current Reading:</b> ${d.current_reading}</div>
+      <div class="field"><b>Consumption:</b> ${d.total_consumption_weight}</div>
+    `;
+    openModal(`${d.delivery_no}`, `
+      <div class="field"><b>Type:</b> <span class="badge ${d.billing_type === 'WIWO' ? 'blue' : 'warn'}">${d.billing_type}</span></div>
+      <div class="field"><b>Customer:</b> ${esc(d.customer_name)} (${d.account_no})</div>
+      <div class="field"><b>Location:</b> ${esc(d.location_name)} &nbsp; <b>Product:</b> ${esc(d.product_name)}</div>
+      <div class="field"><b>Status:</b> <span class="badge ${statusColor(d.status)}">${d.status}</span></div>
+      ${detailHtml}
+      ${d.billed_amount ? `<div class="field" style="margin-top:10px"><b>Billed:</b> ${money(d.price_per_kg)}/unit x ${d.total_consumption_weight} = ${money(d.billed_amount)}</div>` : ""}
+      <div class="modal-actions">
+        <button class="btn" onclick="closeModal()">Close</button>
+        <button class="btn" onclick="printCommercialDelivery(${id})">Print</button>
+        <a class="btn green" href="/api/commercial-deliveries/${id}/export/pdf">Export PDF</a>
+      </div>
     `);
   };
 
@@ -2125,9 +2200,10 @@ async function renderCommercialDeliveries(c) {
     const d = await api(`/commercial-deliveries/${id}`);
     const prod = products.find(p => p.id === d.product_id);
     const defaultRate = prod ? prod.price_per_kg : 0;
+    const unitLabel = d.billing_type === "WIWO" ? "kg" : "unit(s)";
     openModal("Generate Invoice", `
-      <div class="field"><b>Total Consumption:</b> ${totalConsumption} kg</div>
-      <div class="field"><label>Price per KG</label><input type="number" step="0.01" id="billRate" value="${defaultRate}"></div>
+      <div class="field"><b>Total Consumption:</b> ${totalConsumption} ${unitLabel}</div>
+      <div class="field"><label>Price per ${d.billing_type === 'WIWO' ? 'KG' : 'Unit'}</label><input type="number" step="0.01" id="billRate" value="${defaultRate}"></div>
       <div class="field"><b>Estimated Total:</b> <span id="billTotal">${money(totalConsumption * defaultRate)}</span></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
         <button class="btn green" id="billSaveBtn">Generate Invoice</button></div>
@@ -2137,7 +2213,7 @@ async function renderCommercialDeliveries(c) {
       });
       document.getElementById("billSaveBtn").addEventListener("click", async () => {
         const rate = parseFloat(document.getElementById("billRate").value);
-        if (!rate || rate <= 0) { toast("Enter a valid price per kg", "error"); return; }
+        if (!rate || rate <= 0) { toast(`Enter a valid price per ${unitLabel}`, "error"); return; }
         try {
           const result = await api(`/commercial-deliveries/${id}/bill`, { method: "POST", body: { price_per_kg: rate } });
           closeModal();
@@ -2152,6 +2228,44 @@ async function renderCommercialDeliveries(c) {
     if (!confirm("Cancel this commercial delivery?")) return;
     try { await api(`/commercial-deliveries/${id}/cancel`, { method: "POST" }); toast("Delivery cancelled", "success"); load(); }
     catch (e) {}
+  };
+
+  window.printCommercialDelivery = async (id) => {
+    const d = await api(`/commercial-deliveries/${id}`);
+    const detailRows = d.billing_type === "WIWO"
+      ? `<table style="width:100%;border-collapse:collapse;font-size:12px;margin:10px 0">
+          <tr style="border-bottom:1px solid #ccc"><th style="text-align:left">Cylinder</th><th>GW In</th><th>Tare</th><th>NW In</th><th>GW Out</th><th>NW Out</th><th>Consumed</th></tr>
+          ${d.cylinders.map(cy => `<tr><td>${esc(cy.cylinder_label || '—')}</td><td>${cy.gross_weight_in}</td>
+            <td>${cy.tare_weight}</td><td>${cy.net_weight_in}</td><td>${cy.gross_weight_out ?? '—'}</td>
+            <td>${cy.net_weight_out ?? '—'}</td><td>${cy.consumption_weight ?? '—'}</td></tr>`).join("")}
+        </table>`
+      : `<div style="margin:10px 0">Meter/Tank: ${esc(d.meter_label || '—')}<br>
+          Previous Reading: ${d.previous_reading} &nbsp; Current Reading: ${d.current_reading}</div>`;
+    const html = `
+      <div style="max-width:640px;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:13px">
+        <div style="text-align:center;margin-bottom:14px">
+          <img src="/images/logo.png" alt="GUFC" style="width:56px;height:56px;object-fit:contain">
+          <div style="font-weight:800;font-size:16px;margin-top:4px">GREAT UNLI FOOD CORP.</div>
+          <div style="color:#6b7785">Commercial LPG Billing — ${d.billing_type === 'WIWO' ? 'Weight In / Weight Out' : 'Meter Reading'}</div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;margin-bottom:10px">
+          <tr><td style="padding:4px 0;width:140px"><b>Delivery #</b></td><td>${d.delivery_no}</td></tr>
+          <tr><td style="padding:4px 0"><b>Date</b></td><td>${d.delivery_date}</td></tr>
+          <tr><td style="padding:4px 0"><b>Customer</b></td><td>${esc(d.customer_name)} (${d.account_no})</td></tr>
+          <tr><td style="padding:4px 0"><b>Location</b></td><td>${esc(d.location_name)}</td></tr>
+          <tr><td style="padding:4px 0"><b>Product</b></td><td>${esc(d.product_name)}</td></tr>
+          <tr><td style="padding:4px 0"><b>Status</b></td><td>${d.status}</td></tr>
+        </table>
+        ${detailRows}
+        <div style="margin-top:14px;font-size:14px">
+          <b>Total Consumption:</b> ${d.total_consumption_weight ?? '—'} ${d.billing_type === 'WIWO' ? 'kg' : ''}<br>
+          ${d.price_per_kg ? `<b>Rate:</b> ${money(d.price_per_kg)}<br>` : ""}
+          ${d.billed_amount ? `<b style="color:#1e9e5a">Billed Amount: ${money(d.billed_amount)}</b>` : ""}
+        </div>
+        <div style="margin-top:24px;color:#6b7785;font-size:11px;text-align:center">Printed ${new Date().toLocaleString()}</div>
+      </div>`;
+    document.getElementById("receiptArea").innerHTML = html;
+    setTimeout(() => window.print(), 200);
   };
 
   load();

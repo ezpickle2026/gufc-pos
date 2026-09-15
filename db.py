@@ -239,6 +239,10 @@ CREATE TABLE IF NOT EXISTS commercial_deliveries (
     customer_id INTEGER NOT NULL REFERENCES customers(id),
     location_id INTEGER NOT NULL REFERENCES locations(id),
     product_id INTEGER NOT NULL REFERENCES products(id),
+    billing_type TEXT NOT NULL DEFAULT 'WIWO' CHECK(billing_type IN ('WIWO','READING')),
+    meter_label TEXT,
+    previous_reading REAL,
+    current_reading REAL,
     status TEXT NOT NULL DEFAULT 'DELIVERED' CHECK(status IN ('DELIVERED','PICKED_UP','BILLED','CANCELLED')),
     pickup_date TEXT,
     price_per_kg REAL,
@@ -392,6 +396,14 @@ def migrate_schema():
         conn.execute("ALTER TABLE products ADD COLUMN price_per_kg REAL NOT NULL DEFAULT 0")
     if not _column_exists(conn, "sale_items", "sale_mode"):
         conn.execute("ALTER TABLE sale_items ADD COLUMN sale_mode TEXT NOT NULL DEFAULT 'REFILL'")
+    if not _column_exists(conn, "commercial_deliveries", "billing_type"):
+        conn.execute("ALTER TABLE commercial_deliveries ADD COLUMN billing_type TEXT NOT NULL DEFAULT 'WIWO'")
+    if not _column_exists(conn, "commercial_deliveries", "meter_label"):
+        conn.execute("ALTER TABLE commercial_deliveries ADD COLUMN meter_label TEXT")
+    if not _column_exists(conn, "commercial_deliveries", "previous_reading"):
+        conn.execute("ALTER TABLE commercial_deliveries ADD COLUMN previous_reading REAL")
+    if not _column_exists(conn, "commercial_deliveries", "current_reading"):
+        conn.execute("ALTER TABLE commercial_deliveries ADD COLUMN current_reading REAL")
     conn.commit()
 
     # 2. users.role needs to become a free-text field (no CHECK) so custom role

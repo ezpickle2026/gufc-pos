@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify, session, send_from_directory, Respons
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from db import get_db, init_db
-from reports import xlsx_response, pdf_table_response, soa_pdf_response
+from reports import xlsx_response, pdf_table_response, soa_pdf_response, commercial_billing_pdf
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
@@ -2298,13 +2298,41 @@ def list_commercial_deliveries():
     rows = conn.execute(sql, params).fetchall()
     out = []
     for r in rows:
-        cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (r["id"],)).fetchall()
-        total_net_in = round(sum(c["net_weight_in"] for c in cyls), 2)
-        total_consumption = round(sum(c["consumption_weight"] or 0 for c in cyls), 2) if r["status"] in ("PICKED_UP", "BILLED") else None
-        out.append({**dict(r), "cylinders": [dict(c) for c in cyls],
+        if r["billing_type"] == "READING":
+            total_net_in = None
+            total_consumption = round(r["current_reading"] - r["previous_reading"], 2) \
+                if r["current_reading"] is not None and r["previous_reading"] is not None else None
+            cyls = []
+        else:
+            cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (r["id"],)).fetchall()
+            total_net_in = round(sum(c["net_weight_in"] for c in cyls), 2)
+            total_consumption = round(sum(c["consumption_weight"] or 0 for c in cyls), 2) if r["status"] in ("PICKED_UP", "BILLED") else None
+            cyls = [dict(c) for c in cyls]
+        out.append({**dict(r), "cylinders": cyls,
                     "total_net_weight_in": total_net_in, "total_consumption_weight": total_consumption})
     conn.close()
     return jsonify(out)
+
+
+@app.get("/api/commercial-deliveries/last-reading")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+def last_meter_reading():
+    """Auto-suggest the starting reading for a new READING-type bill: the
+    ending reading from that customer's last one, like a utility company."""
+    customer_id = request.args.get("customer_id", type=int)
+    meter_label = request.args.get("meter_label", "")
+    if not customer_id:
+        return jsonify(error="customer_id is required"), 400
+    conn = get_db()
+    row = conn.execute(
+        """SELECT current_reading FROM commercial_deliveries
+           WHERE customer_id=? AND billing_type='READING' AND current_reading IS NOT NULL
+                 AND (meter_label=? OR ?='')
+           ORDER BY id DESC LIMIT 1""",
+        (customer_id, meter_label, meter_label),
+    ).fetchone()
+    conn.close()
+    return jsonify(previous_reading=row["current_reading"] if row else None)
 
 
 @app.post("/api/commercial-deliveries")
@@ -2313,44 +2341,86 @@ def create_commercial_delivery():
     d = request.get_json(force=True)
     u = session["user"]
     location_id = u["location_id"] if u["role"] not in ("ADMIN", "MANAGER") else d.get("location_id")
-    cylinders = d.get("cylinders") or []
+    billing_type = d.get("billing_type", "WIWO")
+    if billing_type not in ("WIWO", "READING"):
+        return jsonify(error="billing_type must be WIWO or READING"), 400
     if not d.get("customer_id") or not d.get("product_id") or not location_id:
         return jsonify(error="customer_id, product_id and location_id are required"), 400
-    if not cylinders:
-        return jsonify(error="At least one cylinder is required"), 400
-
-    resolved = []
-    for cyl in cylinders:
-        try:
-            gw = float(cyl.get("gross_weight_in"))
-            tw = float(cyl.get("tare_weight"))
-        except (TypeError, ValueError):
-            return jsonify(error="Gross weight and tare weight must be numbers"), 400
-        if gw <= 0 or tw <= 0:
-            return jsonify(error="Gross weight and tare weight must be positive"), 400
-        if gw <= tw:
-            return jsonify(error=f"Gross weight ({gw}) must be greater than tare weight ({tw}) for each cylinder"), 400
-        resolved.append((cyl.get("cylinder_label", ""), gw, tw, round(gw - tw, 2)))
 
     conn = get_db()
-    delivery_no = next_number(conn, "CD", "commercial_deliveries", "delivery_no")
-    cur = conn.execute(
-        """INSERT INTO commercial_deliveries (delivery_no, customer_id, location_id, product_id, notes, created_by)
-           VALUES (?,?,?,?,?,?)""",
-        (delivery_no, d["customer_id"], location_id, d["product_id"], d.get("notes", ""), u["id"]),
-    )
-    delivery_id = cur.lastrowid
-    for label, gw, tw, nw in resolved:
-        conn.execute(
-            """INSERT INTO commercial_delivery_cylinders (delivery_id, cylinder_label, gross_weight_in, tare_weight, net_weight_in)
-               VALUES (?,?,?,?,?)""",
-            (delivery_id, label, gw, tw, nw),
+
+    if billing_type == "WIWO":
+        cylinders = d.get("cylinders") or []
+        if not cylinders:
+            conn.close()
+            return jsonify(error="At least one cylinder is required"), 400
+        resolved = []
+        for cyl in cylinders:
+            try:
+                gw = float(cyl.get("gross_weight_in"))
+                tw = float(cyl.get("tare_weight"))
+            except (TypeError, ValueError):
+                conn.close()
+                return jsonify(error="Gross weight and tare weight must be numbers"), 400
+            if gw <= 0 or tw <= 0:
+                conn.close()
+                return jsonify(error="Gross weight and tare weight must be positive"), 400
+            if gw <= tw:
+                conn.close()
+                return jsonify(error=f"Gross weight ({gw}) must be greater than tare weight ({tw}) for each cylinder"), 400
+            resolved.append((cyl.get("cylinder_label", ""), gw, tw, round(gw - tw, 2)))
+
+        delivery_no = next_number(conn, "CD", "commercial_deliveries", "delivery_no")
+        cur = conn.execute(
+            """INSERT INTO commercial_deliveries (delivery_no, customer_id, location_id, product_id, billing_type, notes, created_by)
+               VALUES (?,?,?,?,?,?,?)""",
+            (delivery_no, d["customer_id"], location_id, d["product_id"], "WIWO", d.get("notes", ""), u["id"]),
         )
-    total_nw = round(sum(r[3] for r in resolved), 2)
-    audit(conn, "CREATE", "COMMERCIAL_DELIVERIES", delivery_id, f"{delivery_no}: {len(resolved)} cylinder(s), {total_nw}kg total")
-    conn.commit()
-    conn.close()
-    return jsonify(id=delivery_id, delivery_no=delivery_no, total_net_weight_in=total_nw), 201
+        delivery_id = cur.lastrowid
+        for label, gw, tw, nw in resolved:
+            conn.execute(
+                """INSERT INTO commercial_delivery_cylinders (delivery_id, cylinder_label, gross_weight_in, tare_weight, net_weight_in)
+                   VALUES (?,?,?,?,?)""",
+                (delivery_id, label, gw, tw, nw),
+            )
+        total_nw = round(sum(r[3] for r in resolved), 2)
+        audit(conn, "CREATE", "COMMERCIAL_DELIVERIES", delivery_id, f"{delivery_no} (WIWO): {len(resolved)} cylinder(s), {total_nw}kg total")
+        conn.commit()
+        conn.close()
+        return jsonify(id=delivery_id, delivery_no=delivery_no, total_net_weight_in=total_nw), 201
+
+    else:  # READING
+        try:
+            previous_reading = float(d.get("previous_reading"))
+            current_reading = float(d.get("current_reading"))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="previous_reading and current_reading must be numbers"), 400
+        if previous_reading < 0 or current_reading < 0:
+            conn.close()
+            return jsonify(error="Readings can't be negative"), 400
+        if current_reading < previous_reading:
+            conn.close()
+            return jsonify(error=f"Current reading ({current_reading}) can't be less than the previous reading ({previous_reading})"), 400
+
+        delivery_no = next_number(conn, "CD", "commercial_deliveries", "delivery_no")
+        # Both readings are captured in one step (no physical pickup to wait
+        # for), so this goes straight to PICKED_UP — ready to bill.
+        cur = conn.execute(
+            """INSERT INTO commercial_deliveries (delivery_no, customer_id, location_id, product_id, billing_type,
+                   meter_label, previous_reading, current_reading, status, pickup_date, notes, created_by, collected_by)
+               VALUES (?,?,?,?,?,?,?,?,?,datetime('now'),?,?,?)""",
+            (delivery_no, d["customer_id"], location_id, d["product_id"], "READING",
+             d.get("meter_label", ""), previous_reading, current_reading, "PICKED_UP",
+             d.get("notes", ""), u["id"], u["id"]),
+        )
+        delivery_id = cur.lastrowid
+        consumption = round(current_reading - previous_reading, 2)
+        audit(conn, "CREATE", "COMMERCIAL_DELIVERIES", delivery_id,
+              f"{delivery_no} (READING): {previous_reading} -> {current_reading} = {consumption} consumed")
+        conn.commit()
+        conn.close()
+        return jsonify(id=delivery_id, delivery_no=delivery_no, consumption=consumption), 201
 
 
 @app.get("/api/commercial-deliveries/<int:did>")
@@ -2368,7 +2438,32 @@ def get_commercial_delivery(did):
         return jsonify(error="Not found"), 404
     cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (did,)).fetchall()
     conn.close()
-    return jsonify({**dict(row), "cylinders": [dict(c) for c in cyls]})
+    total_consumption = None
+    if row["billing_type"] == "READING":
+        if row["current_reading"] is not None and row["previous_reading"] is not None:
+            total_consumption = round(row["current_reading"] - row["previous_reading"], 2)
+    elif row["status"] in ("PICKED_UP", "BILLED"):
+        total_consumption = round(sum(c["consumption_weight"] or 0 for c in cyls), 2)
+    return jsonify({**dict(row), "cylinders": [dict(c) for c in cyls], "total_consumption_weight": total_consumption})
+
+
+@app.get("/api/commercial-deliveries/<int:did>/export/pdf")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+def export_commercial_delivery_pdf(did):
+    conn = get_db()
+    row = conn.execute(
+        """SELECT cd.*, c.name customer_name, c.account_no, l.name location_name, p.name product_name
+           FROM commercial_deliveries cd JOIN customers c ON c.id=cd.customer_id
+           JOIN locations l ON l.id=cd.location_id JOIN products p ON p.id=cd.product_id WHERE cd.id=?""",
+        (did,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (did,)).fetchall()
+    conn.close()
+    fname = f"{row['delivery_no']}.pdf"
+    return commercial_billing_pdf(dict(row), [dict(c) for c in cyls], fname)
 
 
 @app.put("/api/commercial-deliveries/<int:did>/pickup")
@@ -2378,14 +2473,18 @@ def record_commercial_pickup(did):
     (billable weight) = net weight delivered - net weight residual."""
     d = request.get_json(force=True)
     cylinders = d.get("cylinders") or []
-    if not cylinders:
-        return jsonify(error="At least one cylinder weigh-out reading is required"), 400
 
     conn = get_db()
     delivery = conn.execute("SELECT * FROM commercial_deliveries WHERE id=?", (did,)).fetchone()
     if not delivery:
         conn.close()
         return jsonify(error="Not found"), 404
+    if delivery["billing_type"] != "WIWO":
+        conn.close()
+        return jsonify(error="Reading-based billing doesn't use a separate pickup step — both readings are entered together"), 400
+    if not cylinders:
+        conn.close()
+        return jsonify(error="At least one cylinder weigh-out reading is required"), 400
     if delivery["status"] != "DELIVERED":
         conn.close()
         return jsonify(error=f"This delivery is already {delivery['status']} — pickup can't be recorded again"), 400
@@ -2464,7 +2563,10 @@ def bill_commercial_delivery(did):
         return jsonify(error="A positive price per kg is required (set a default on the product, or enter one now)"), 400
 
     cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (did,)).fetchall()
-    total_consumption = round(sum(c["consumption_weight"] or 0 for c in cyls), 2)
+    if delivery["billing_type"] == "READING":
+        total_consumption = round(delivery["current_reading"] - delivery["previous_reading"], 2)
+    else:
+        total_consumption = round(sum(c["consumption_weight"] or 0 for c in cyls), 2)
     if total_consumption <= 0:
         conn.close()
         return jsonify(error="Total consumption is zero — nothing to bill"), 400
@@ -2472,19 +2574,26 @@ def bill_commercial_delivery(did):
 
     customer = conn.execute("SELECT * FROM customers WHERE id=?", (delivery["customer_id"],)).fetchone()
     u = session["user"]
+    if delivery["billing_type"] == "READING":
+        billing_desc = (f"Commercial meter billing for {delivery['delivery_no']} ({delivery['meter_label'] or 'meter'}): "
+                         f"{delivery['previous_reading']} -> {delivery['current_reading']} = {total_consumption} "
+                         f"@ {money_fmt(price_per_kg)}")
+        item_label = f"{product['name']} (meter reading)"
+    else:
+        billing_desc = f"Commercial weight billing for {delivery['delivery_no']}: {total_consumption}kg @ {money_fmt(price_per_kg)}/kg"
+        item_label = f"{product['name']} (weight-billed)"
     try:
         sale_no = next_number(conn, "SALE", "sales", "sale_no")
         cur = conn.execute(
             """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance, notes)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (sale_no, delivery["location_id"], u["id"], delivery["customer_id"], "CREDIT",
-             billed_amount, 0, billed_amount, 0, billed_amount,
-             f"Commercial 50kg billing for {delivery['delivery_no']}: {total_consumption}kg @ {money_fmt(price_per_kg)}/kg"),
+             billed_amount, 0, billed_amount, 0, billed_amount, billing_desc),
         )
         sale_id = cur.lastrowid
         conn.execute(
             "INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode) VALUES (?,?,?,?,?,?,?)",
-            (sale_id, product["id"], f"{product['name']} (weight-billed)", total_consumption, price_per_kg, billed_amount, "REFILL"),
+            (sale_id, product["id"], item_label, total_consumption, price_per_kg, billed_amount, "REFILL"),
         )
         terms_days = customer["terms_days"] or 0
         invoice_date = datetime.now().date()

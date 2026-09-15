@@ -32,6 +32,18 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Two commercial billing types** — the 50kg Commercial module now supports:
+  - **WIWO** (Weight In / Weight Out) — the existing flow: weigh cylinders in
+    at delivery, weigh out at pickup, bill the difference (actual consumption)
+  - **READING** — meter-based billing: enter the previous and current meter
+    reading, and consumption is billed at the client's rate. The previous
+    reading auto-fills from that customer's last bill, like a utility meter.
+    Since both readings are captured together, these skip the pickup step and
+    go straight to ready-to-bill.
+- **Printable and PDF-exportable billing** — every commercial billing record
+  (both types) now has a **Print** button and a **PDF** export, producing a
+  branded document with the full weight/reading breakdown, rate, and total.
+
 - **Incident Report attachments** — attach photos, PDFs, Excel/CSV, or Word
   docs (up to 10 files per report, 10MB each) when filing a report or any
   time after. Images and PDFs preview inline in the browser; other types

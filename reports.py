@@ -128,3 +128,89 @@ def soa_pdf_response(customer, entries, beginning_balance, ending_balance, filen
     doc.build(flow)
     buf.seek(0)
     return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
+
+
+def commercial_billing_pdf(delivery, cylinders, filename):
+    """One-record invoice-style PDF for a commercial 50kg WIWO or READING
+    billing — as opposed to pdf_table_response, which is for many-row
+    tabular reports."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=36, bottomMargin=36, leftMargin=36, rightMargin=36)
+    styles = getSampleStyleSheet()
+    flow = _header_flowables(
+        "Commercial LPG Billing" + (" — Weight In / Weight Out" if delivery["billing_type"] == "WIWO" else " — Meter Reading"),
+        subtitle=f"{delivery['delivery_no']} — {delivery['delivery_date']}",
+    )
+
+    info_rows = [
+        ["Customer", f"{delivery['customer_name']} ({delivery['account_no']})"],
+        ["Location", delivery["location_name"]],
+        ["Product", delivery["product_name"]],
+        ["Status", delivery["status"]],
+    ]
+    info_table = Table(info_rows, colWidths=[100, 380])
+    info_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    flow.append(info_table)
+    flow.append(Spacer(1, 14))
+
+    if delivery["billing_type"] == "WIWO":
+        headers = ["Cylinder", "Gross In", "Tare", "Net In", "Gross Out", "Net Out", "Consumed"]
+        data = [headers] + [[
+            c["cylinder_label"] or "—", c["gross_weight_in"], c["tare_weight"], c["net_weight_in"],
+            c["gross_weight_out"] if c["gross_weight_out"] is not None else "—",
+            c["net_weight_out"] if c["net_weight_out"] is not None else "—",
+            c["consumption_weight"] if c["consumption_weight"] is not None else "—",
+        ] for c in cylinders]
+        table = Table(data, repeatRows=1, colWidths=[90, 65, 60, 60, 65, 60, 65])
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), BLUE), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 8), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
+        ]))
+        flow.append(table)
+        total_consumption = round(sum(c["consumption_weight"] or 0 for c in cylinders), 2)
+    else:
+        reading_rows = [
+            ["Meter / Tank", delivery["meter_label"] or "—"],
+            ["Previous Reading", delivery["previous_reading"]],
+            ["Current Reading", delivery["current_reading"]],
+        ]
+        reading_table = Table(reading_rows, colWidths=[150, 330])
+        reading_table.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
+        ]))
+        flow.append(reading_table)
+        total_consumption = round((delivery["current_reading"] or 0) - (delivery["previous_reading"] or 0), 2)
+
+    flow.append(Spacer(1, 14))
+    unit = "kg" if delivery["billing_type"] == "WIWO" else "unit(s)"
+    summary_rows = [["Total Consumption", f"{total_consumption} {unit}"]]
+    if delivery["price_per_kg"]:
+        summary_rows.append(["Rate", f"PHP {delivery['price_per_kg']:,.2f} per {unit[:-1] if unit.endswith('s') else unit}"])
+    if delivery["billed_amount"]:
+        summary_rows.append(["Billed Amount", f"PHP {delivery['billed_amount']:,.2f}"])
+    summary_table = Table(summary_rows, colWidths=[150, 200])
+    summary_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (1, -1), (1, -1), "Helvetica-Bold"),
+        ("TEXTCOLOR", (1, -1), (1, -1), GREEN),
+        ("FONTSIZE", (0, 0), (-1, -1), 11),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    flow.append(summary_table)
+
+    if delivery["notes"]:
+        flow.append(Spacer(1, 14))
+        flow.append(Paragraph(f"<b>Notes:</b> {delivery['notes']}", styles["Normal"]))
+
+    doc.build(flow)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
