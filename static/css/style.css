@@ -129,7 +129,12 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase}
 
 .print-only{display:none}
 @media print{
+  /* #receiptArea is display:none on screen (.print-only). Toggling only
+     `visibility` isn't enough — a display:none element never renders, so the
+     page prints blank. Restore display here, then hide everything else. */
   body *{visibility:hidden}
-  #receiptArea, #receiptArea *{visibility:visible}
-  #receiptArea{position:absolute;top:0;left:0;width:100%;padding:20px}
+  #receiptArea{display:block !important;visibility:visible;position:absolute;top:0;left:0;width:100%;padding:20px}
+  #receiptArea *{visibility:visible}
+  /* Keep overlays out of the printout entirely */
+  .modal-backdrop, .toast-wrap, .bottom-nav, .sidebar, .topbar{display:none !important}
 }
