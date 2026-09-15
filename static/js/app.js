@@ -181,6 +181,37 @@ function openModal(title, bodyHtml, onMount) {
 }
 function closeModal() { document.getElementById("modalRoot").innerHTML = ""; }
 
+// Shared print helper. Loads the given HTML into the hidden #receiptArea and
+// prints it. Waits for any images (the logo) to finish loading first —
+// otherwise the browser can open the print dialog before the logo has
+// rendered. Also closes any open modal so it can't overlay the printout.
+function printDocument(html) {
+  closeModal();
+  const area = document.getElementById("receiptArea");
+  area.innerHTML = html;
+
+  const images = [...area.querySelectorAll("img")];
+  const pending = images.filter(img => !img.complete);
+  if (!pending.length) {
+    setTimeout(() => window.print(), 100);
+    return;
+  }
+  let remaining = pending.length;
+  let done = false;
+  const go = () => {
+    if (done) return;
+    done = true;
+    setTimeout(() => window.print(), 100);
+  };
+  pending.forEach(img => {
+    const onSettled = () => { remaining -= 1; if (remaining <= 0) go(); };
+    img.addEventListener("load", onSettled, { once: true });
+    img.addEventListener("error", onSettled, { once: true });
+  });
+  // Safety net: never block printing on a stuck image request.
+  setTimeout(go, 2000);
+}
+
 // ================================================================== DASHBOARD
 async function renderDashboard(c) {
   c.innerHTML = "Loading...";
@@ -429,8 +460,7 @@ function printReceipt(result) {
       <div>Paid: ${money(sale.paid)}<br>Balance: ${money(sale.balance)}</div>
       <div style="text-align:center;margin-top:8px">Thank you for your purchase!</div>
     </div>`;
-  document.getElementById("receiptArea").innerHTML = html;
-  setTimeout(() => window.print(), 200);
+  printDocument(html);
 }
 
 // ================================================================== SALES
@@ -1895,8 +1925,7 @@ async function renderIncidentReports(c) {
           <br><span style="color:#6b7785;font-size:12px">Resolved by ${esc(report.resolver_name || "")} on ${report.resolved_at}</span></div>` : ""}
         <div style="margin-top:24px;color:#6b7785;font-size:11px;text-align:center">Printed ${new Date().toLocaleString()}</div>
       </div>`;
-    document.getElementById("receiptArea").innerHTML = html;
-    setTimeout(() => window.print(), 200);
+    printDocument(html);
   };
 
   load();
@@ -2264,8 +2293,7 @@ async function renderCommercialDeliveries(c) {
         </div>
         <div style="margin-top:24px;color:#6b7785;font-size:11px;text-align:center">Printed ${new Date().toLocaleString()}</div>
       </div>`;
-    document.getElementById("receiptArea").innerHTML = html;
-    setTimeout(() => window.print(), 200);
+    printDocument(html);
   };
 
   load();
