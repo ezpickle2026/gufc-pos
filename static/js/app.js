@@ -215,28 +215,79 @@ function printDocument(html) {
 // ================================================================== DASHBOARD
 async function renderDashboard(c) {
   c.innerHTML = "Loading...";
-  const d = await api("/dashboard");
-  c.innerHTML = `
-    <div class="grid grid-4">
-      <div class="card stat-card green"><div class="label">Today's Sales</div><div class="value">${money(d.today_sales_total)}</div></div>
-      <div class="card stat-card"><div class="label">Today's Transactions</div><div class="value">${d.today_sales_count}</div></div>
-      <div class="card stat-card"><div class="label">Outstanding Receivables</div><div class="value">${money(d.outstanding_receivables)}</div></div>
-      <div class="card stat-card danger"><div class="label">Overdue Receivables</div><div class="value">${money(d.overdue_receivables)}</div></div>
-    </div>
-    <div class="grid grid-2" style="margin-top:16px">
-      <div class="card">
-        <h3 style="margin-top:0">Low Stock Alerts</h3>
-        ${d.low_stock.length ? `<div class="table-wrap"><table><thead><tr><th>Product</th><th>Location</th><th>Qty</th><th>Min</th></tr></thead><tbody>
-          ${d.low_stock.map(r => `<tr><td>${esc(r.name)}</td><td>${esc(r.location_name)}</td><td>${r.quantity}</td><td>${r.min_stock}</td></tr>`).join("")}
-        </tbody></table></div>` : `<p style="color:var(--muted)">No low-stock items.</p>`}
+
+  function todayStr() { return new Date().toISOString().slice(0, 10); }
+  function daysAgoStr(n) {
+    const dt = new Date();
+    dt.setDate(dt.getDate() - n);
+    return dt.toISOString().slice(0, 10);
+  }
+  function monthStartStr() {
+    const dt = new Date();
+    return new Date(dt.getFullYear(), dt.getMonth(), 1).toISOString().slice(0, 10);
+  }
+
+  let payFrom = todayStr();
+  let payTo = todayStr();
+
+  async function load() {
+    const qs = new URLSearchParams({ payments_from: payFrom, payments_to: payTo });
+    const d = await api("/dashboard?" + qs.toString());
+    c.innerHTML = `
+      <div class="grid grid-4">
+        <div class="card stat-card green"><div class="label">Today's Sales</div><div class="value">${money(d.today_sales_total)}</div></div>
+        <div class="card stat-card"><div class="label">Today's Transactions</div><div class="value">${d.today_sales_count}</div></div>
+        <div class="card stat-card"><div class="label">Outstanding Receivables</div><div class="value">${money(d.outstanding_receivables)}</div></div>
+        <div class="card stat-card danger"><div class="label">Overdue Receivables</div><div class="value">${money(d.overdue_receivables)}</div></div>
       </div>
-      <div class="card">
-        <h3 style="margin-top:0">Payments by Method (all time)</h3>
-        ${d.payments_by_method.length ? `<div class="table-wrap"><table><thead><tr><th>Method</th><th>Total</th></tr></thead><tbody>
-          ${d.payments_by_method.map(r => `<tr><td>${esc(r.method)}</td><td>${money(r.total)}</td></tr>`).join("")}
-        </tbody></table></div>` : `<p style="color:var(--muted)">No payments yet.</p>`}
-      </div>
-    </div>`;
+      <div class="grid grid-2" style="margin-top:16px">
+        <div class="card">
+          <h3 style="margin-top:0">Low Stock Alerts</h3>
+          ${d.low_stock.length ? `<div class="table-wrap"><table><thead><tr><th>Product</th><th>Location</th><th>Qty</th><th>Min</th></tr></thead><tbody>
+            ${d.low_stock.map(r => `<tr><td>${esc(r.name)}</td><td>${esc(r.location_name)}</td><td>${r.quantity}</td><td>${r.min_stock}</td></tr>`).join("")}
+          </tbody></table></div>` : `<p style="color:var(--muted)">No low-stock items.</p>`}
+        </div>
+        <div class="card">
+          <h3 style="margin-top:0">Payments by Method</h3>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+            <button class="btn small" data-preset="today">Today</button>
+            <button class="btn small" data-preset="7">Last 7 Days</button>
+            <button class="btn small" data-preset="30">Last 30 Days</button>
+            <button class="btn small" data-preset="month">This Month</button>
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+            <input type="date" id="payFrom" value="${payFrom}" style="font-size:13px">
+            <span style="color:var(--muted);font-size:13px">to</span>
+            <input type="date" id="payTo" value="${payTo}" style="font-size:13px">
+            <button class="btn small" id="payApply">Apply</button>
+          </div>
+          ${d.payments_by_method.length ? `<div class="table-wrap"><table><thead><tr><th>Method</th><th>Total</th></tr></thead><tbody>
+            ${d.payments_by_method.map(r => `<tr><td>${esc(r.method)}</td><td>${money(r.total)}</td></tr>`).join("")}
+            <tr style="font-weight:700;background:var(--bg)"><td>TOTAL</td><td>${money(d.payments_total)}</td></tr>
+          </tbody></table></div>` : `<p style="color:var(--muted)">No payments in this date range.</p>`}
+        </div>
+      </div>`;
+
+    c.querySelectorAll("[data-preset]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const p = btn.dataset.preset;
+        if (p === "today") { payFrom = todayStr(); payTo = todayStr(); }
+        else if (p === "month") { payFrom = monthStartStr(); payTo = todayStr(); }
+        else { payFrom = daysAgoStr(parseInt(p, 10) - 1); payTo = todayStr(); }
+        load();
+      });
+    });
+    document.getElementById("payApply").addEventListener("click", () => {
+      const f = document.getElementById("payFrom").value;
+      const t = document.getElementById("payTo").value;
+      if (!f || !t) { toast("Choose both dates", "error"); return; }
+      if (f > t) { toast("'From' date can't be after 'To' date", "error"); return; }
+      payFrom = f; payTo = t;
+      load();
+    });
+  }
+
+  load();
 }
 
 // ================================================================== POS
