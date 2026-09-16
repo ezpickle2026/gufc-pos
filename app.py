@@ -1825,15 +1825,39 @@ def dashboard():
            WHERE i.quantity <= p.min_stock""" + (" AND l.id=?" if u["role"] != "ADMIN" else ""),
         params,
     ).fetchall()
-    by_method = conn.execute(
-        "SELECT method, COALESCE(SUM(amount),0) total FROM payments GROUP BY method"
-    ).fetchall()
+
+    # Payments by method — date-filtered (defaults to today) and scoped to the
+    # user's own location for non-admins, via the sale each payment belongs to.
+    date_from = request.args.get("payments_from")
+    date_to = request.args.get("payments_to")
+    if not date_from and not date_to:
+        date_from = date_to = datetime.now().strftime("%Y-%m-%d")
+
+    pay_sql = """SELECT p.method, COALESCE(SUM(p.amount),0) total
+                  FROM payments p JOIN sales s ON s.id = p.sale_id
+                  WHERE 1=1"""
+    pay_params = []
+    if date_from:
+        pay_sql += " AND date(p.ts) >= date(?)"
+        pay_params.append(date_from)
+    if date_to:
+        pay_sql += " AND date(p.ts) <= date(?)"
+        pay_params.append(date_to)
+    if u["role"] not in ("ADMIN", "MANAGER"):
+        pay_sql += " AND s.location_id=?"
+        pay_params.append(u["location_id"])
+    pay_sql += " GROUP BY p.method ORDER BY total DESC"
+    by_method = conn.execute(pay_sql, pay_params).fetchall()
+    payments_total = round(sum(r["total"] for r in by_method), 2)
+
     conn.close()
     return jsonify(
         today_sales_total=today_sales["t"], today_sales_count=today_sales["c"],
         outstanding_receivables=outstanding["b"], overdue_receivables=overdue["b"],
         low_stock=[dict(r) for r in low_stock],
         payments_by_method=[dict(r) for r in by_method],
+        payments_total=payments_total,
+        payments_from=date_from, payments_to=date_to,
     )
 
 
