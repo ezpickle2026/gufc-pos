@@ -32,6 +32,32 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Dispatch empty cylinders** — a dispatch can now carry several lines, each
+  marked **Full** or **Empty**. Empties can go to another location (added to
+  that location's empties when it's marked Received) or out to a **plant** for
+  refilling. Only empties can go to a plant. Empty-cylinder stock now has its
+  own ledger (Inv. Ledger → "Empty Cylinders").
+- **Adjust empty cylinder inventory** — Admin can add or remove empties
+  (physical count, write-offs) from the Inventory page. A reason is required
+  and every change is logged.
+- **Receivables totals limited to Admin & Accounting** — the Outstanding /
+  Overdue Receivables cards are withheld server-side for everyone else. A new
+  built-in **ACCOUNTING** role (all-location receivables, payments, SOA,
+  reports) has been added. Access is the `receivables_summary` module in
+  Manage Roles.
+- **End of Day Report** — each attendant's collections for the day, totalled
+  by payment method (Cash, GCash, Bank Transfer, ...) and split into POS
+  sales vs. AR collections, plus a sales summary, items sold, and every
+  payment received. Print / PDF / Excel. Attendants see only their own;
+  Admin/Manager/Accounting can choose any staff member or location.
+- **Upload previous arrears** — Admin/Accounting can enter a customer's unpaid
+  balance from before the system went live, one at a time or by CSV
+  (`account_no, amount, as_of_date[, due_date, reference, notes]`). These act
+  like normal invoices (payments, aging, overdue status). They are not counted
+  as sales, and they roll into the **Beginning Balance** on the Statement of
+  Account. If any row in the CSV has an error, nothing is saved. An unpaid
+  entry can be removed to fix a mistake.
+
 - **Two commercial billing types** — the 50kg Commercial module now supports:
   - **WIWO** (Weight In / Weight Out) — the existing flow: weigh cylinders in
     at delivery, weigh out at pickup, bill the difference (actual consumption)
@@ -256,6 +282,7 @@ network — use your machine's LAN IP instead of localhost).
 | jsoliven    | Attendant123!  | Attendant  | Soliven Showroom     |
 | mmadamba    | Attendant123!  | Attendant  | Madamba Warehouse    |
 | pdispatch   | Dispatch123!   | Dispatcher | Madamba Warehouse    |
+| aaccounting | Accounting123! | Accounting | (all locations)      |
 
 **Change these before any real use** — create new users from the Admin → Users
 screen and disable the seeded ones.

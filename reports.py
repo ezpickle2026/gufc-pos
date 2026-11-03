@@ -214,3 +214,139 @@ def commercial_billing_pdf(delivery, cylinders, filename):
     doc.build(flow)
     buf.seek(0)
     return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
+
+
+def _eod_title(data):
+    sub = f"{data['staff_name']}"
+    if data.get("location_name"):
+        sub += f" — {data['location_name']}"
+    return f"End of Day Report — {data['date']}", sub
+
+
+def eod_pdf_response(data, filename):
+    """Attendant cash-up: totals by payment method, sales summary, items sold,
+    and the full list of payments received, with a signature block."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=36, bottomMargin=36, leftMargin=36, rightMargin=36)
+    styles = getSampleStyleSheet()
+    h3 = ParagraphStyle("H3GUFC", parent=styles["Heading3"], textColor=BLUE, spaceBefore=10)
+    title, sub = _eod_title(data)
+    flow = _header_flowables(title, subtitle=sub)
+
+    def styled(table_data, widths, total_row=False, right_from=1):
+        t = Table(table_data, repeatRows=1, colWidths=widths)
+        style = [
+            ("BACKGROUND", (0, 0), (-1, 0), BLUE),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("ALIGN", (right_from, 1), (-1, -1), "RIGHT"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
+        ]
+        if total_row:
+            style += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+                      ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e8f5ee"))]
+        t.setStyle(TableStyle(style))
+        return t
+
+    m = lambda n: f"{(n or 0):,.2f}"
+
+    flow.append(Paragraph("Collections by Payment Method", h3))
+    rows = [["Method", "# Payments", "POS Sales", "AR Collections", "Total"]]
+    for r in data["methods"]:
+        rows.append([r["method"], str(r["count"]), m(r["sales"]), m(r["collections"]), m(r["total"])])
+    t = data["totals"]
+    rows.append(["TOTAL", str(t["count"]), m(t["sales"]), m(t["collections"]), m(t["total"])])
+    flow.append(styled(rows, [140, 70, 100, 100, 100], total_row=True))
+
+    s = data["sales"]
+    flow.append(Paragraph("Sales Summary", h3))
+    summary = [["", "Amount"],
+               [f"Completed sales ({s['count']})", m(s["total"])],
+               ["  Cash sales", m(s["cash_sales"])],
+               ["  Credit / terms sales", m(s["credit_sales"])],
+               ["  Charged to accounts (unpaid)", m(s["charged_to_accounts"])],
+               ["Discounts given", m(s["discount"])],
+               [f"Voided sales ({s['voided_count']})", m(s["voided_total"])]]
+    flow.append(styled(summary, [300, 120]))
+
+    if data["items"]:
+        flow.append(Paragraph("Items Sold", h3))
+        rows = [["Product", "Type", "Qty", "Amount"]]
+        for i in data["items"]:
+            rows.append([i["product_name"], i["sale_mode"], str(i["qty"]), m(i["amount"])])
+        flow.append(styled(rows, [210, 80, 60, 100], right_from=2))
+
+    flow.append(Paragraph("Payments Received", h3))
+    rows = [["Time", "Sale / Invoice", "Customer", "Type", "Method", "Reference", "Amount"]]
+    for p in data["payments"]:
+        rows.append([p["ts"][11:16], p["invoice_no"] if p["payment_source"] == "AR_COLLECTION" and p["invoice_no"] else p["sale_no"],
+                     (p["customer_name"] or "Walk-in")[:22],
+                     "AR" if p["payment_source"] == "AR_COLLECTION" else "POS",
+                     p["method"], (p["reference"] or "")[:18], m(p["amount"])])
+    if len(rows) == 1:
+        rows.append(["—", "No payments received", "", "", "", "", ""])
+    flow.append(styled(rows, [40, 100, 110, 35, 70, 90, 70], right_from=6))
+
+    flow.append(Spacer(1, 30))
+    sig = Table([["______________________________", "______________________________"],
+                 [f"Prepared by: {data['staff_name']}", "Received / verified by"]],
+                colWidths=[260, 260])
+    sig.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), 9), ("ALIGN", (0, 0), (-1, -1), "CENTER")]))
+    flow.append(sig)
+
+    doc.build(flow)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
+
+
+def eod_xlsx_response(data, filename):
+    wb = Workbook()
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="0B3D66", end_color="0B3D66", fill_type="solid")
+
+    def header(ws, row):
+        ws.append(row)
+        for cell in ws[ws.max_row]:
+            cell.font = header_font
+            cell.fill = header_fill
+
+    title, sub = _eod_title(data)
+    ws = wb.active
+    ws.title = "Summary"
+    ws.append([title]); ws["A1"].font = Font(bold=True, size=14)
+    ws.append([sub])
+    ws.append([])
+    header(ws, ["Method", "# Payments", "POS Sales", "AR Collections", "Total"])
+    for r in data["methods"]:
+        ws.append([r["method"], r["count"], r["sales"], r["collections"], r["total"]])
+    t = data["totals"]
+    ws.append(["TOTAL", t["count"], t["sales"], t["collections"], t["total"]])
+    for cell in ws[ws.max_row]:
+        cell.font = Font(bold=True)
+    ws.append([])
+    s = data["sales"]
+    header(ws, ["Sales Summary", "Amount"])
+    for label, val in [(f"Completed sales ({s['count']})", s["total"]), ("Cash sales", s["cash_sales"]),
+                       ("Credit / terms sales", s["credit_sales"]),
+                       ("Charged to accounts (unpaid)", s["charged_to_accounts"]),
+                       ("Discounts given", s["discount"]), (f"Voided sales ({s['voided_count']})", s["voided_total"])]:
+        ws.append([label, val])
+    for col, width in zip("ABCDE", (32, 12, 14, 16, 14)):
+        ws.column_dimensions[col].width = width
+
+    ws2 = wb.create_sheet("Payments")
+    header(ws2, ["Date/Time", "Sale #", "Invoice #", "Customer", "Type", "Method", "Reference", "Collected By", "Amount"])
+    for p in data["payments"]:
+        ws2.append([p["ts"], p["sale_no"], p["invoice_no"] or "", p["customer_name"] or "Walk-in",
+                    "AR Collection" if p["payment_source"] == "AR_COLLECTION" else "POS Sale",
+                    p["method"], p["reference"] or "", p["collected_by"] or "", p["amount"]])
+    for col, width in zip("ABCDEFGHI", (19, 20, 20, 26, 14, 14, 18, 20, 12)):
+        ws2.column_dimensions[col].width = width
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
