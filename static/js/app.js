@@ -958,8 +958,9 @@ async function renderInventory(c) {
       </div>
       <p style="color:var(--muted);font-size:13px;margin-top:0">Returned via refill sales and deposit returns — dispatch them to the warehouse or plant from the Dispatch page.</p>
       <div class="table-wrap"><table><thead><tr><th>Location</th><th>Product</th><th>Empty Qty</th></tr></thead><tbody>
-        ${empties.filter(e => e.quantity > 0).length ? empties.filter(e => e.quantity > 0).map(e => `<tr>
-          <td>${esc(e.location_name)}</td><td>${esc(e.product_name)}</td><td><b>${e.quantity}</b></td></tr>`).join("")
+        ${empties.filter(e => e.quantity !== 0).length ? empties.filter(e => e.quantity !== 0).map(e => `<tr>
+          <td>${esc(e.location_name)}</td><td>${esc(e.product_name)}</td>
+          <td><b${e.quantity < 0 ? ' style="color:var(--danger)" title="Negative — a voided refill sale reversed an empty that was already dispatched. Recount and adjust."' : ""}>${e.quantity}</b></td></tr>`).join("")
           : `<tr><td colspan="3" style="color:var(--muted)">No empty cylinders on hand.</td></tr>`}
       </tbody></table></div>`;
     if (isAdmin) {

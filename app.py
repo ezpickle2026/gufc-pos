@@ -1402,16 +1402,21 @@ def add_empty_cylinders(conn, location_id, product_id, qty, mtype="RETURNED", re
     _log_empty_movement(conn, location_id, product_id, qty, mtype, reference, notes)
 
 
-def remove_empty_cylinders(conn, location_id, product_id, qty, mtype="REMOVED", reference=None, notes=None):
+def remove_empty_cylinders(conn, location_id, product_id, qty, mtype="REMOVED", reference=None, notes=None,
+                           allow_negative=False):
     row = conn.execute(
         "SELECT quantity FROM empty_cylinder_inventory WHERE location_id=? AND product_id=?",
         (location_id, product_id),
     ).fetchone()
     current = row["quantity"] if row else 0
-    if qty > current:
+    if qty > current and not allow_negative:
         raise ValueError(f"Only {current} empty cylinders on hand at this location")
-    conn.execute("UPDATE empty_cylinder_inventory SET quantity=quantity-? WHERE location_id=? AND product_id=?",
-                 (qty, location_id, product_id))
+    if row:
+        conn.execute("UPDATE empty_cylinder_inventory SET quantity=quantity-? WHERE location_id=? AND product_id=?",
+                     (qty, location_id, product_id))
+    else:
+        conn.execute("INSERT INTO empty_cylinder_inventory (location_id, product_id, quantity) VALUES (?,?,?)",
+                     (location_id, product_id, -qty))
     _log_empty_movement(conn, location_id, product_id, -qty, mtype, reference, notes)
 
 
@@ -1631,9 +1636,23 @@ def void_sale(sale_id):
         conn.close()
         return jsonify(error="Already voided"), 400
     items = conn.execute("SELECT * FROM sale_items WHERE sale_id=?", (sale_id,)).fetchall()
+    void_ref = f"VOID-{sale['sale_no']}"
     for it in items:
         adjust_inventory(conn, sale["location_id"], it["product_id"], it["qty"], "ADJUSTMENT",
-                          f"VOID-{sale['sale_no']}", notes="Reversal of voided sale", allow_negative=True)
+                          void_ref, notes="Reversal of voided sale", allow_negative=True)
+        if it["sale_mode"] == "REFILL":
+            # The refill sale took in an empty in exchange — take it back out.
+            # Allowed to go below zero (like the full-stock reversal above) in
+            # case the empty was already dispatched; a negative count flags it.
+            remove_empty_cylinders(conn, sale["location_id"], it["product_id"], it["qty"], "VOID REVERSAL",
+                                   void_ref, notes="Empty returned on voided refill sale", allow_negative=True)
+        elif sale["customer_id"]:
+            # DEPOSIT sale put cylinders on loan to the customer — undo that,
+            # without going below zero if some were already returned.
+            conn.execute(
+                "UPDATE cylinder_deposits SET qty_on_loan = MAX(qty_on_loan - ?, 0) WHERE customer_id=? AND product_id=?",
+                (it["qty"], sale["customer_id"], it["product_id"]),
+            )
     conn.execute("UPDATE sales SET status='VOIDED' WHERE id=?", (sale_id,))
     conn.execute("UPDATE receivables SET status='PAID', balance=0 WHERE sale_id=? ", (sale_id,))
     audit(conn, "VOID", "SALES", sale_id, f"Voided {sale['sale_no']}")
