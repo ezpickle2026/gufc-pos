@@ -61,6 +61,7 @@ const NAV = [
   { id: "dashboard", label: "Dashboard", icon: "\u{1F3E0}", module: "dashboard" },
   { id: "pos", label: "POS", icon: "\u{1F6D2}", module: "pos" },
   { id: "sales", label: "Sales", icon: "\u{1F9FE}", module: "sales" },
+  { id: "eod_report", label: "End of Day Report", icon: "\u{1F4B5}", module: "eod_report" },
   { id: "booked_orders", label: "Booked Orders", icon: "\u{1F4CB}", module: "booked_orders" },
 
   { section: "Customers & Money" },
@@ -162,7 +163,7 @@ function render() {
     hauling: renderHauling, vehicles: renderVehicles, employees: renderEmployees,
     staff_schedule: renderStaffSchedule, kpi: renderKpi,
     booked_orders: renderBookedOrders, incident_reports: renderIncidentReports, roles: renderRoles,
-    commercial_deliveries: renderCommercialDeliveries,
+    commercial_deliveries: renderCommercialDeliveries, eod_report: renderEndOfDay,
   };
   (views[state.view] || renderDashboard)(c);
 }
@@ -234,11 +235,12 @@ async function renderDashboard(c) {
     const qs = new URLSearchParams({ payments_from: payFrom, payments_to: payTo });
     const d = await api("/dashboard?" + qs.toString());
     c.innerHTML = `
-      <div class="grid grid-4">
+      <div class="grid ${d.show_receivables ? "grid-4" : "grid-2"}">
         <div class="card stat-card green"><div class="label">Today's Sales</div><div class="value">${money(d.today_sales_total)}</div></div>
         <div class="card stat-card"><div class="label">Today's Transactions</div><div class="value">${d.today_sales_count}</div></div>
+        ${d.show_receivables ? `
         <div class="card stat-card"><div class="label">Outstanding Receivables</div><div class="value">${money(d.outstanding_receivables)}</div></div>
-        <div class="card stat-card danger"><div class="label">Overdue Receivables</div><div class="value">${money(d.overdue_receivables)}</div></div>
+        <div class="card stat-card danger"><div class="label">Overdue Receivables</div><div class="value">${money(d.overdue_receivables)}</div></div>` : ""}
       </div>
       <div class="grid grid-2" style="margin-top:16px">
         <div class="card">
@@ -741,7 +743,7 @@ window.openCustomerLedger = async (cid) => {
       <div class="cart-total-row"><span>Beginning Balance</span><span>${money(data.beginning_balance)}</span></div>
       <div class="table-wrap" style="margin:8px 0"><table><thead><tr><th>Date</th><th>Type</th><th>Reference</th><th>Charges</th><th>Payments</th><th>Balance</th></tr></thead><tbody>
         ${data.entries.length ? data.entries.map(e => `<tr><td>${e.date}</td>
-          <td><span class="badge ${e.type === 'SALE' ? 'warn' : 'green'}">${e.type}</span></td><td>${esc(e.ref)}</td>
+          <td><span class="badge ${e.type === 'PAYMENT' ? 'green' : 'warn'}">${e.type}</span></td><td>${esc(e.ref)}</td>
           <td>${e.debit ? money(e.debit) : ""}</td><td>${e.credit ? money(e.credit) : ""}</td><td>${money(e.balance)}</td></tr>`).join("")
           : `<tr><td colspan="6" style="color:var(--muted)">No activity in this range.</td></tr>`}
       </tbody></table></div>
@@ -769,20 +771,110 @@ window.openCustomerLedger = async (cid) => {
 async function renderReceivables(c) {
   c.innerHTML = "Loading...";
   const rows = await api("/receivables");
-  const canExport = state.user.role === "ADMIN" || state.user.role === "MANAGER";
+  const role = state.user.role;
+  const canExport = ["ADMIN", "MANAGER", "ACCOUNTING"].includes(role);
+  const canArrears = ["ADMIN", "ACCOUNTING"].includes(role);
   const statusColor = s => ({ PAID: "green", CURRENT: "blue", "DUE SOON": "warn", OVERDUE: "danger", "PARTIALLY PAID": "warn" }[s] || "gray");
-  c.innerHTML = `<div style="margin-bottom:12px"><button class="btn" id="agingBtn">Aging Report</button></div>
+  c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn" id="agingBtn">Aging Report</button>
+    ${canArrears ? `<button class="btn green" id="addArrearsBtn">+ Add Previous Arrears</button>
+      <button class="btn" id="uploadArrearsBtn">Upload Previous Arrears (CSV)</button>` : ""}
+  </div>
   <div class="table-wrap"><table><thead><tr>
     <th>Invoice #</th><th>Customer</th><th>Sale #</th><th>Invoice Date</th><th>Due Date</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Status</th><th></th>
   </tr></thead><tbody>
     ${rows.map(r => `<tr>
-      <td>${r.invoice_no}</td><td>${esc(r.customer_name)} (${r.account_no})</td><td>${r.sale_no}</td>
+      <td>${esc(r.invoice_no)}</td><td>${esc(r.customer_name)} (${r.account_no})</td>
+      <td>${r.is_opening_balance ? '<span class="badge gray">PREV. ARREARS</span>' : esc(r.sale_no)}</td>
       <td>${r.invoice_date}</td><td>${r.due_date}</td><td>${money(r.amount)}</td><td>${money(r.paid)}</td><td>${money(r.balance)}</td>
       <td><span class="badge ${statusColor(r.status)}">${r.status}</span></td>
-      <td>${r.balance > 0.009 ? `<button class="btn small green" onclick="payReceivable(${r.id}, ${r.balance})">Record Payment</button>` : ""}</td>
+      <td style="display:flex;gap:6px">${r.balance > 0.009 ? `<button class="btn small green" onclick="payReceivable(${r.id}, ${r.balance})">Record Payment</button>` : ""}
+        ${canArrears && r.is_opening_balance && r.paid <= 0 ? `<button class="btn small danger" onclick="deleteArrears(${r.id})">Remove</button>` : ""}</td>
     </tr>`).join("")}
   </tbody></table></div>`;
   document.getElementById("agingBtn").addEventListener("click", () => openAgingReport(canExport));
+  if (!canArrears) return;
+
+  const reload = () => renderReceivables(document.getElementById("content"));
+  const locOpts = state.locations.map(l => `<option value="${l.id}" ${l.id === state.user.location_id ? "selected" : ""}>${esc(l.name)}</option>`).join("");
+  const arrearsHelp = `<p style="font-size:12.5px;color:var(--muted);margin-top:0">
+    Unpaid balances from before this system. They show up in Receivables and the Aging Report, can be paid like any invoice,
+    and roll into the <b>Beginning Balance</b> of the customer's Statement of Account. They are not counted as sales.</p>`;
+
+  document.getElementById("addArrearsBtn").addEventListener("click", async () => {
+    const customers = await api("/customers");
+    const today = new Date().toISOString().slice(0, 10);
+    openModal("Add Previous Arrears", `${arrearsHelp}
+      <div class="field"><label>Customer</label><select id="obCust"><option value="">-- choose --</option>
+        ${customers.map(cu => `<option value="${cu.id}">${esc(cu.name)} (${cu.account_no})</option>`).join("")}</select></div>
+      <div class="field"><label>Location (branch the account belongs to)</label><select id="obLoc">${locOpts}</select></div>
+      <div class="field"><label>Amount Owed</label><input type="number" id="obAmount" min="0" step="0.01"></div>
+      <div class="field"><label>Balance As Of</label><input type="date" id="obAsOf" value="${today}" max="${today}"></div>
+      <div class="field"><label>Due Date (optional — defaults to as-of date + customer terms)</label><input type="date" id="obDue"></div>
+      <div class="field"><label>Old Invoice / Reference # (optional)</label><input id="obRef"></div>
+      <div class="field"><label>Notes</label><input id="obNotes"></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="obSaveBtn">Save</button></div>
+    `, () => {
+      document.getElementById("obSaveBtn").addEventListener("click", async () => {
+        const body = {
+          customer_id: document.getElementById("obCust").value,
+          location_id: document.getElementById("obLoc").value,
+          amount: document.getElementById("obAmount").value,
+          as_of_date: document.getElementById("obAsOf").value,
+          due_date: document.getElementById("obDue").value || null,
+          reference: document.getElementById("obRef").value,
+          notes: document.getElementById("obNotes").value,
+        };
+        if (!body.customer_id) { toast("Choose a customer", "error"); return; }
+        if (!(parseFloat(body.amount) > 0)) { toast("Enter the amount owed", "error"); return; }
+        try { await api("/receivables/opening-balance", { method: "POST", body }); closeModal(); toast("Previous arrears added", "success"); reload(); }
+        catch (e) {}
+      });
+    });
+  });
+
+  document.getElementById("uploadArrearsBtn").addEventListener("click", () => {
+    openModal("Upload Previous Arrears (CSV)", `${arrearsHelp}
+      <p style="font-size:13px"><a href="/api/receivables/opening-balance/template">Download the CSV template</a>.
+        Columns: <code>account_no</code>, <code>amount</code>, <code>as_of_date</code> (YYYY-MM-DD), and optional
+        <code>due_date</code>, <code>reference</code>, <code>notes</code>. One row per unpaid invoice (or one row per customer for a lump sum).</p>
+      <p style="font-size:12.5px;color:var(--muted)">If any row has an error, nothing is saved — fix the file and upload again.</p>
+      <div class="field"><label>Location (branch these accounts belong to)</label><select id="obCsvLoc">${locOpts}</select></div>
+      <div class="field"><input type="file" id="obCsvFile" accept=".csv"></div>
+      <div id="obImportResult"></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Close</button>
+        <button class="btn green" id="obUploadBtn">Upload</button></div>
+    `, () => {
+      document.getElementById("obUploadBtn").addEventListener("click", async () => {
+        const file = document.getElementById("obCsvFile").files[0];
+        if (!file) { toast("Choose a CSV file first", "error"); return; }
+        const fd = new FormData();
+        fd.append("file", file);
+        fd.append("location_id", document.getElementById("obCsvLoc").value);
+        const out = document.getElementById("obImportResult");
+        try {
+          const res = await fetch("/api/receivables/opening-balance/import", { method: "POST", body: fd, credentials: "include" });
+          const data = await res.json();
+          if (!res.ok) {
+            out.innerHTML = data.errors && data.errors.length
+              ? `<p style="color:var(--danger);font-size:12.5px"><b>Nothing was saved.</b><br>${data.errors.map(esc).join("<br>")}</p>` : "";
+            toast(data.error || "Upload failed — see errors", "error");
+            return;
+          }
+          out.innerHTML = `<p style="color:var(--green-dark);font-weight:600">${data.created} row(s) imported — total ${money(data.total)}.</p>`;
+          toast(`${data.created} arrears row(s) imported`, "success");
+          reload();
+        } catch (e) { toast("Upload failed", "error"); }
+      });
+    });
+  });
+
+  window.deleteArrears = async (id) => {
+    if (!confirm("Remove this previous-arrears entry? Use this only to correct an upload mistake.")) return;
+    try { await api(`/receivables/${id}/opening-balance`, { method: "DELETE" }); toast("Entry removed", "success"); reload(); }
+    catch (e) {}
+  };
 }
 
 async function openAgingReport(canExport) {
@@ -860,14 +952,47 @@ async function renderInventory(c) {
           <td>${r.quantity}</td><td>${r.min_stock}</td>
           <td>${r.quantity <= r.min_stock ? '<span class="badge danger">LOW STOCK</span>' : '<span class="badge green">OK</span>'}</td></tr>`).join("")}
       </tbody></table></div>
-      <h3 style="margin:20px 0 8px">Empty Cylinders on Hand</h3>
-      <p style="color:var(--muted);font-size:13px;margin-top:0">Returned via refill sales — ready to haul back to the plant for refilling.</p>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin:20px 0 8px">
+        <h3 style="margin:0">Empty Cylinders on Hand</h3>
+        ${isAdmin ? `<button class="btn green" id="adjustEmptiesBtn">+ Adjust Empties</button>` : ""}
+      </div>
+      <p style="color:var(--muted);font-size:13px;margin-top:0">Returned via refill sales and deposit returns — dispatch them to the warehouse or plant from the Dispatch page.</p>
       <div class="table-wrap"><table><thead><tr><th>Location</th><th>Product</th><th>Empty Qty</th></tr></thead><tbody>
         ${empties.filter(e => e.quantity > 0).length ? empties.filter(e => e.quantity > 0).map(e => `<tr>
           <td>${esc(e.location_name)}</td><td>${esc(e.product_name)}</td><td><b>${e.quantity}</b></td></tr>`).join("")
           : `<tr><td colspan="3" style="color:var(--muted)">No empty cylinders on hand.</td></tr>`}
       </tbody></table></div>`;
-    if (isAdmin) document.getElementById("adjustStockBtn").addEventListener("click", openAdjustStockModal);
+    if (isAdmin) {
+      document.getElementById("adjustStockBtn").addEventListener("click", openAdjustStockModal);
+      document.getElementById("adjustEmptiesBtn").addEventListener("click", openAdjustEmptiesModal);
+    }
+  }
+  function openAdjustEmptiesModal() {
+    const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+    const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+    openModal("Adjust Empty Cylinders", `
+      <div class="field"><label>Location</label><select id="eLoc">${locOpts}</select></div>
+      <div class="field"><label>Product</label><select id="eProd">${prodOpts}</select></div>
+      <div class="field"><label>Quantity Change</label><input type="number" id="eDelta" placeholder="e.g. 10 or -5" value="0">
+        <div style="font-size:11.5px;color:var(--muted);margin-top:3px">Positive to add empties, negative to remove (e.g. damaged / written off).</div></div>
+      <div class="field"><label>Reason (required)</label><input type="text" id="eReason" placeholder="e.g. Physical count correction"></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="eSaveBtn">Save Adjustment</button></div>
+    `, () => {
+      document.getElementById("eSaveBtn").addEventListener("click", async () => {
+        const delta = parseInt(document.getElementById("eDelta").value, 10);
+        const reason = document.getElementById("eReason").value.trim();
+        if (!delta) { toast("Enter a non-zero quantity change", "error"); return; }
+        if (!reason) { toast("A reason is required", "error"); return; }
+        try {
+          await api("/inventory/empties/adjust", { method: "POST", body: {
+            location_id: document.getElementById("eLoc").value,
+            product_id: document.getElementById("eProd").value, delta, reason,
+          }});
+          closeModal(); toast("Empty cylinders adjusted", "success"); load();
+        } catch (e) {}
+      });
+    });
   }
   function openAdjustStockModal() {
     const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
@@ -906,6 +1031,7 @@ async function renderInventory(c) {
 async function renderInventoryLedger(c) {
   c.innerHTML = `
     <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+      <select id="ledgerStock"><option value="FULL">Full Cylinders</option><option value="EMPTY">Empty Cylinders</option></select>
       <select id="ledgerLoc"><option value="">All Locations</option>${state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}</select>
       <select id="ledgerProd"><option value="">All Products</option>${state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>
       <button class="btn" id="ledgerFilterBtn">Filter</button>
@@ -915,6 +1041,7 @@ async function renderInventoryLedger(c) {
     const loc = document.getElementById("ledgerLoc").value;
     const prod = document.getElementById("ledgerProd").value;
     const qs = new URLSearchParams();
+    qs.set("stock", document.getElementById("ledgerStock").value);
     if (loc) qs.set("location_id", loc);
     if (prod) qs.set("product_id", prod);
     const rows = await api("/inventory/movements?" + qs.toString());
@@ -943,7 +1070,7 @@ async function renderTransfers(c) {
       <th>Dispatch #</th><th>Date</th><th>From</th><th>To</th><th>Items</th><th>Status</th><th></th>
     </tr></thead><tbody>
       ${rows.map(t => `<tr><td>${t.transfer_no}</td><td>${t.ts}</td><td>${esc(t.from_name)}</td><td>${esc(t.to_name)}</td>
-        <td>${t.items.map(i => `${esc(i.product_name)} x${i.qty}`).join(", ")}</td>
+        <td>${t.items.map(i => `${esc(i.product_name)} x${i.qty}${i.cylinder_state === 'EMPTY' ? ' <span class="badge gray">EMPTY</span>' : ''}`).join(", ")}</td>
         <td><span class="badge ${t.status === 'RECEIVED' ? 'green' : t.status === 'CANCELLED' ? 'danger' : 'warn'}">${t.status}</span></td>
         <td>${t.status === 'RELEASED' ? `<button class="btn small green" onclick="receiveXfer(${t.id})">Mark Received</button>` : ""}</td>
       </tr>`).join("")}
@@ -979,21 +1106,81 @@ async function renderTransfers(c) {
     const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
     openModal("New Transfer / Dispatch", `
       <div class="field"><label>From</label><select id="xFrom">${locOpts}</select></div>
-      <div class="field"><label>To</label><select id="xTo">${locOpts}</select></div>
-      <div class="field"><label>Product</label><select id="xProd">${prodOpts}</select></div>
-      <div class="field"><label>Quantity</label><input type="number" id="xQty" value="1" min="1"></div>
+      <div class="field"><label>To</label><select id="xTo">${locOpts}<option value="PLANT">Plant (send empties for refill)</option></select></div>
+      <div class="field hidden" id="xPlantWrap"><label>Plant Name</label><input id="xPlant" placeholder="e.g. Solane Plant"></div>
+      <div class="field"><label>Items</label><div id="xRows"></div>
+        <button class="btn small" id="xAddRow" type="button">+ Add Item</button>
+        <div style="font-size:11.5px;color:var(--muted);margin-top:4px" id="xHint"></div></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
-        <button class="btn green" id="xSaveBtn">Create Transfer</button></div>
+        <button class="btn green" id="xSaveBtn">Dispatch</button></div>
     `, () => {
+      const stock = { FULL: {}, EMPTY: {} };
+      const rowsEl = document.getElementById("xRows");
+      const toPlant = () => document.getElementById("xTo").value === "PLANT";
+      function stateOpts() {
+        return toPlant() ? `<option value="EMPTY">Empty</option>`
+          : `<option value="FULL">Full</option><option value="EMPTY">Empty</option>`;
+      }
+      function refreshHints() {
+        rowsEl.querySelectorAll(".xRow").forEach(r => {
+          const st = r.querySelector(".xState").value, pid = r.querySelector(".xProd").value;
+          r.querySelector(".xAvail").textContent = `avail: ${stock[st][pid] ?? 0}`;
+        });
+      }
+      function addRow() {
+        const row = document.createElement("div");
+        row.className = "xRow";
+        row.style.cssText = "display:flex;gap:6px;margin-bottom:6px;align-items:center;flex-wrap:wrap";
+        row.innerHTML = `<select class="xProd" style="flex:2;min-width:140px">${prodOpts}</select>
+          <select class="xState" style="flex:1;min-width:80px">${stateOpts()}</select>
+          <input type="number" class="xQty" value="1" min="1" style="width:80px">
+          <span class="xAvail" style="font-size:11.5px;color:var(--muted);min-width:60px"></span>
+          <button class="btn small danger xDel" type="button">&times;</button>`;
+        row.querySelector(".xDel").addEventListener("click", () => { row.remove(); });
+        row.querySelectorAll("select").forEach(el => el.addEventListener("change", refreshHints));
+        rowsEl.appendChild(row);
+        refreshHints();
+      }
+      async function loadStock() {
+        const from = document.getElementById("xFrom").value;
+        const [full, empty] = await Promise.all([api(`/inventory?location_id=${from}`), api(`/inventory/empties?location_id=${from}`)]);
+        stock.FULL = {}; stock.EMPTY = {};
+        full.forEach(r => stock.FULL[r.product_id] = r.quantity);
+        empty.forEach(r => stock.EMPTY[r.product_id] = r.quantity);
+        refreshHints();
+      }
+      document.getElementById("xFrom").addEventListener("change", loadStock);
+      document.getElementById("xTo").addEventListener("change", () => {
+        document.getElementById("xPlantWrap").classList.toggle("hidden", !toPlant());
+        document.getElementById("xHint").textContent = toPlant()
+          ? "Only empty cylinders can go to the plant. Mark Received once the plant confirms delivery." : "";
+        rowsEl.querySelectorAll(".xState").forEach(sel => { const v = sel.value; sel.innerHTML = stateOpts(); if ([...sel.options].some(o => o.value === v)) sel.value = v; });
+        refreshHints();
+      });
+      if (state.locations.length > 1) document.getElementById("xTo").selectedIndex = 1;
+      document.getElementById("xAddRow").addEventListener("click", addRow);
+      addRow();
+      loadStock();
+
       document.getElementById("xSaveBtn").addEventListener("click", async () => {
         const from = document.getElementById("xFrom").value, to = document.getElementById("xTo").value;
-        if (from === to) { toast("Origin and destination must differ", "error"); return; }
+        const plant = document.getElementById("xPlant").value.trim();
+        if (to === "PLANT" && !plant) { toast("Enter the plant name", "error"); return; }
+        if (to !== "PLANT" && from === to) { toast("Origin and destination must differ", "error"); return; }
+        const items = [...rowsEl.querySelectorAll(".xRow")].map(r => ({
+          product_id: r.querySelector(".xProd").value, cylinder_state: r.querySelector(".xState").value,
+          qty: parseInt(r.querySelector(".xQty").value, 10),
+        }));
+        if (!items.length) { toast("Add at least one item", "error"); return; }
+        if (items.some(i => !(i.qty > 0))) { toast("Quantities must be at least 1", "error"); return; }
         try {
           await api("/transfers", { method: "POST", body: {
-            from_location: from, to_location: to,
-            items: [{ product_id: document.getElementById("xProd").value, qty: document.getElementById("xQty").value }],
+            from_location: from,
+            to_location: to === "PLANT" ? null : to,
+            to_external: to === "PLANT" ? plant : null,
+            items,
           }});
-          closeModal(); toast("Transfer dispatched", "success"); load();
+          closeModal(); toast("Dispatched", "success"); load();
         } catch (e) {}
       });
     });
@@ -1003,6 +1190,129 @@ async function renderTransfers(c) {
     try { await api(`/transfers/${id}/receive`, { method: "POST" }); toast("Transfer received; inventory updated", "success"); load(); }
     catch (e) {}
   };
+}
+
+// ================================================================== END OF DAY REPORT
+async function renderEndOfDay(c) {
+  const today = new Date().toISOString().slice(0, 10);
+  let date = today, userId = "", locationId = "";
+  async function load() {
+    c.innerHTML = "Loading...";
+    const qs = new URLSearchParams({ date });
+    if (userId) qs.set("user_id", userId);
+    if (locationId) qs.set("location_id", locationId);
+    const d = await api("/reports/end-of-day?" + qs.toString());
+    const s = d.sales, t = d.totals;
+    c.innerHTML = `
+      <div class="card" style="margin-bottom:16px">
+        <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+          <div class="field" style="margin:0"><label>Date</label><input type="date" id="eodDate" value="${date}" max="${today}"></div>
+          ${d.can_pick_staff ? `
+          <div class="field" style="margin:0"><label>Staff</label><select id="eodUser">
+            <option value="">All staff</option>
+            ${d.staff.map(u => `<option value="${u.id}" ${String(u.id) === String(userId) ? "selected" : ""}>${esc(u.name)} (${esc(u.role)})</option>`).join("")}
+          </select></div>
+          <div class="field" style="margin:0"><label>Location</label><select id="eodLoc">
+            <option value="">All locations</option>
+            ${state.locations.map(l => `<option value="${l.id}" ${String(l.id) === String(locationId) ? "selected" : ""}>${esc(l.name)}</option>`).join("")}
+          </select></div>` : ""}
+          <button class="btn" id="eodRun">Run</button>
+          <button class="btn green" id="eodPrint">Print</button>
+          <a class="btn" href="/api/reports/end-of-day/export?format=pdf&${qs.toString()}">PDF</a>
+          <a class="btn" href="/api/reports/end-of-day/export?format=xlsx&${qs.toString()}">Excel</a>
+        </div>
+        <p style="color:var(--muted);font-size:13px;margin:10px 0 0">
+          <b>${esc(d.staff_name)}</b>${d.location_name ? " — " + esc(d.location_name) : ""} · ${d.date}</p>
+      </div>
+      <div class="grid grid-4">
+        <div class="card stat-card green"><div class="label">Total Collected</div><div class="value">${money(t.total)}</div></div>
+        <div class="card stat-card"><div class="label">From POS Sales</div><div class="value">${money(t.sales)}</div></div>
+        <div class="card stat-card"><div class="label">AR Collections</div><div class="value">${money(t.collections)}</div></div>
+        <div class="card stat-card"><div class="label">Charged to Accounts</div><div class="value">${money(s.charged_to_accounts)}</div></div>
+      </div>
+      <div class="grid grid-2" style="margin-top:16px">
+        <div class="card">
+          <h3 style="margin-top:0">Collections by Payment Method</h3>
+          <div class="table-wrap"><table><thead><tr><th>Method</th><th>#</th><th>POS Sales</th><th>AR Collections</th><th>Total</th></tr></thead><tbody>
+            ${d.methods.length ? d.methods.map(m => `<tr><td><b>${esc(m.method)}</b></td><td>${m.count}</td><td>${money(m.sales)}</td><td>${money(m.collections)}</td><td><b>${money(m.total)}</b></td></tr>`).join("")
+              : `<tr><td colspan="5" style="color:var(--muted)">No payments received.</td></tr>`}
+            <tr style="font-weight:700;background:var(--bg)"><td>TOTAL</td><td>${t.count}</td><td>${money(t.sales)}</td><td>${money(t.collections)}</td><td>${money(t.total)}</td></tr>
+          </tbody></table></div>
+        </div>
+        <div class="card">
+          <h3 style="margin-top:0">Sales Summary</h3>
+          <div class="cart-total-row"><span>Completed sales (${s.count})</span><span>${money(s.total)}</span></div>
+          <div class="cart-total-row"><span>&nbsp;&nbsp;Cash sales</span><span>${money(s.cash_sales)}</span></div>
+          <div class="cart-total-row"><span>&nbsp;&nbsp;Credit / terms sales</span><span>${money(s.credit_sales)}</span></div>
+          <div class="cart-total-row"><span>&nbsp;&nbsp;Charged to accounts (unpaid)</span><span>${money(s.charged_to_accounts)}</span></div>
+          <div class="cart-total-row"><span>Discounts given</span><span>${money(s.discount)}</span></div>
+          <div class="cart-total-row"><span>Voided sales (${s.voided_count})</span><span>${money(s.voided_total)}</span></div>
+          ${d.items.length ? `<h4 style="margin:14px 0 6px">Items Sold</h4>
+          <div class="table-wrap"><table><thead><tr><th>Product</th><th>Type</th><th>Qty</th><th>Amount</th></tr></thead><tbody>
+            ${d.items.map(i => `<tr><td>${esc(i.product_name)}</td><td>${i.sale_mode}</td><td>${i.qty}</td><td>${money(i.amount)}</td></tr>`).join("")}
+          </tbody></table></div>` : ""}
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <h3 style="margin-top:0">Payments Received</h3>
+        <div class="table-wrap"><table><thead><tr><th>Time</th><th>Sale / Invoice</th><th>Customer</th><th>Type</th><th>Method</th><th>Reference</th>${d.user_id ? "" : "<th>Collected By</th>"}<th>Amount</th></tr></thead><tbody>
+          ${d.payments.length ? d.payments.map(p => `<tr><td>${p.ts.slice(11, 16)}</td>
+            <td>${esc(p.payment_source === 'AR_COLLECTION' && p.invoice_no ? p.invoice_no : p.sale_no)}</td>
+            <td>${esc(p.customer_name || "Walk-in")}</td>
+            <td><span class="badge ${p.payment_source === 'AR_COLLECTION' ? 'warn' : 'blue'}">${p.payment_source === 'AR_COLLECTION' ? 'AR' : 'POS'}</span></td>
+            <td>${esc(p.method)}</td><td>${esc(p.reference || "")}</td>${d.user_id ? "" : `<td>${esc(p.collected_by || "")}</td>`}<td>${money(p.amount)}</td></tr>`).join("")
+            : `<tr><td colspan="8" style="color:var(--muted)">No payments received on this date.</td></tr>`}
+        </tbody></table></div>
+      </div>`;
+
+    document.getElementById("eodRun").addEventListener("click", () => {
+      date = document.getElementById("eodDate").value || today;
+      if (d.can_pick_staff) {
+        userId = document.getElementById("eodUser").value;
+        locationId = document.getElementById("eodLoc").value;
+      }
+      load();
+    });
+    document.getElementById("eodPrint").addEventListener("click", () => printEndOfDay(d));
+  }
+  load();
+}
+
+function printEndOfDay(d) {
+  const t = d.totals, s = d.sales;
+  const row = (a, b, bold) => `<tr${bold ? ' style="font-weight:700"' : ""}><td>${a}</td><td style="text-align:right">${b}</td></tr>`;
+  printDocument(`<div style="font-family:Arial,sans-serif;font-size:12px;max-width:720px;margin:auto">
+    <div style="text-align:center"><img src="/images/logo.png" style="height:50px"><h2 style="margin:4px 0">GREAT UNLI FOOD CORP.</h2>
+      <div>Solane LPG Distributor</div><h3 style="margin:10px 0 2px">END OF DAY REPORT</h3>
+      <div>${esc(d.staff_name)}${d.location_name ? " — " + esc(d.location_name) : ""} · ${d.date}</div></div>
+    <h4>Collections by Payment Method</h4>
+    <table style="width:100%;border-collapse:collapse" border="1" cellpadding="4">
+      <tr><th align="left">Method</th><th>#</th><th align="right">POS Sales</th><th align="right">AR Collections</th><th align="right">Total</th></tr>
+      ${d.methods.map(m => `<tr><td>${esc(m.method)}</td><td align="center">${m.count}</td><td align="right">${money(m.sales)}</td><td align="right">${money(m.collections)}</td><td align="right">${money(m.total)}</td></tr>`).join("")}
+      <tr style="font-weight:700"><td>TOTAL</td><td align="center">${t.count}</td><td align="right">${money(t.sales)}</td><td align="right">${money(t.collections)}</td><td align="right">${money(t.total)}</td></tr>
+    </table>
+    <h4>Sales Summary</h4>
+    <table style="width:100%;border-collapse:collapse" border="1" cellpadding="4">
+      ${row(`Completed sales (${s.count})`, money(s.total), true)}
+      ${row("&nbsp;&nbsp;Cash sales", money(s.cash_sales))}
+      ${row("&nbsp;&nbsp;Credit / terms sales", money(s.credit_sales))}
+      ${row("&nbsp;&nbsp;Charged to accounts (unpaid)", money(s.charged_to_accounts))}
+      ${row("Discounts given", money(s.discount))}
+      ${row(`Voided sales (${s.voided_count})`, money(s.voided_total))}
+    </table>
+    <h4>Payments Received</h4>
+    <table style="width:100%;border-collapse:collapse" border="1" cellpadding="3">
+      <tr><th>Time</th><th align="left">Sale / Invoice</th><th align="left">Customer</th><th>Type</th><th align="left">Method</th><th align="left">Ref</th><th align="right">Amount</th></tr>
+      ${d.payments.length ? d.payments.map(p => `<tr><td>${p.ts.slice(11, 16)}</td>
+        <td>${esc(p.payment_source === 'AR_COLLECTION' && p.invoice_no ? p.invoice_no : p.sale_no)}</td><td>${esc(p.customer_name || "Walk-in")}</td>
+        <td align="center">${p.payment_source === 'AR_COLLECTION' ? 'AR' : 'POS'}</td><td>${esc(p.method)}</td><td>${esc(p.reference || "")}</td>
+        <td align="right">${money(p.amount)}</td></tr>`).join("") : `<tr><td colspan="7">No payments received.</td></tr>`}
+    </table>
+    <table style="width:100%;margin-top:50px"><tr>
+      <td style="text-align:center">______________________________<br>Prepared by: ${esc(d.staff_name)}</td>
+      <td style="text-align:center">______________________________<br>Received / verified by</td></tr></table>
+    <div style="text-align:center;color:#888;margin-top:16px;font-size:10px">Printed ${new Date().toLocaleString()} by ${esc(d.generated_by)}</div>
+  </div>`);
 }
 
 // ================================================================== REPORTS
@@ -2025,6 +2335,8 @@ async function renderRoles(c) {
       cylinder_deposits: "Cylinder Deposits", transfers: "Dispatch / Transfers", hauling: "Hauling Schedule",
       vehicles: "Vehicles", employees: "Employees", staff_schedule: "Staff Schedule", kpi: "Employee KPI",
       reports: "Reports", audit: "Audit Log", booked_orders: "Booked Orders", incident_reports: "Incident Reports",
+      commercial_deliveries: "50kg Commercial Billing", eod_report: "End of Day Report",
+      receivables_summary: "Dashboard: Receivables Totals",
     };
     openModal(`${locked ? "View" : "Edit"} Modules — ${name}`, `
       ${locked ? `<p style="color:var(--muted);font-size:13px">Admin always has full access to every module — this can't be changed.</p>` : ""}

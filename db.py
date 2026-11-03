@@ -89,7 +89,8 @@ CREATE TABLE IF NOT EXISTS sales (
     paid REAL NOT NULL DEFAULT 0,
     balance REAL NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'COMPLETED' CHECK(status IN ('COMPLETED','VOIDED')),
-    notes TEXT
+    notes TEXT,
+    is_opening_balance INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sale_items (
@@ -110,6 +111,18 @@ CREATE TABLE IF NOT EXISTS empty_cylinder_inventory (
     PRIMARY KEY (location_id, product_id)
 );
 
+CREATE TABLE IF NOT EXISTS empty_cylinder_movements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT DEFAULT (datetime('now')),
+    location_id INTEGER NOT NULL REFERENCES locations(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    qty_change INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    reference TEXT,
+    user_id INTEGER REFERENCES users(id),
+    notes TEXT
+);
+
 CREATE TABLE IF NOT EXISTS cylinder_deposits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id INTEGER NOT NULL REFERENCES customers(id),
@@ -125,7 +138,8 @@ CREATE TABLE IF NOT EXISTS payments (
     amount REAL NOT NULL,
     reference TEXT,
     ts TEXT DEFAULT (datetime('now')),
-    user_id INTEGER REFERENCES users(id)
+    user_id INTEGER REFERENCES users(id),
+    payment_source TEXT NOT NULL DEFAULT 'SALE'
 );
 
 CREATE TABLE IF NOT EXISTS receivables (
@@ -146,7 +160,8 @@ CREATE TABLE IF NOT EXISTS transfers (
     transfer_no TEXT UNIQUE NOT NULL,
     ts TEXT DEFAULT (datetime('now')),
     from_location INTEGER NOT NULL REFERENCES locations(id),
-    to_location INTEGER NOT NULL REFERENCES locations(id),
+    to_location INTEGER REFERENCES locations(id),
+    to_external TEXT,
     status TEXT NOT NULL DEFAULT 'RELEASED' CHECK(status IN ('RELEASED','RECEIVED','CANCELLED')),
     user_id INTEGER REFERENCES users(id),
     received_by INTEGER REFERENCES users(id),
@@ -157,7 +172,8 @@ CREATE TABLE IF NOT EXISTS transfer_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     transfer_id INTEGER NOT NULL REFERENCES transfers(id),
     product_id INTEGER NOT NULL REFERENCES products(id),
-    qty INTEGER NOT NULL
+    qty INTEGER NOT NULL,
+    cylinder_state TEXT NOT NULL DEFAULT 'FULL'
 );
 
 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -359,6 +375,7 @@ MODULE_KEYS = [
     "inventory_ledger", "cylinder_deposits", "transfers", "hauling", "vehicles",
     "employees", "staff_schedule", "kpi", "reports", "audit",
     "booked_orders", "incident_reports", "commercial_deliveries",
+    "eod_report", "receivables_summary",
 ]
 
 DEFAULT_ROLE_PERMISSIONS = {
@@ -367,11 +384,16 @@ DEFAULT_ROLE_PERMISSIONS = {
         "dashboard", "sales", "customers", "receivables", "inventory",
         "inventory_ledger", "cylinder_deposits", "hauling", "vehicles",
         "employees", "staff_schedule", "kpi", "reports", "audit",
-        "booked_orders", "incident_reports", "commercial_deliveries",
+        "booked_orders", "incident_reports", "commercial_deliveries", "eod_report",
+    ],
+    "ACCOUNTING": [
+        "dashboard", "sales", "customers", "receivables", "reports", "eod_report",
+        "receivables_summary",
     ],
     "ATTENDANT": [
         "dashboard", "pos", "sales", "customers", "receivables", "inventory",
         "cylinder_deposits", "staff_schedule", "booked_orders", "incident_reports",
+        "eod_report",
     ],
     "DISPATCHER": [
         "dashboard", "inventory", "transfers", "staff_schedule", "incident_reports",
@@ -516,6 +538,60 @@ def migrate_schema():
         for role_name in ("MANAGER", "DISPATCHER"):
             if conn.execute("SELECT 1 FROM roles WHERE name=?", (role_name,)).fetchone():
                 conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES (?, 'commercial_deliveries')",
+                             (role_name,))
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
+        conn.commit()
+
+    # 9. Columns for: empty-cylinder dispatch, AR-collection tagging on
+    #    payments (End of Day report), and previous-arrears opening balances.
+    if not _column_exists(conn, "transfer_items", "cylinder_state"):
+        conn.execute("ALTER TABLE transfer_items ADD COLUMN cylinder_state TEXT NOT NULL DEFAULT 'FULL'")
+    if not _column_exists(conn, "payments", "payment_source"):
+        conn.execute("ALTER TABLE payments ADD COLUMN payment_source TEXT NOT NULL DEFAULT 'SALE'")
+        # Receivable payments were always saved with an "AR-<invoice>"
+        # reference unless the user typed their own — best-effort backfill.
+        conn.execute("UPDATE payments SET payment_source='AR_COLLECTION' WHERE reference LIKE 'AR-%'")
+    if not _column_exists(conn, "sales", "is_opening_balance"):
+        conn.execute("ALTER TABLE sales ADD COLUMN is_opening_balance INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+
+    # 10. transfers.to_location becomes nullable so empties can be dispatched
+    #     to a plant (outside the system) — recreate table, copy data.
+    if not _column_exists(conn, "transfers", "to_external"):
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("""
+            CREATE TABLE transfers_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                transfer_no TEXT UNIQUE NOT NULL,
+                ts TEXT DEFAULT (datetime('now')),
+                from_location INTEGER NOT NULL REFERENCES locations(id),
+                to_location INTEGER REFERENCES locations(id),
+                to_external TEXT,
+                status TEXT NOT NULL DEFAULT 'RELEASED' CHECK(status IN ('RELEASED','RECEIVED','CANCELLED')),
+                user_id INTEGER REFERENCES users(id),
+                received_by INTEGER REFERENCES users(id),
+                received_ts TEXT
+            )
+        """)
+        conn.execute("""
+            INSERT INTO transfers_new (id, transfer_no, ts, from_location, to_location, status, user_id, received_by, received_ts)
+            SELECT id, transfer_no, ts, from_location, to_location, status, user_id, received_by, received_ts FROM transfers
+        """)
+        conn.execute("DROP TABLE transfers")
+        conn.execute("ALTER TABLE transfers_new RENAME TO transfers")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.commit()
+
+    # 11. New built-in ACCOUNTING role, and the End of Day report module for
+    #     the roles that need it. Runs once; never touches custom roles.
+    MIGRATION_KEY = "accounting_role_and_eod_report"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        conn.execute("INSERT OR IGNORE INTO roles (name, is_builtin) VALUES ('ACCOUNTING', 1)")
+        for m in DEFAULT_ROLE_PERMISSIONS["ACCOUNTING"]:
+            conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES ('ACCOUNTING', ?)", (m,))
+        for role_name in ("MANAGER", "ATTENDANT"):
+            if conn.execute("SELECT 1 FROM roles WHERE name=?", (role_name,)).fetchone():
+                conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES (?, 'eod_report')",
                              (role_name,))
         conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()

@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify, session, send_from_directory, Respons
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from db import get_db, init_db
-from reports import xlsx_response, pdf_table_response, soa_pdf_response, commercial_billing_pdf
+from reports import xlsx_response, pdf_table_response, soa_pdf_response, commercial_billing_pdf, eod_pdf_response, eod_xlsx_response
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
@@ -129,6 +129,18 @@ def get_permitted_modules(conn, role):
         return MODULE_KEYS
     rows = conn.execute("SELECT module_key FROM role_permissions WHERE role_name=?", (role,)).fetchall()
     return [r["module_key"] for r in rows]
+
+
+# Roles that see receivables (and sales) across every location rather than
+# just their own assigned branch.
+ALL_LOCATION_FINANCE_ROLES = ("ADMIN", "MANAGER", "ACCOUNTING")
+
+
+def can_view_receivables_summary(conn, role):
+    """Outstanding / overdue receivables totals on the dashboard are limited
+    to Admin and Accounting by default (via the receivables_summary module,
+    which Admin can grant to other roles in Manage Roles if ever needed)."""
+    return has_module_access(conn, role, "receivables_summary")
 
 
 def location_scope(row_location_id):
@@ -656,7 +668,9 @@ def build_customer_ledger(conn, cid, date_from=None, date_to=None):
     """Chronological charges (sales) + payments for a customer, with running balance.
     Used for both the on-screen Account Ledger and the printable Statement of Account."""
     sales = conn.execute(
-        "SELECT id, sale_no, ts, total, status FROM sales WHERE customer_id=? AND status='COMPLETED' ORDER BY ts",
+        """SELECT s.id, s.sale_no, s.ts, s.total, s.status, s.is_opening_balance, r.invoice_no
+           FROM sales s LEFT JOIN receivables r ON r.sale_id = s.id
+           WHERE s.customer_id=? AND s.status='COMPLETED' ORDER BY s.ts""",
         (cid,),
     ).fetchall()
     payments = conn.execute(
@@ -668,7 +682,11 @@ def build_customer_ledger(conn, cid, date_from=None, date_to=None):
 
     events = []
     for s in sales:
-        events.append({"date": s["ts"], "type": "SALE", "ref": s["sale_no"], "debit": s["total"], "credit": 0})
+        if s["is_opening_balance"]:
+            events.append({"date": s["ts"], "type": "PREVIOUS ARREARS", "ref": s["invoice_no"] or s["sale_no"],
+                           "debit": s["total"], "credit": 0, "opening": True})
+        else:
+            events.append({"date": s["ts"], "type": "SALE", "ref": s["sale_no"], "debit": s["total"], "credit": 0})
     for p in payments:
         events.append({"date": p["ts"], "type": "PAYMENT", "ref": f"{p['sale_no']} ({p['method']})", "debit": 0, "credit": p["amount"]})
     events.sort(key=lambda e: e["date"])
@@ -678,16 +696,22 @@ def build_customer_ledger(conn, cid, date_from=None, date_to=None):
     for e in events:
         before_range = date_from and e["date"] < date_from
         after_range = date_to and e["date"] > date_to + " 23:59:59"
+        # Uploaded previous arrears always roll into the Beginning Balance
+        # (as long as they're dated within the statement period or earlier),
+        # rather than appearing as a charge line on the statement.
+        if e.get("opening") and not after_range:
+            beginning_balance += e["debit"]
+            continue
         if before_range:
             beginning_balance += e["debit"] - e["credit"]
         elif not after_range:
             in_range_events.append(e)
 
-    running = beginning_balance
+    running = round(beginning_balance, 2)
     out = []
     for e in in_range_events:
         running = round(running + e["debit"] - e["credit"], 2)
-        out.append({**e, "balance": running})
+        out.append({**{k: v for k, v in e.items() if k != "opening"}, "balance": running})
     return out, round(beginning_balance, 2), running
 
 
@@ -707,7 +731,7 @@ def customer_ledger(cid):
 
 
 @app.get("/api/customers/<int:cid>/statement/export")
-@roles_required("ADMIN", "ATTENDANT")
+@roles_required("ADMIN", "ATTENDANT", "ACCOUNTING")
 def customer_statement_export(cid):
     conn = get_db()
     cust = conn.execute("SELECT * FROM customers WHERE id=?", (cid,)).fetchone()
@@ -1162,8 +1186,9 @@ def inventory_movements():
     product_id = request.args.get("product_id", type=int)
     location_id = request.args.get("location_id", type=int)
     mtype = request.args.get("type")
+    table = "empty_cylinder_movements" if request.args.get("stock") == "EMPTY" else "inventory_movements"
     conn = get_db()
-    sql = "SELECT m.*, p.name product_name, l.name location_name FROM inventory_movements m " \
+    sql = f"SELECT m.*, p.name product_name, l.name location_name FROM {table} m " \
           "JOIN products p ON p.id=m.product_id JOIN locations l ON l.id=m.location_id WHERE 1=1"
     params = []
     if product_id:
@@ -1200,6 +1225,42 @@ def get_empty_cylinders():
     rows = conn.execute(sql, params).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/inventory/empties/adjust")
+@roles_required("ADMIN")
+def adjust_empty_cylinders():
+    """Manual correction of empty-cylinder counts (physical count, damaged
+    cylinders written off, etc.). Logged to the empty-cylinder ledger."""
+    d = request.get_json(force=True)
+    location_id = d.get("location_id")
+    product_id = d.get("product_id")
+    reason = (d.get("reason") or "").strip()
+    if not location_id or not product_id or d.get("delta") is None:
+        return jsonify(error="location_id, product_id and delta are required"), 400
+    try:
+        delta = int(d.get("delta"))
+    except (TypeError, ValueError):
+        return jsonify(error="delta must be a whole number (positive to add, negative to remove)"), 400
+    if delta == 0:
+        return jsonify(error="delta cannot be zero"), 400
+    if not reason:
+        return jsonify(error="A reason is required for empty cylinder adjustments"), 400
+
+    conn = get_db()
+    try:
+        if delta > 0:
+            add_empty_cylinders(conn, location_id, product_id, delta, "ADJUSTMENT", "MANUAL-ADMIN", reason)
+        else:
+            remove_empty_cylinders(conn, location_id, product_id, -delta, "ADJUSTMENT", "MANUAL-ADMIN", reason)
+        audit(conn, "ADJUST", "EMPTY CYLINDERS", f"{location_id}:{product_id}", f"delta={delta} reason={reason}")
+        conn.commit()
+    except ValueError as e:
+        conn.rollback()
+        conn.close()
+        return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(ok=True)
 
 
 @app.post("/api/inventory/inbound")
@@ -1276,7 +1337,8 @@ def return_cylinder_deposit():
 
     conn.execute("UPDATE cylinder_deposits SET qty_on_loan=qty_on_loan-? WHERE customer_id=? AND product_id=?",
                  (qty, customer_id, product_id))
-    add_empty_cylinders(conn, location_id, product_id, qty, notes=f"Cylinder returned by customer {customer_id}")
+    add_empty_cylinders(conn, location_id, product_id, qty, "DEPOSIT RETURN", f"CUST-{customer_id}",
+                        notes=f"Cylinder returned by customer {customer_id}")
     audit(conn, "RETURN", "INVENTORY", f"{customer_id}:{product_id}", f"{qty} cylinder(s) returned")
     conn.commit()
     conn.close()
@@ -1318,7 +1380,15 @@ def manual_inventory_adjust():
     return jsonify(ok=True)
 
 
-def add_empty_cylinders(conn, location_id, product_id, qty, reference=None, notes=None):
+def _log_empty_movement(conn, location_id, product_id, qty_change, mtype, reference, notes):
+    conn.execute(
+        "INSERT INTO empty_cylinder_movements (location_id, product_id, qty_change, type, reference, user_id, notes) VALUES (?,?,?,?,?,?,?)",
+        (location_id, product_id, qty_change, mtype, reference,
+         session["user"]["id"] if session.get("user") else None, notes),
+    )
+
+
+def add_empty_cylinders(conn, location_id, product_id, qty, mtype="RETURNED", reference=None, notes=None):
     row = conn.execute(
         "SELECT quantity FROM empty_cylinder_inventory WHERE location_id=? AND product_id=?",
         (location_id, product_id),
@@ -1329,9 +1399,10 @@ def add_empty_cylinders(conn, location_id, product_id, qty, reference=None, note
     else:
         conn.execute("INSERT INTO empty_cylinder_inventory (location_id, product_id, quantity) VALUES (?,?,?)",
                      (location_id, product_id, qty))
+    _log_empty_movement(conn, location_id, product_id, qty, mtype, reference, notes)
 
 
-def remove_empty_cylinders(conn, location_id, product_id, qty):
+def remove_empty_cylinders(conn, location_id, product_id, qty, mtype="REMOVED", reference=None, notes=None):
     row = conn.execute(
         "SELECT quantity FROM empty_cylinder_inventory WHERE location_id=? AND product_id=?",
         (location_id, product_id),
@@ -1341,6 +1412,7 @@ def remove_empty_cylinders(conn, location_id, product_id, qty):
         raise ValueError(f"Only {current} empty cylinders on hand at this location")
     conn.execute("UPDATE empty_cylinder_inventory SET quantity=quantity-? WHERE location_id=? AND product_id=?",
                  (qty, location_id, product_id))
+    _log_empty_movement(conn, location_id, product_id, -qty, mtype, reference, notes)
 
 
 def record_cylinder_deposit(conn, customer_id, product_id, qty):
@@ -1465,8 +1537,8 @@ def create_sale():
             if sale_mode == "REFILL":
                 # Customer exchanges an empty cylinder for a full one — the empty
                 # comes back into our stock, ready to be hauled to the plant for refill.
-                add_empty_cylinders(conn, location_id, prod["id"], qty,
-                                     reference=sale_no, notes=f"Empty returned on refill sale {sale_no}")
+                add_empty_cylinders(conn, location_id, prod["id"], qty, "REFILL SALE",
+                                    reference=sale_no, notes=f"Empty returned on refill sale {sale_no}")
             else:
                 # DEPOSIT: customer takes a full cylinder with no exchange — no
                 # empty comes back, and the cylinder is now outstanding on loan
@@ -1530,9 +1602,9 @@ def list_sales():
     conn = get_db()
     sql = """SELECT s.*, l.name location_name, u2.name cashier_name, c.name customer_name
               FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u2 ON u2.id=s.user_id
-              LEFT JOIN customers c ON c.id=s.customer_id WHERE 1=1"""
+              LEFT JOIN customers c ON c.id=s.customer_id WHERE s.is_opening_balance=0"""
     params = []
-    if u["role"] != "ADMIN":
+    if u["role"] not in ("ADMIN", "ACCOUNTING"):
         sql += " AND s.location_id=?"
         params.append(u["location_id"])
     sql += " ORDER BY s.ts DESC LIMIT 100"
@@ -1600,11 +1672,11 @@ def list_receivables():
     for r in rows:
         recompute_receivable_status(conn, r["id"])
     conn.commit()
-    sql = """SELECT r.*, c.name customer_name, c.account_no, s.sale_no, s.location_id
+    sql = """SELECT r.*, c.name customer_name, c.account_no, s.sale_no, s.location_id, s.is_opening_balance
               FROM receivables r JOIN customers c ON c.id=r.customer_id JOIN sales s ON s.id=r.sale_id
               WHERE 1=1"""
     params = []
-    if u["role"] not in ("ADMIN", "MANAGER"):
+    if u["role"] not in ALL_LOCATION_FINANCE_ROLES:
         sql += " AND s.location_id=?"
         params.append(u["location_id"])
     sql += " ORDER BY r.due_date ASC"
@@ -1640,7 +1712,7 @@ def _build_aging_report(conn, u):
               FROM receivables r JOIN customers c ON c.id=r.customer_id JOIN sales s ON s.id=r.sale_id
               WHERE r.balance > 0.009"""
     params = []
-    if u["role"] not in ("ADMIN", "MANAGER"):
+    if u["role"] not in ALL_LOCATION_FINANCE_ROLES:
         sql += " AND s.location_id=?"
         params.append(u["location_id"])
     rows = conn.execute(sql, params).fetchall()
@@ -1696,7 +1768,7 @@ def export_receivables_aging():
 
 
 @app.post("/api/receivables/<int:rid>/pay")
-@roles_required("ADMIN", "MANAGER", "ATTENDANT")
+@roles_required("ADMIN", "MANAGER", "ATTENDANT", "ACCOUNTING")
 def pay_receivable(rid):
     d = request.get_json(force=True)
     amount = float(d["amount"])
@@ -1710,7 +1782,7 @@ def pay_receivable(rid):
     if not r:
         conn.close()
         return jsonify(error="Not found"), 404
-    if u["role"] not in ("ADMIN", "MANAGER") and r["sale_location_id"] != u["location_id"]:
+    if u["role"] not in ALL_LOCATION_FINANCE_ROLES and r["sale_location_id"] != u["location_id"]:
         conn.close()
         return jsonify(error="Forbidden: this receivable belongs to another location"), 403
     if amount <= 0 or amount > r["balance"] + 0.009:
@@ -1720,8 +1792,8 @@ def pay_receivable(rid):
     new_balance = round(r["balance"] - amount, 2)
     conn.execute("UPDATE receivables SET paid=?, balance=? WHERE id=?", (new_paid, new_balance, rid))
     conn.execute(
-        "INSERT INTO payments (sale_id, method, amount, reference, user_id) VALUES (?,?,?,?,?)",
-        (r["sale_id"], method, amount, d.get("reference", f"AR-{r['invoice_no']}"), session["user"]["id"]),
+        "INSERT INTO payments (sale_id, method, amount, reference, user_id, payment_source) VALUES (?,?,?,?,?,'AR_COLLECTION')",
+        (r["sale_id"], method, amount, d.get("reference") or f"AR-{r['invoice_no']}", session["user"]["id"]),
     )
     conn.execute("UPDATE sales SET paid = paid + ?, balance = balance - ? WHERE id=?",
                  (amount, amount, r["sale_id"]))
@@ -1732,6 +1804,168 @@ def pay_receivable(rid):
     return jsonify(ok=True, paid=new_paid, balance=new_balance)
 
 
+# ---------------------------------------------------------------- previous arrears (opening balances)
+# Lets Admin/Accounting load a customer's unpaid balance from before this
+# system went live. Each one is stored as a zero-item "opening balance" credit
+# sale + receivable, so it flows through Receivables, payments, the Aging
+# Report and the SOA exactly like any other invoice — but it's excluded from
+# sales totals/reports (it isn't a sale made in this system), and on the SOA
+# it rolls into the Beginning Balance instead of showing as a charge.
+
+ARREARS_ROLES = ("ADMIN", "ACCOUNTING")
+
+
+def _parse_date(value, field):
+    try:
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be a date in YYYY-MM-DD format")
+
+
+def _create_opening_balance(conn, customer, location_id, amount, as_of, due=None, reference=None, notes=None):
+    try:
+        amount = round(float(amount), 2)
+    except (TypeError, ValueError):
+        raise ValueError("amount must be a number")
+    if amount <= 0:
+        raise ValueError("amount must be greater than zero")
+    as_of_date = _parse_date(as_of, "as_of_date")
+    if as_of_date > datetime.now().date():
+        raise ValueError("as_of_date can't be in the future")
+    due_date = _parse_date(due, "due_date") if due else as_of_date + timedelta(days=customer["terms_days"] or 0)
+    if due_date < as_of_date:
+        raise ValueError("due_date can't be before as_of_date")
+    if not conn.execute("SELECT 1 FROM locations WHERE id=?", (location_id,)).fetchone():
+        raise ValueError("Unknown location")
+
+    reference = (reference or "").strip()
+    if reference:
+        if conn.execute("SELECT 1 FROM receivables WHERE invoice_no=?", (reference,)).fetchone():
+            raise ValueError(f"Invoice/reference '{reference}' already exists")
+        invoice_no = reference
+    else:
+        invoice_no = next_number(conn, "OB", "receivables", "invoice_no")
+
+    sale_no = next_number(conn, "OB", "sales", "sale_no")
+    note_text = "Previous arrears (opening balance)" + (f" — {notes.strip()}" if notes and notes.strip() else "")
+    cur = conn.execute(
+        """INSERT INTO sales (sale_no, ts, location_id, user_id, customer_id, sale_type, subtotal, discount, total,
+                              paid, balance, notes, is_opening_balance)
+           VALUES (?,?,?,?,?,'CREDIT',?,0,?,0,?,?,1)""",
+        (sale_no, f"{as_of_date} 00:00:00", location_id, session["user"]["id"], customer["id"],
+         amount, amount, amount, note_text),
+    )
+    sale_id = cur.lastrowid
+    cur = conn.execute(
+        """INSERT INTO receivables (sale_id, customer_id, invoice_no, invoice_date, due_date, amount, paid, balance, status)
+           VALUES (?,?,?,?,?,?,0,?,'CURRENT')""",
+        (sale_id, customer["id"], invoice_no, str(as_of_date), str(due_date), amount, amount),
+    )
+    rid = cur.lastrowid
+    recompute_receivable_status(conn, rid)
+    audit(conn, "CREATE", "RECEIVABLES", rid,
+          f"Previous arrears {invoice_no} for {customer['account_no']}: {amount:.2f} as of {as_of_date}")
+    return rid, invoice_no
+
+
+@app.post("/api/receivables/opening-balance")
+@roles_required(*ARREARS_ROLES)
+def create_opening_balance():
+    d = request.get_json(force=True)
+    conn = get_db()
+    try:
+        customer = conn.execute("SELECT * FROM customers WHERE id=?", (d.get("customer_id"),)).fetchone()
+        if not customer:
+            raise ValueError("Choose a customer")
+        rid, invoice_no = _create_opening_balance(
+            conn, customer, d.get("location_id"), d.get("amount"), d.get("as_of_date"),
+            d.get("due_date"), d.get("reference"), d.get("notes"))
+        conn.commit()
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(id=rid, invoice_no=invoice_no), 201
+
+
+@app.get("/api/receivables/opening-balance/template")
+@roles_required(*ARREARS_ROLES)
+def opening_balance_template():
+    csv_text = ("account_no,amount,as_of_date,due_date,reference,notes\n"
+                "ACC-00001,15000.00,2026-09-30,2026-10-30,OLD-INV-1234,Unpaid balance from old system\n")
+    return Response(csv_text, mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=previous-arrears-template.csv"})
+
+
+@app.post("/api/receivables/opening-balance/import")
+@roles_required(*ARREARS_ROLES)
+def import_opening_balances():
+    """All-or-nothing: if any row has an error, nothing is saved, so a
+    half-imported file can't leave balances doubled up on a retry."""
+    file = request.files.get("file")
+    location_id = request.form.get("location_id", type=int)
+    if not file:
+        return jsonify(error="No file uploaded"), 400
+    if not location_id:
+        return jsonify(error="Choose the location these arrears belong to"), 400
+    try:
+        reader = csv.DictReader(io.StringIO(decode_csv_upload(file.read())))
+    except Exception as e:
+        return jsonify(error=f"Could not read CSV: {e}"), 400
+
+    conn = get_db()
+    created, errors, total = 0, [], 0.0
+    for i, row in enumerate(reader, start=2):
+        row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+        if not any(row.values()):
+            continue
+        try:
+            account_no = row.get("account_no", "")
+            if not account_no:
+                raise ValueError("account_no is required")
+            customer = conn.execute("SELECT * FROM customers WHERE account_no=?", (account_no,)).fetchone()
+            if not customer:
+                raise ValueError(f"no customer with account_no '{account_no}'")
+            amount = (row.get("amount") or "").replace(",", "")
+            _create_opening_balance(conn, customer, location_id, amount, row.get("as_of_date"),
+                                    row.get("due_date") or None, row.get("reference"), row.get("notes"))
+            created += 1
+            total += float(amount)
+        except ValueError as e:
+            errors.append(f"Row {i}: {e}")
+    if errors:
+        conn.rollback()
+        conn.close()
+        return jsonify(created=0, errors=errors, total=0), 400
+    if created:
+        audit(conn, "IMPORT", "RECEIVABLES", None, f"{created} previous-arrears rows imported, total {total:.2f}")
+        conn.commit()
+    conn.close()
+    return jsonify(created=created, errors=[], total=round(total, 2))
+
+
+@app.delete("/api/receivables/<int:rid>/opening-balance")
+@roles_required(*ARREARS_ROLES)
+def delete_opening_balance(rid):
+    """Undo a mistaken arrears upload. Only allowed while nothing has been paid on it."""
+    conn = get_db()
+    r = conn.execute(
+        "SELECT r.*, s.is_opening_balance FROM receivables r JOIN sales s ON s.id=r.sale_id WHERE r.id=?", (rid,)
+    ).fetchone()
+    if not r:
+        conn.close(); return jsonify(error="Not found"), 404
+    if not r["is_opening_balance"]:
+        conn.close(); return jsonify(error="Only previous-arrears entries can be removed here"), 400
+    if r["paid"] > 0 or conn.execute("SELECT 1 FROM payments WHERE sale_id=?", (r["sale_id"],)).fetchone():
+        conn.close(); return jsonify(error="Payments have already been recorded against this — it can't be removed"), 400
+    conn.execute("DELETE FROM receivables WHERE id=?", (rid,))
+    conn.execute("DELETE FROM sales WHERE id=?", (r["sale_id"],))
+    audit(conn, "DELETE", "RECEIVABLES", rid, f"Removed previous arrears {r['invoice_no']} ({r['amount']:.2f})")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
 # ---------------------------------------------------------------- transfers (dispatch-lite)
 
 @app.get("/api/transfers")
@@ -1739,8 +1973,10 @@ def pay_receivable(rid):
 def list_transfers():
     conn = get_db()
     rows = conn.execute(
-        """SELECT t.*, lf.name from_name, lt.name to_name FROM transfers t
-           JOIN locations lf ON lf.id=t.from_location JOIN locations lt ON lt.id=t.to_location
+        """SELECT t.*, lf.name from_name,
+                  COALESCE(lt.name, 'Plant: ' || COALESCE(t.to_external, '')) to_name
+           FROM transfers t
+           JOIN locations lf ON lf.id=t.from_location LEFT JOIN locations lt ON lt.id=t.to_location
            ORDER BY t.ts DESC LIMIT 100"""
     ).fetchall()
     out = []
@@ -1757,24 +1993,53 @@ def list_transfers():
 @app.post("/api/transfers")
 @roles_or_module_required("ADMIN", "DISPATCHER", module="transfers")
 def create_transfer():
+    """Dispatch full and/or empty cylinders from one location to another
+    location, or empties out to a plant for refilling (to_external)."""
     d = request.get_json(force=True)
     items = d.get("items") or []
     if not items:
         return jsonify(error="No items to transfer"), 400
+    from_location = d.get("from_location")
+    to_location = d.get("to_location") or None
+    to_external = (d.get("to_external") or "").strip() or None
+    if not from_location:
+        return jsonify(error="Origin location is required"), 400
+    if not to_location and not to_external:
+        return jsonify(error="Choose a destination location or enter the plant name"), 400
+    if to_location and str(to_location) == str(from_location):
+        return jsonify(error="Origin and destination must differ"), 400
+    if to_location:
+        to_external = None
+
     conn = get_db()
     try:
         transfer_no = next_number(conn, "DISP", "transfers", "transfer_no")
         cur = conn.execute(
-            "INSERT INTO transfers (transfer_no, from_location, to_location, status, user_id) VALUES (?,?,?,?,?)",
-            (transfer_no, d["from_location"], d["to_location"], "RELEASED", session["user"]["id"]),
+            "INSERT INTO transfers (transfer_no, from_location, to_location, to_external, status, user_id) VALUES (?,?,?,?,?,?)",
+            (transfer_no, from_location, to_location, to_external, "RELEASED", session["user"]["id"]),
         )
         tid = cur.lastrowid
+        dest_label = to_external and f"plant {to_external}" or f"location {to_location}"
         for it in items:
-            qty = int(it["qty"])
-            conn.execute("INSERT INTO transfer_items (transfer_id, product_id, qty) VALUES (?,?,?)",
-                         (tid, it["product_id"], qty))
-            adjust_inventory(conn, d["from_location"], it["product_id"], -qty, "TRANSFER OUT", transfer_no)
-        audit(conn, "CREATE", "TRANSFERS", tid, transfer_no)
+            try:
+                qty = int(it["qty"])
+            except (TypeError, ValueError, KeyError):
+                raise ValueError("Each item needs a whole-number quantity")
+            if qty <= 0:
+                raise ValueError("Quantities must be positive")
+            state = (it.get("cylinder_state") or "FULL").upper()
+            if state not in ("FULL", "EMPTY"):
+                raise ValueError("cylinder_state must be FULL or EMPTY")
+            if to_external and state != "EMPTY":
+                raise ValueError("Only empty cylinders can be dispatched to a plant")
+            conn.execute("INSERT INTO transfer_items (transfer_id, product_id, qty, cylinder_state) VALUES (?,?,?,?)",
+                         (tid, it["product_id"], qty, state))
+            if state == "EMPTY":
+                remove_empty_cylinders(conn, from_location, it["product_id"], qty, "DISPATCH OUT", transfer_no,
+                                       notes=f"Empties dispatched to {dest_label}")
+            else:
+                adjust_inventory(conn, from_location, it["product_id"], -qty, "TRANSFER OUT", transfer_no)
+        audit(conn, "CREATE", "TRANSFERS", tid, transfer_no + (f" to plant {to_external}" if to_external else ""))
         conn.commit()
     except ValueError as e:
         conn.rollback(); conn.close()
@@ -1793,8 +2058,15 @@ def receive_transfer(tid):
     if t["status"] != "RELEASED":
         conn.close(); return jsonify(error=f"Transfer already {t['status']}"), 400
     items = conn.execute("SELECT * FROM transfer_items WHERE transfer_id=?", (tid,)).fetchall()
-    for it in items:
-        adjust_inventory(conn, t["to_location"], it["product_id"], it["qty"], "TRANSFER IN", t["transfer_no"])
+    # A dispatch to a plant leaves the system — "received" only confirms the
+    # plant got the empties; nothing is added to any of our locations.
+    if t["to_location"]:
+        for it in items:
+            if it["cylinder_state"] == "EMPTY":
+                add_empty_cylinders(conn, t["to_location"], it["product_id"], it["qty"], "DISPATCH IN",
+                                    t["transfer_no"], notes="Empties received from dispatch")
+            else:
+                adjust_inventory(conn, t["to_location"], it["product_id"], it["qty"], "TRANSFER IN", t["transfer_no"])
     conn.execute("UPDATE transfers SET status='RECEIVED', received_by=?, received_ts=datetime('now') WHERE id=?",
                  (session["user"]["id"], tid))
     audit(conn, "RECEIVE", "TRANSFERS", tid, t["transfer_no"])
@@ -1810,19 +2082,29 @@ def receive_transfer(tid):
 def dashboard():
     u = session["user"]
     conn = get_db()
-    loc_filter = "" if u["role"] == "ADMIN" else "AND location_id=?"
-    params = [] if u["role"] == "ADMIN" else [u["location_id"]]
+    all_locations = u["role"] in ALL_LOCATION_FINANCE_ROLES
+    loc_filter = "" if all_locations else "AND location_id=?"
+    params = [] if all_locations else [u["location_id"]]
 
     today_sales = conn.execute(
-        f"SELECT COALESCE(SUM(total),0) t, COUNT(*) c FROM sales WHERE status='COMPLETED' AND date(ts)=date('now') {loc_filter}",
+        f"SELECT COALESCE(SUM(total),0) t, COUNT(*) c FROM sales WHERE status='COMPLETED' AND is_opening_balance=0 "
+        f"AND date(ts)=date('now') {loc_filter}",
         params,
     ).fetchone()
-    outstanding = conn.execute("SELECT COALESCE(SUM(balance),0) b FROM receivables WHERE status!='PAID'").fetchone()
-    overdue = conn.execute("SELECT COALESCE(SUM(balance),0) b FROM receivables WHERE status='OVERDUE'").fetchone()
+    # Receivables totals are sensitive — only Admin/Accounting get them, and
+    # they're withheld server-side (not just hidden in the UI).
+    show_receivables = can_view_receivables_summary(conn, u["role"])
+    outstanding_total = overdue_total = None
+    if show_receivables:
+        for r in conn.execute("SELECT id FROM receivables WHERE status!='PAID'").fetchall():
+            recompute_receivable_status(conn, r["id"])
+        conn.commit()
+        outstanding_total = conn.execute("SELECT COALESCE(SUM(balance),0) b FROM receivables WHERE status!='PAID'").fetchone()["b"]
+        overdue_total = conn.execute("SELECT COALESCE(SUM(balance),0) b FROM receivables WHERE status='OVERDUE'").fetchone()["b"]
     low_stock = conn.execute(
         """SELECT p.name, l.name location_name, i.quantity, p.min_stock
            FROM inventory i JOIN products p ON p.id=i.product_id JOIN locations l ON l.id=i.location_id
-           WHERE i.quantity <= p.min_stock""" + (" AND l.id=?" if u["role"] != "ADMIN" else ""),
+           WHERE i.quantity <= p.min_stock""" + ("" if all_locations else " AND l.id=?"),
         params,
     ).fetchall()
 
@@ -1853,7 +2135,8 @@ def dashboard():
     conn.close()
     return jsonify(
         today_sales_total=today_sales["t"], today_sales_count=today_sales["c"],
-        outstanding_receivables=outstanding["b"], overdue_receivables=overdue["b"],
+        show_receivables=show_receivables,
+        outstanding_receivables=outstanding_total, overdue_receivables=overdue_total,
         low_stock=[dict(r) for r in low_stock],
         payments_by_method=[dict(r) for r in by_method],
         payments_total=payments_total,
@@ -1878,7 +2161,7 @@ def _sales_report_rows(date_from, date_to):
                             CASE WHEN si.sale_mode='DEPOSIT' THEN ' (deposit)' ELSE '' END, '; ')
                      FROM sale_items si WHERE si.sale_id = s.id) items_summary
              FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u ON u.id=s.user_id
-             LEFT JOIN customers c ON c.id=s.customer_id WHERE 1=1"""
+             LEFT JOIN customers c ON c.id=s.customer_id WHERE s.is_opening_balance=0"""
     params = []
     if date_from:
         sql += " AND date(s.ts) >= date(?)"; params.append(date_from)
@@ -1966,6 +2249,154 @@ def export_receivables_report():
     if fmt == "pdf":
         return pdf_table_response("Accounts Receivable", headers, data, f"receivables-{stamp}.pdf")
     return xlsx_response(headers, data, f"receivables-{stamp}.xlsx", "Receivables")
+
+
+# ---------------------------------------------------------------- end of day report
+# Per-attendant cash-up: everything they collected on a given day, totalled
+# by payment method (Cash, GCash, Bank Transfer, ...), split between POS
+# sales and collections on receivables. Attendants only ever see their own;
+# Admin/Manager/Accounting can pick any staff member (or everyone).
+
+EOD_SUPERVISOR_ROLES = ("ADMIN", "MANAGER", "ACCOUNTING")
+
+
+def _build_eod_report(conn, u, report_date, user_id=None, location_id=None):
+    if u["role"] not in EOD_SUPERVISOR_ROLES:
+        user_id = u["id"]
+        location_id = None
+
+    where = ["date(p.ts) = date(?)", "s.status = 'COMPLETED'"]
+    params = [report_date]
+    if user_id:
+        where.append("p.user_id = ?"); params.append(user_id)
+    if location_id:
+        where.append("s.location_id = ?"); params.append(location_id)
+    payments = conn.execute(
+        f"""SELECT p.id, p.ts, p.method, p.amount, p.reference, p.payment_source,
+                   s.sale_no, s.sale_type, c.name customer_name, uu.name collected_by, l.name location_name,
+                   (SELECT r.invoice_no FROM receivables r WHERE r.sale_id = s.id) invoice_no
+            FROM payments p JOIN sales s ON s.id = p.sale_id
+            LEFT JOIN customers c ON c.id = s.customer_id
+            LEFT JOIN users uu ON uu.id = p.user_id
+            JOIN locations l ON l.id = s.location_id
+            WHERE {' AND '.join(where)} ORDER BY p.ts""",
+        params,
+    ).fetchall()
+
+    by_method = {}
+    for p in payments:
+        m = by_method.setdefault(p["method"], {"method": p["method"], "sales": 0.0, "collections": 0.0,
+                                                "total": 0.0, "count": 0})
+        key = "collections" if p["payment_source"] == "AR_COLLECTION" else "sales"
+        m[key] = round(m[key] + p["amount"], 2)
+        m["total"] = round(m["total"] + p["amount"], 2)
+        m["count"] += 1
+    methods = sorted(by_method.values(), key=lambda m: -m["total"])
+    totals = {
+        "sales": round(sum(m["sales"] for m in methods), 2),
+        "collections": round(sum(m["collections"] for m in methods), 2),
+        "total": round(sum(m["total"] for m in methods), 2),
+        "count": sum(m["count"] for m in methods),
+    }
+
+    # Sales rung up that day (by cashier), incl. what was charged to accounts.
+    s_where = ["date(s.ts) = date(?)", "s.is_opening_balance = 0"]
+    s_params = [report_date]
+    if user_id:
+        s_where.append("s.user_id = ?"); s_params.append(user_id)
+    if location_id:
+        s_where.append("s.location_id = ?"); s_params.append(location_id)
+    sw = " AND ".join(s_where)
+    sales = conn.execute(
+        f"""SELECT
+              COALESCE(SUM(CASE WHEN status='COMPLETED' THEN 1 END),0) count,
+              COALESCE(SUM(CASE WHEN status='COMPLETED' THEN total END),0) total,
+              COALESCE(SUM(CASE WHEN status='COMPLETED' THEN discount END),0) discount,
+              COALESCE(SUM(CASE WHEN status='COMPLETED' AND sale_type='CASH' THEN total END),0) cash_sales,
+              COALESCE(SUM(CASE WHEN status='COMPLETED' AND sale_type='CREDIT' THEN total END),0) credit_sales,
+              COALESCE(SUM(CASE WHEN status='VOIDED' THEN 1 END),0) voided_count,
+              COALESCE(SUM(CASE WHEN status='VOIDED' THEN total END),0) voided_total
+            FROM sales s WHERE {sw}""",
+        s_params,
+    ).fetchone()
+    paid_at_sale = conn.execute(
+        f"""SELECT COALESCE(SUM(p.amount),0) a FROM payments p JOIN sales s ON s.id=p.sale_id
+            WHERE {sw} AND s.status='COMPLETED' AND p.payment_source='SALE'""",
+        s_params,
+    ).fetchone()["a"]
+    sales_summary = {k: (round(sales[k], 2) if isinstance(sales[k], float) else sales[k]) for k in sales.keys()}
+    sales_summary["charged_to_accounts"] = round(sales["total"] - paid_at_sale, 2)
+
+    items = conn.execute(
+        f"""SELECT si.product_name, si.sale_mode, SUM(si.qty) qty, SUM(si.subtotal) amount
+            FROM sale_items si JOIN sales s ON s.id = si.sale_id
+            WHERE {sw} AND s.status='COMPLETED'
+            GROUP BY si.product_name, si.sale_mode ORDER BY si.product_name""",
+        s_params,
+    ).fetchall()
+
+    staff_name, location_name = "All staff", None
+    if user_id:
+        row = conn.execute("SELECT u.name, l.name location_name FROM users u LEFT JOIN locations l ON l.id=u.location_id WHERE u.id=?",
+                           (user_id,)).fetchone()
+        if row:
+            staff_name, location_name = row["name"], row["location_name"]
+    if location_id:
+        row = conn.execute("SELECT name FROM locations WHERE id=?", (location_id,)).fetchone()
+        location_name = row["name"] if row else location_name
+
+    return {
+        "date": report_date, "user_id": user_id, "staff_name": staff_name,
+        "location_id": location_id, "location_name": location_name,
+        "methods": methods, "totals": totals, "sales": sales_summary,
+        "items": [dict(i) for i in items],
+        "payments": [dict(p) for p in payments],
+        "generated_by": u["name"],
+    }
+
+
+def _eod_args():
+    report_date = request.args.get("date") or datetime.now().strftime("%Y-%m-%d")
+    _parse_date(report_date, "date")
+    return report_date, request.args.get("user_id", type=int), request.args.get("location_id", type=int)
+
+
+@app.get("/api/reports/end-of-day")
+@roles_or_module_required("ADMIN", "MANAGER", "ACCOUNTING", "ATTENDANT", module="eod_report")
+def end_of_day_report():
+    u = session["user"]
+    try:
+        report_date, user_id, location_id = _eod_args()
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    conn = get_db()
+    data = _build_eod_report(conn, u, report_date, user_id, location_id)
+    if u["role"] in EOD_SUPERVISOR_ROLES:
+        data["staff"] = [dict(r) for r in conn.execute(
+            "SELECT id, name, role, location_id FROM users WHERE active=1 ORDER BY name").fetchall()]
+        data["can_pick_staff"] = True
+    else:
+        data["can_pick_staff"] = False
+    conn.close()
+    return jsonify(data)
+
+
+@app.get("/api/reports/end-of-day/export")
+@roles_or_module_required("ADMIN", "MANAGER", "ACCOUNTING", "ATTENDANT", module="eod_report")
+def export_end_of_day_report():
+    u = session["user"]
+    try:
+        report_date, user_id, location_id = _eod_args()
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    conn = get_db()
+    data = _build_eod_report(conn, u, report_date, user_id, location_id)
+    conn.close()
+    slug = "".join(ch for ch in data["staff_name"].lower().replace(" ", "-") if ch.isalnum() or ch == "-")
+    fname = f"end-of-day-{report_date}-{slug}"
+    if request.args.get("format") == "xlsx":
+        return eod_xlsx_response(data, fname + ".xlsx")
+    return eod_pdf_response(data, fname + ".pdf")
 
 
 # ---------------------------------------------------------------- users (admin)
@@ -2815,7 +3246,7 @@ def employee_kpi():
                      COALESCE(AVG(s.total),0) avg_sale_value,
                      COALESCE(SUM((SELECT SUM(qty) FROM sale_items si WHERE si.sale_id=s.id)),0) total_items_sold
               FROM users u LEFT JOIN locations l ON l.id=u.location_id
-              LEFT JOIN sales s ON s.user_id=u.id AND s.status='COMPLETED'"""
+              LEFT JOIN sales s ON s.user_id=u.id AND s.status='COMPLETED' AND s.is_opening_balance=0"""
     params = []
     conds = []
     if date_from:
