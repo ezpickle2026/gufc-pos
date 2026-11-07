@@ -1582,6 +1582,192 @@ def delete_discount(did):
     return jsonify(ok=True)
 
 
+# ---------------------------------------------------------------- system reset (go live)
+#
+# Used once, when testing is over and the client starts real operations.
+# Always wipes every transaction and zeroes stock; setup data (locations,
+# products, roles, customer categories) is kept so nothing has to be
+# re-encoded. Customers, other user accounts, employees/vehicles and
+# discounts can optionally be wiped too. A full copy of the database is
+# saved next to it before anything is deleted.
+
+# Child tables first so foreign keys never block a delete.
+RESET_TRANSACTION_TABLES = [
+    "payments", "receivables", "sale_items",
+    "commercial_delivery_cylinders", "commercial_deliveries",
+    "sales",
+    "inventory_movements", "empty_cylinder_movements", "cylinder_deposits",
+    "transfer_items", "transfers",
+    "hauling_schedule_items", "hauling_schedule",
+    "booked_order_items", "booked_orders",
+    "incident_report_attachments", "incident_reports",
+    "staff_schedule",
+    "audit_logs",
+]
+
+
+def _reset_counts(conn):
+    def c(sql):
+        return conn.execute(sql).fetchone()[0]
+    me = session["user"]["id"]
+    return {
+        "sales": c("SELECT COUNT(*) FROM sales"),
+        "payments": c("SELECT COUNT(*) FROM payments"),
+        "receivables": c("SELECT COUNT(*) FROM receivables"),
+        "transfers": c("SELECT COUNT(*) FROM transfers"),
+        "inventory_movements": c("SELECT COUNT(*) FROM inventory_movements"),
+        "stock_on_hand": c("SELECT COALESCE(SUM(quantity),0) FROM inventory"),
+        "empties_on_hand": c("SELECT COALESCE(SUM(quantity),0) FROM empty_cylinder_inventory"),
+        "booked_orders": c("SELECT COUNT(*) FROM booked_orders"),
+        "commercial_deliveries": c("SELECT COUNT(*) FROM commercial_deliveries"),
+        "hauling": c("SELECT COUNT(*) FROM hauling_schedule"),
+        "incident_reports": c("SELECT COUNT(*) FROM incident_reports"),
+        "staff_schedule": c("SELECT COUNT(*) FROM staff_schedule"),
+        "audit_logs": c("SELECT COUNT(*) FROM audit_logs"),
+        "customers": c("SELECT COUNT(*) FROM customers"),
+        "other_users": conn.execute("SELECT COUNT(*) FROM users WHERE id<>?", (me,)).fetchone()[0],
+        "employees": c("SELECT COUNT(*) FROM employees"),
+        "vehicles": c("SELECT COUNT(*) FROM vehicles"),
+        "discounts": c("SELECT COUNT(*) FROM discounts"),
+        "products": c("SELECT COUNT(*) FROM products"),
+        "locations": c("SELECT COUNT(*) FROM locations"),
+    }
+
+
+def _backup_database(dest_path):
+    """Consistent copy of the live DB (safe even while other requests run)."""
+    from db import DB_PATH
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(dest_path)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
+
+@app.get("/api/admin/reset-summary")
+@roles_required("ADMIN")
+def reset_summary():
+    conn = get_db()
+    counts = _reset_counts(conn)
+    conn.close()
+    return jsonify(counts)
+
+
+@app.get("/api/admin/backup")
+@roles_required("ADMIN")
+def download_backup():
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        _backup_database(tmp)
+        with open(tmp, "rb") as f:
+            data = f.read()
+    finally:
+        os.remove(tmp)
+    fname = f"gufc-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+    return Response(data, mimetype="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+@app.post("/api/admin/reset")
+@roles_required("ADMIN")
+def system_reset():
+    from db import DB_PATH
+    d = request.get_json(force=True) or {}
+    if (d.get("confirm_text") or "").strip().upper() != "RESET":
+        return jsonify(error='Type RESET in the confirmation box to continue'), 400
+    opts = d.get("options") or {}
+    wipe_customers = bool(opts.get("customers"))
+    wipe_users = bool(opts.get("users"))
+    wipe_staff_fleet = bool(opts.get("employees_vehicles"))
+    wipe_discounts = bool(opts.get("discounts"))
+
+    me = session["user"]
+    conn = get_db()
+    row = conn.execute("SELECT password_hash FROM users WHERE id=?", (me["id"],)).fetchone()
+    if not row or not check_password_hash(row["password_hash"], d.get("password") or ""):
+        conn.close()
+        return jsonify(error="Incorrect admin password"), 403
+
+    before = _reset_counts(conn)
+    conn.close()
+
+    # Safety net: full copy of the database before anything is deleted.
+    backup_path = f"{DB_PATH}.before-reset-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak"
+    try:
+        _backup_database(backup_path)
+    except Exception as e:  # never wipe data if we couldn't back it up
+        return jsonify(error=f"Could not create a backup, nothing was deleted: {e}"), 500
+
+    conn = get_db()
+    try:
+        conn.execute("BEGIN")
+        for t in RESET_TRANSACTION_TABLES:
+            conn.execute(f"DELETE FROM {t}")
+        # Stock starts at zero; real opening stock is encoded via Inventory → Adjust Stock.
+        conn.execute("UPDATE inventory SET quantity=0")
+        conn.execute("UPDATE empty_cylinder_inventory SET quantity=0")
+
+        if wipe_staff_fleet:
+            conn.execute("DELETE FROM employees")
+            conn.execute("DELETE FROM vehicles")
+        else:
+            conn.execute("UPDATE vehicles SET status='AVAILABLE' WHERE status IN ('DISPATCHED','IN TRANSIT')")
+
+        if wipe_users:
+            conn.execute("UPDATE employees SET linked_user_id=NULL WHERE linked_user_id<>?", (me["id"],))
+            conn.execute("DELETE FROM users WHERE id<>?", (me["id"],))
+
+        if wipe_customers:
+            conn.execute("DELETE FROM customers")
+
+        if wipe_discounts:
+            conn.execute("DELETE FROM discounts")
+
+        # Restart auto-number counters for every emptied table.
+        emptied = list(RESET_TRANSACTION_TABLES)
+        if wipe_staff_fleet:
+            emptied += ["employees", "vehicles"]
+        if wipe_customers:
+            emptied.append("customers")
+        if wipe_discounts:
+            emptied.append("discounts")
+        conn.executemany("DELETE FROM sqlite_sequence WHERE name=?", [(t,) for t in emptied])
+
+        wiped = ["transactions", "stock"]
+        if wipe_customers:
+            wiped.append("customers")
+        if wipe_users:
+            wiped.append("other users")
+        if wipe_staff_fleet:
+            wiped.append("employees & vehicles")
+        if wipe_discounts:
+            wiped.append("discounts")
+        audit(conn, "RESET", "SYSTEM", None,
+              f"Go-live reset: cleared {', '.join(wiped)}. "
+              f"Before: {before['sales']} sales, {before['transfers']} transfers, "
+              f"{before['customers']} customers. Backup: {os.path.basename(backup_path)}")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return jsonify(error=f"Reset failed, nothing was changed: {e}"), 500
+    conn.close()
+
+    try:  # reclaim disk space from the deleted rows (non-critical)
+        v = get_db()
+        v.isolation_level = None
+        v.execute("VACUUM")
+        v.close()
+    except Exception:
+        pass
+
+    return jsonify(ok=True, backup_file=os.path.basename(backup_path), before=before)
+
+
 # ---------------------------------------------------------------- POS / sales
 
 @app.post("/api/sales")

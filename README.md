@@ -32,6 +32,18 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **System Reset (Go Live)** (Reports & Admin → System Reset, Admin only). Run this
+  once when testing is over, before the client starts real operations. It always
+  clears every transaction (sales, payments, receivables/arrears, transfers,
+  inventory ledger, cylinder deposits, booked orders, commercial deliveries,
+  hauling, incident reports, staff schedule, audit log) and sets all stock to 0.
+  It keeps locations, products/prices, roles, customer categories and the admin
+  account doing the reset. Optional checkboxes also clear customers, all other user
+  accounts (e.g. the demo logins), employees & vehicles, and discounts. Requires
+  typing `RESET` plus the admin password, and saves a full backup copy of the
+  database next to it (`<db>.before-reset-<timestamp>.bak`) before deleting
+  anything. A "Download backup" button is also on the page.
+
 - **Discounts & Promos settings** (Reports & Admin → Discounts & Promos, Admin/Manager).
   Create named discounts as **% off** or **₱ off per unit**, for **all items** or one
   specific product, with an optional minimum qty and start/end dates. In POS each
