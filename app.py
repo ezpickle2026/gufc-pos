@@ -9,7 +9,8 @@ from flask import Flask, request, jsonify, session, send_from_directory, Respons
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from db import get_db, init_db
-from reports import xlsx_response, pdf_table_response, soa_pdf_response, commercial_billing_pdf, eod_pdf_response, eod_xlsx_response
+from reports import (xlsx_response, pdf_table_response, soa_pdf_response, commercial_billing_pdf, eod_pdf_response,
+                     eod_xlsx_response, swapped_pdf_response, swapped_xlsx_response)
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
@@ -2831,6 +2832,92 @@ def export_receivables_report():
     if fmt == "pdf":
         return pdf_table_response("Accounts Receivable", headers, data, f"receivables-{stamp}.pdf", landscape_mode=True)
     return xlsx_response(headers, data, f"receivables-{stamp}.xlsx", "Receivables")
+
+
+# ---------------------------------------------------------------- swapped cylinder report
+# Every other-brand cylinder taken in on a SWAP sale, plus totals per brand /
+# size and what's still on hand (not yet dispatched to the plant).
+
+def _build_swapped_report(conn, date_from=None, date_to=None, location_id=None):
+    where = ["si.sale_mode = 'SWAP'", "s.status = 'COMPLETED'", "s.is_opening_balance = 0"]
+    params = []
+    if date_from:
+        where.append("date(s.ts) >= date(?)"); params.append(date_from)
+    if date_to:
+        where.append("date(s.ts) <= date(?)"); params.append(date_to)
+    if location_id:
+        where.append("s.location_id = ?"); params.append(location_id)
+    rows = conn.execute(
+        f"""SELECT s.ts, s.sale_no, l.name location_name, u.name cashier, c.name customer_name,
+                   COALESCE(NULLIF(si.swap_brand,''), 'Unspecified') swap_brand, si.product_name,
+                   si.qty, COALESCE(si.swap_fee,0) swap_fee, ROUND(COALESCE(si.swap_fee,0) * si.qty, 2) swap_fee_total,
+                   si.subtotal amount
+            FROM sale_items si JOIN sales s ON s.id = si.sale_id
+            JOIN locations l ON l.id = s.location_id JOIN users u ON u.id = s.user_id
+            LEFT JOIN customers c ON c.id = s.customer_id
+            WHERE {' AND '.join(where)} ORDER BY s.ts DESC, si.id""",
+        params,
+    ).fetchall()
+    rows = [dict(r) for r in rows]
+
+    summary = {}
+    for r in rows:
+        k = (r["swap_brand"], r["product_name"])
+        sm = summary.setdefault(k, {"swap_brand": k[0], "product_name": k[1], "qty": 0, "swap_fees": 0.0, "amount": 0.0})
+        sm["qty"] += r["qty"]
+        sm["swap_fees"] = round(sm["swap_fees"] + r["swap_fee_total"], 2)
+        sm["amount"] = round(sm["amount"] + (r["amount"] or 0), 2)
+    summary = sorted(summary.values(), key=lambda x: (x["swap_brand"], x["product_name"]))
+
+    oh_sql = """SELECT l.name location_name, s.brand, p.name product_name, s.quantity
+                FROM swapped_empty_inventory s JOIN locations l ON l.id=s.location_id
+                JOIN products p ON p.id=s.product_id WHERE s.quantity <> 0"""
+    oh_params = []
+    if location_id:
+        oh_sql += " AND s.location_id = ?"; oh_params.append(location_id)
+    on_hand = [dict(r) for r in conn.execute(oh_sql + " ORDER BY l.name, s.brand, p.name", oh_params).fetchall()]
+
+    location_name = None
+    if location_id:
+        row = conn.execute("SELECT name FROM locations WHERE id=?", (location_id,)).fetchone()
+        location_name = row["name"] if row else None
+    return {
+        "date_from": date_from, "date_to": date_to, "location_id": location_id, "location_name": location_name,
+        "rows": rows, "summary": summary, "on_hand": on_hand,
+        "totals": {"qty": sum(r["qty"] for r in rows),
+                   "swap_fees": round(sum(r["swap_fee_total"] for r in rows), 2),
+                   "amount": round(sum((r["amount"] or 0) for r in rows), 2),
+                   "on_hand": sum(r["quantity"] for r in on_hand)},
+    }
+
+
+def _swapped_args():
+    return request.args.get("from") or None, request.args.get("to") or None, request.args.get("location_id", type=int)
+
+
+@app.get("/api/reports/swapped")
+@roles_or_module_required("ADMIN", "MANAGER", module="reports")
+def report_swapped():
+    conn = get_db()
+    data = _build_swapped_report(conn, *_swapped_args())
+    conn.close()
+    return jsonify(data)
+
+
+@app.get("/api/reports/swapped/export")
+@roles_or_module_required("ADMIN", "MANAGER", module="reports")
+def export_swapped_report():
+    fmt = request.args.get("format", "xlsx")
+    conn = get_db()
+    data = _build_swapped_report(conn, *_swapped_args())
+    conn.close()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    subtitle = f"{data['date_from'] or 'All dates'} to {data['date_to'] or 'present'}"
+    if data["location_name"]:
+        subtitle += f" — {data['location_name']}"
+    if fmt == "pdf":
+        return swapped_pdf_response(data, subtitle, f"swapped-cylinders-{stamp}.pdf")
+    return swapped_xlsx_response(data, subtitle, f"swapped-cylinders-{stamp}.xlsx")
 
 
 # ---------------------------------------------------------------- end of day report
