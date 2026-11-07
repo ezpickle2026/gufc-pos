@@ -2039,12 +2039,14 @@ def create_sale():
 
         balance = round(total - paid_total, 2)
         sale_no = next_number(conn, "SALE", "sales", "sale_no")
+        # Credit / terms sales get a Delivery Receipt number the customer signs against.
+        dr_no = next_number(conn, "DR", "sales", "dr_no") if sale_type == "CREDIT" else None
 
         cur = conn.execute(
-            """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance, notes)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance, notes, dr_no)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (sale_no, location_id, u["id"], customer_id, sale_type, subtotal, discount, total,
-             paid_total, balance, d.get("notes", "")),
+             paid_total, balance, d.get("notes", ""), dr_no),
         )
         sale_id = cur.lastrowid
 
@@ -2115,9 +2117,13 @@ def create_sale():
 def get_sale_detail(sale_id):
     conn = get_db()
     sale = conn.execute(
-        """SELECT s.*, l.name location_name, u.name cashier_name, c.name customer_name, c.account_no
+        """SELECT s.*, l.name location_name, l.address location_address, u.name cashier_name,
+                  c.name customer_name, c.account_no, c.business_name customer_business_name,
+                  c.address customer_address, c.phone customer_phone, c.terms_days customer_terms_days,
+                  r.invoice_no, r.due_date
            FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u ON u.id=s.user_id
-           LEFT JOIN customers c ON c.id=s.customer_id WHERE s.id=?""", (sale_id,)
+           LEFT JOIN customers c ON c.id=s.customer_id
+           LEFT JOIN receivables r ON r.sale_id=s.id WHERE s.id=?""", (sale_id,)
     ).fetchone()
     items = conn.execute("SELECT * FROM sale_items WHERE sale_id=?", (sale_id,)).fetchall()
     pays = conn.execute("SELECT * FROM payments WHERE sale_id=?", (sale_id,)).fetchall()

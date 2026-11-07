@@ -32,6 +32,18 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Delivery Receipt for credit / terms sales.** Every CREDIT sale now gets its own
+  DR number (`DR-YYYYMMDD-####`). Right after a credit sale is completed, the
+  Delivery Receipt prints instead of the small cash receipt: one letter-size page
+  with a Customer's Copy and an Office Copy (cut line in between). It shows the
+  customer, business name, address, contact no., terms, due date, sale / invoice
+  reference, the items (qty, description, unit price, amount, with refill / deposit
+  / swap / discount notes), total, amount paid, balance charged to the account, and
+  signature lines for Prepared by, Delivered by and Received by. Reprint it any time
+  from Sales (the **DR** button, or **Print Delivery Receipt** in the sale view).
+  Voided sales print with a VOID mark. Existing credit sales were given DR numbers
+  automatically.
+
 - **Swapped Cylinder Report** (Reports → Swapped Cylinder Report, Admin/Manager).
   Every other-brand cylinder taken in on a swap sale, with filters for date range
   and location. Shows totals per brand and size (qty, swap fees, sales amount),

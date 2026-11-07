@@ -684,6 +684,22 @@ def migrate_schema():
         conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 
+    # 12. Delivery receipts for credit / terms sales: each gets its own DR
+    #     number. Backfill existing credit sales, numbered per day in order.
+    if not _column_exists(conn, "sales", "dr_no"):
+        conn.execute("ALTER TABLE sales ADD COLUMN dr_no TEXT")
+        conn.commit()
+    MIGRATION_KEY = "delivery_receipt_numbers"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        seq = {}
+        for r in conn.execute("""SELECT id, ts FROM sales WHERE sale_type='CREDIT' AND is_opening_balance=0
+                                  AND dr_no IS NULL ORDER BY ts, id""").fetchall():
+            day = (r[1] or "")[:10].replace("-", "")
+            seq[day] = seq.get(day, 0) + 1
+            conn.execute("UPDATE sales SET dr_no=? WHERE id=?", (f"DR-{day}-{seq[day]:04d}", r[0]))
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
+        conn.commit()
+
     conn.close()
 
 
