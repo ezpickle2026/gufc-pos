@@ -483,7 +483,7 @@ def update_product(pid):
 
 # Every table that keeps a record of a product being used.
 PRODUCT_HISTORY_TABLES = [
-    "sale_items", "inventory_movements", "empty_cylinder_movements", "cylinder_deposits",
+    "sale_items", "inventory_movements", "empty_cylinder_movements", "swapped_empty_movements", "cylinder_deposits",
     "transfer_items", "hauling_schedule", "hauling_schedule_items",
     "commercial_deliveries", "booked_order_items",
 ]
@@ -499,6 +499,7 @@ def delete_product(pid):
         return jsonify(error="Product not found"), 404
     full = conn.execute("SELECT COALESCE(SUM(quantity),0) FROM inventory WHERE product_id=?", (pid,)).fetchone()[0]
     empty = conn.execute("SELECT COALESCE(SUM(quantity),0) FROM empty_cylinder_inventory WHERE product_id=?", (pid,)).fetchone()[0]
+    empty += conn.execute("SELECT COALESCE(SUM(quantity),0) FROM swapped_empty_inventory WHERE product_id=?", (pid,)).fetchone()[0]
     if full or empty:
         conn.close()
         return jsonify(error=(
@@ -519,6 +520,7 @@ def delete_product(pid):
         return jsonify(ok=True, archived=True)
     conn.execute("DELETE FROM inventory WHERE product_id=?", (pid,))
     conn.execute("DELETE FROM empty_cylinder_inventory WHERE product_id=?", (pid,))
+    conn.execute("DELETE FROM swapped_empty_inventory WHERE product_id=?", (pid,))
     conn.execute("DELETE FROM discounts WHERE product_id=?", (pid,))
     conn.execute("DELETE FROM products WHERE id=?", (pid,))
     audit(conn, "DELETE", "PRODUCTS", pid, prod["name"])
@@ -1253,7 +1255,8 @@ def inventory_movements():
     product_id = request.args.get("product_id", type=int)
     location_id = request.args.get("location_id", type=int)
     mtype = request.args.get("type")
-    table = "empty_cylinder_movements" if request.args.get("stock") == "EMPTY" else "inventory_movements"
+    stock = request.args.get("stock")
+    table = {"EMPTY": "empty_cylinder_movements", "SWAPPED": "swapped_empty_movements"}.get(stock, "inventory_movements")
     conn = get_db()
     sql = f"SELECT m.*, p.name product_name, l.name location_name FROM {table} m " \
           "JOIN products p ON p.id=m.product_id JOIN locations l ON l.id=m.location_id WHERE 1=1"
@@ -1292,6 +1295,65 @@ def get_empty_cylinders():
     rows = conn.execute(sql, params).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.get("/api/inventory/swapped-empties")
+@login_required
+def get_swapped_empties():
+    """Other-brand empties taken in on swap sales, per location / brand / size."""
+    u = session["user"]
+    location_id = request.args.get("location_id", type=int)
+    if u["role"] not in ("ADMIN", "MANAGER") and location_id and location_id != u["location_id"]:
+        return jsonify(error="Forbidden: not your location"), 403
+    if not location_id and u["role"] not in ("ADMIN", "MANAGER"):
+        location_id = u["location_id"]
+    conn = get_db()
+    sql = """SELECT l.name location_name, l.id location_id, p.name product_name, p.id product_id,
+                     s.brand, s.quantity
+              FROM swapped_empty_inventory s JOIN locations l ON l.id=s.location_id
+              JOIN products p ON p.id=s.product_id WHERE s.quantity<>0"""
+    params = []
+    if location_id:
+        sql += " AND l.id=?"; params.append(location_id)
+    sql += " ORDER BY l.name, s.brand, p.name"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.post("/api/inventory/swapped-empties/adjust")
+@roles_required("ADMIN")
+def adjust_swapped_empties():
+    """Manual correction of other-brand empty counts. Logged to the ledger."""
+    d = request.get_json(force=True)
+    location_id = d.get("location_id")
+    product_id = d.get("product_id")
+    brand = (d.get("brand") or "").strip()
+    reason = (d.get("reason") or "").strip()
+    if not location_id or not product_id or not brand or d.get("delta") is None:
+        return jsonify(error="location_id, product_id, brand and delta are required"), 400
+    try:
+        delta = int(d.get("delta"))
+    except (TypeError, ValueError):
+        return jsonify(error="delta must be a whole number (positive to add, negative to remove)"), 400
+    if delta == 0:
+        return jsonify(error="delta cannot be zero"), 400
+    if not reason:
+        return jsonify(error="A reason is required for adjustments"), 400
+    conn = get_db()
+    try:
+        if delta > 0:
+            add_swapped_empties(conn, location_id, product_id, brand, delta, "ADJUSTMENT", "MANUAL-ADMIN", reason)
+        else:
+            remove_swapped_empties(conn, location_id, product_id, brand, -delta, "ADJUSTMENT", "MANUAL-ADMIN", reason)
+        audit(conn, "ADJUST", "SWAPPED EMPTIES", f"{location_id}:{product_id}:{brand}", f"delta={delta} reason={reason}")
+        conn.commit()
+    except ValueError as e:
+        conn.rollback()
+        conn.close()
+        return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(ok=True)
 
 
 @app.post("/api/inventory/empties/adjust")
@@ -1487,6 +1549,38 @@ def remove_empty_cylinders(conn, location_id, product_id, qty, mtype="REMOVED", 
     _log_empty_movement(conn, location_id, product_id, -qty, mtype, reference, notes)
 
 
+def _change_swapped_empties(conn, location_id, product_id, brand, delta, mtype, reference, notes,
+                            allow_negative=False):
+    row = conn.execute(
+        "SELECT quantity FROM swapped_empty_inventory WHERE location_id=? AND product_id=? AND brand=?",
+        (location_id, product_id, brand),
+    ).fetchone()
+    current = row["quantity"] if row else 0
+    if delta < 0 and -delta > current and not allow_negative:
+        raise ValueError(f"Only {current} swapped {brand} empties on hand at this location")
+    if row:
+        conn.execute("UPDATE swapped_empty_inventory SET quantity=quantity+? WHERE location_id=? AND product_id=? AND brand=?",
+                     (delta, location_id, product_id, brand))
+    else:
+        conn.execute("INSERT INTO swapped_empty_inventory (location_id, product_id, brand, quantity) VALUES (?,?,?,?)",
+                     (location_id, product_id, brand, delta))
+    conn.execute(
+        """INSERT INTO swapped_empty_movements (location_id, product_id, brand, qty_change, type, reference, user_id, notes)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (location_id, product_id, brand, delta, mtype, reference,
+         session["user"]["id"] if session.get("user") else None, notes),
+    )
+
+
+def add_swapped_empties(conn, location_id, product_id, brand, qty, mtype, reference=None, notes=None):
+    _change_swapped_empties(conn, location_id, product_id, brand, qty, mtype, reference, notes)
+
+
+def remove_swapped_empties(conn, location_id, product_id, brand, qty, mtype, reference=None, notes=None,
+                           allow_negative=False):
+    _change_swapped_empties(conn, location_id, product_id, brand, -qty, mtype, reference, notes, allow_negative)
+
+
 def record_cylinder_deposit(conn, customer_id, product_id, qty):
     row = conn.execute(
         "SELECT qty_on_loan FROM cylinder_deposits WHERE customer_id=? AND product_id=?",
@@ -1663,7 +1757,7 @@ RESET_TRANSACTION_TABLES = [
     "payments", "receivables", "sale_items",
     "commercial_delivery_cylinders", "commercial_deliveries",
     "sales",
-    "inventory_movements", "empty_cylinder_movements", "cylinder_deposits",
+    "inventory_movements", "empty_cylinder_movements", "swapped_empty_movements", "cylinder_deposits",
     "transfer_items", "transfers",
     "hauling_schedule_items", "hauling_schedule",
     "booked_order_items", "booked_orders",
@@ -1684,7 +1778,8 @@ def _reset_counts(conn):
         "transfers": c("SELECT COUNT(*) FROM transfers"),
         "inventory_movements": c("SELECT COUNT(*) FROM inventory_movements"),
         "stock_on_hand": c("SELECT COALESCE(SUM(quantity),0) FROM inventory"),
-        "empties_on_hand": c("SELECT COALESCE(SUM(quantity),0) FROM empty_cylinder_inventory"),
+        "empties_on_hand": c("SELECT COALESCE(SUM(quantity),0) FROM empty_cylinder_inventory")
+                           + c("SELECT COALESCE(SUM(quantity),0) FROM swapped_empty_inventory"),
         "booked_orders": c("SELECT COUNT(*) FROM booked_orders"),
         "commercial_deliveries": c("SELECT COUNT(*) FROM commercial_deliveries"),
         "hauling": c("SELECT COUNT(*) FROM hauling_schedule"),
@@ -1778,6 +1873,7 @@ def system_reset():
         # Stock starts at zero; real opening stock is encoded via Inventory → Adjust Stock.
         conn.execute("UPDATE inventory SET quantity=0")
         conn.execute("UPDATE empty_cylinder_inventory SET quantity=0")
+        conn.execute("DELETE FROM swapped_empty_inventory")
 
         if wipe_staff_fleet:
             conn.execute("DELETE FROM employees")
@@ -1969,9 +2065,9 @@ def create_sale():
                                     reference=sale_no, notes=f"Empty returned on refill sale {sale_no}")
             elif sale_mode == "SWAP":
                 # SWAP: the customer hands over an empty of a different brand.
-                # It can't go to our plant as one of our empties, so it isn't
-                # added to empty-cylinder stock; the brand is kept on the line.
-                pass
+                # It's kept apart from our own empties, counted per brand.
+                add_swapped_empties(conn, location_id, prod["id"], swap_brand, qty, "SWAP SALE",
+                                    reference=sale_no, notes=f"{swap_brand} empty taken in on swap sale {sale_no}")
             else:
                 # DEPOSIT: customer takes a full cylinder with no exchange — no
                 # empty comes back, and the cylinder is now outstanding on loan
@@ -2074,6 +2170,10 @@ def void_sale(sale_id):
             # case the empty was already dispatched; a negative count flags it.
             remove_empty_cylinders(conn, sale["location_id"], it["product_id"], it["qty"], "VOID REVERSAL",
                                    void_ref, notes="Empty returned on voided refill sale", allow_negative=True)
+        elif it["sale_mode"] == "SWAP" and it["swap_brand"]:
+            remove_swapped_empties(conn, sale["location_id"], it["product_id"], it["swap_brand"], it["qty"],
+                                   "VOID REVERSAL", void_ref, notes="Swapped empty reversed on voided sale",
+                                   allow_negative=True)
         elif it["sale_mode"] == "DEPOSIT" and sale["customer_id"]:
             # DEPOSIT sale put cylinders on loan to the customer — undo that,
             # without going below zero if some were already returned.
@@ -2442,8 +2542,8 @@ def list_transfers():
 @app.post("/api/transfers")
 @roles_or_module_required("ADMIN", "DISPATCHER", module="transfers")
 def create_transfer():
-    """Dispatch full and/or empty cylinders from one location to another
-    location, or empties out to a plant for refilling (to_external)."""
+    """Dispatch full, empty and/or swapped (other-brand) empty cylinders from
+    one location to another location, or out to a plant (to_external)."""
     d = request.get_json(force=True)
     items = d.get("items") or []
     if not items:
@@ -2477,17 +2577,22 @@ def create_transfer():
             if qty <= 0:
                 raise ValueError("Quantities must be positive")
             state = (it.get("cylinder_state") or "FULL").upper()
-            if state not in ("FULL", "EMPTY"):
-                raise ValueError("cylinder_state must be FULL or EMPTY")
-            if to_external and state != "EMPTY":
-                raise ValueError("Only empty cylinders can be dispatched to a plant")
-            conn.execute("INSERT INTO transfer_items (transfer_id, product_id, qty, cylinder_state) VALUES (?,?,?,?)",
-                         (tid, it["product_id"], qty, state))
-            if state == "EMPTY":
+            if state not in ("FULL", "EMPTY", "SWAPPED"):
+                raise ValueError("cylinder_state must be FULL, EMPTY or SWAPPED")
+            brand = (it.get("swap_brand") or "").strip() if state == "SWAPPED" else None
+            if state == "SWAPPED" and not brand:
+                raise ValueError("Choose the brand of the swapped empties to dispatch")
+            conn.execute("INSERT INTO transfer_items (transfer_id, product_id, qty, cylinder_state, swap_brand) VALUES (?,?,?,?,?)",
+                         (tid, it["product_id"], qty, state, brand))
+            if state == "SWAPPED":
+                remove_swapped_empties(conn, from_location, it["product_id"], brand, qty, "DISPATCH OUT", transfer_no,
+                                       notes=f"{brand} empties dispatched to {dest_label}")
+            elif state == "EMPTY":
                 remove_empty_cylinders(conn, from_location, it["product_id"], qty, "DISPATCH OUT", transfer_no,
                                        notes=f"Empties dispatched to {dest_label}")
             else:
-                adjust_inventory(conn, from_location, it["product_id"], -qty, "TRANSFER OUT", transfer_no)
+                adjust_inventory(conn, from_location, it["product_id"], -qty, "TRANSFER OUT", transfer_no,
+                                 notes=f"Full cylinders dispatched to {dest_label}")
         audit(conn, "CREATE", "TRANSFERS", tid, transfer_no + (f" to plant {to_external}" if to_external else ""))
         conn.commit()
     except ValueError as e:
@@ -2508,10 +2613,13 @@ def receive_transfer(tid):
         conn.close(); return jsonify(error=f"Transfer already {t['status']}"), 400
     items = conn.execute("SELECT * FROM transfer_items WHERE transfer_id=?", (tid,)).fetchall()
     # A dispatch to a plant leaves the system — "received" only confirms the
-    # plant got the empties; nothing is added to any of our locations.
+    # plant got the cylinders; nothing is added to any of our locations.
     if t["to_location"]:
         for it in items:
-            if it["cylinder_state"] == "EMPTY":
+            if it["cylinder_state"] == "SWAPPED":
+                add_swapped_empties(conn, t["to_location"], it["product_id"], it["swap_brand"], it["qty"],
+                                    "DISPATCH IN", t["transfer_no"], notes="Swapped empties received from dispatch")
+            elif it["cylinder_state"] == "EMPTY":
                 add_empty_cylinders(conn, t["to_location"], it["product_id"], it["qty"], "DISPATCH IN",
                                     t["transfer_no"], notes="Empties received from dispatch")
             else:
