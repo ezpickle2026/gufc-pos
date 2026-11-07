@@ -1518,7 +1518,8 @@ async function renderProducts(c) {
     </tr></thead><tbody>
       ${state.products.map(p => `<tr><td>${esc(p.sku)}</td><td>${esc(p.name)}</td><td>${esc(p.category)}</td>
         <td>${money(p.price)}</td><td>${money(p.cost)}</td><td>${money(p.deposit_price)}</td><td>${p.min_stock}</td>
-        <td><button class="btn small" onclick="editProduct(${p.id})">Edit</button></td></tr>`).join("")}
+        <td style="display:flex;gap:6px"><button class="btn small" onclick="editProduct(${p.id})">Edit</button>
+          <button class="btn small danger" onclick="deleteProduct(${p.id})">Delete</button></td></tr>`).join("")}
     </tbody></table></div>`;
   }
   function formFields(p = {}) {
@@ -1560,6 +1561,15 @@ async function renderProducts(c) {
         catch (e) {}
       });
     });
+  };
+  window.deleteProduct = async (id) => {
+    const p = state.products.find(x => x.id === id);
+    if (!confirm(`Delete "${p.name}"? Its stock must be 0. If it was already used in sales or other records, it will be hidden instead so past records stay correct.`)) return;
+    try {
+      const r = await api(`/products/${id}`, { method: "DELETE" });
+      toast(r.archived ? "Product removed from the list (kept in past records)" : "Product deleted", "success");
+      load();
+    } catch (e) {}
   };
   document.getElementById("importProdBtn").addEventListener("click", () => {
     openModal("Import Products from CSV", `
@@ -1616,7 +1626,7 @@ async function renderSystemReset(c) {
         <li>Incident reports <span class="badge gray">${n.incident_reports}</span>, staff schedule <span class="badge gray">${n.staff_schedule}</span>, audit log <span class="badge gray">${n.audit_logs}</span></li>
       </ul>
       <h4>Always kept</h4>
-      <p style="font-size:13.5px;margin:0">Locations (${n.locations}), products and prices (${n.products}), roles and permissions, customer categories, and <b>your own admin account</b>.</p>
+      <p style="font-size:13.5px;margin:0">Locations (${n.locations}), roles and permissions, customer categories, and <b>your own admin account</b>. Products are kept unless ticked below.</p>
     </div>
 
     <div class="card" style="margin-bottom:14px">
@@ -1625,6 +1635,7 @@ async function renderSystemReset(c) {
       ${opt("rsUsers", "All other user accounts", n.other_users, "Deletes every login except yours (including demo accounts like mgarcia, otaker, jsoliven). Create the real staff accounts in Users afterwards.")}
       ${opt("rsStaff", "Employees and vehicles", `${n.employees} / ${n.vehicles}`, "Tick only if these were test entries.")}
       ${opt("rsDiscounts", "Discounts & promos", n.discounts, "Tick if the discounts were only for testing.")}
+      ${opt("rsProducts", "Products", n.products, "Deletes every product (and its stock rows and item-specific discounts). Add the real products in Products afterwards, by hand or with Import CSV.")}
     </div>
 
     <div class="card">
@@ -1644,6 +1655,7 @@ async function renderSystemReset(c) {
         users: document.getElementById("rsUsers").checked,
         employees_vehicles: document.getElementById("rsStaff").checked,
         discounts: document.getElementById("rsDiscounts").checked,
+        products: document.getElementById("rsProducts").checked,
       },
     };
     if (body.confirm_text.trim().toUpperCase() !== "RESET") { toast("Type RESET to confirm", "error"); return; }
@@ -1657,6 +1669,7 @@ async function renderSystemReset(c) {
         <p><code>${esc(r.backup_file)}</code></p>
         <p><b>Next steps:</b></p>
         <ol style="padding-left:18px;line-height:1.7">
+          ${body.options.products ? "<li>Products: add the real products (Products → + New Product or Import CSV).</li>" : ""}
           <li>Inventory: encode the actual opening stock per location (Inventory → + Adjust Stock, or Transfers → + Import Stock from Supplier).</li>
           <li>Users: create the real staff accounts${body.options.users ? "" : " and disable demo accounts"}.</li>
           <li>Customers: add or import real customers and their previous arrears.</li>

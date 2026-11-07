@@ -43,6 +43,12 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
   typing `RESET` plus the admin password, and saves a full backup copy of the
   database next to it (`<db>.before-reset-<timestamp>.bak`) before deleting
   anything. A "Download backup" button is also on the page.
+  A **Products** checkbox also clears every product, so the real product list can
+  be encoded from scratch.
+- **Delete products** (Products → Delete, Admin only). The product's stock must be 0.
+  A product with no history is deleted outright; one already used in sales,
+  transfers or other records is hidden instead so past records stay correct.
+  Adding a product again with the same SKU brings it back.
 
 - **Discounts & Promos settings** (Reports & Admin → Discounts & Promos, Admin/Manager).
   Create named discounts as **% off** or **₱ off per unit**, for **all items** or one
