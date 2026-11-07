@@ -343,6 +343,7 @@ async function renderPOS(c) {
     if (existing) existing.qty += 1;
     else state.cart.push({
       product_id: pid, name: prod.name, base_price: prod.price, deposit_price: prod.deposit_price || 0,
+      is_cylinder: (prod.deposit_price || 0) > 0 || /cylinder|lpg/i.test(prod.category || ""),
       sale_mode: "REFILL", price: prod.price, qty: 1,
     });
     drawCart(locationId);
@@ -367,6 +368,25 @@ async function renderPOS(c) {
   window.__posMode = (pid, oldMode, newMode) => {
     const item = state.cart.find(i => i.product_id === pid && i.sale_mode === oldMode);
     if (!item) return;
+    if (newMode === "SWAP") {
+      drawCart(locationId); // keep the dropdown on the old mode until confirmed
+      // ask which brand is being swapped in and the swap fee first; the line
+      // only switches to SWAP once the cashier confirms
+      openSwapDialog(item, (brand, fee) => {
+        const target = state.cart.find(i => i !== item && i.product_id === pid && i.sale_mode === "SWAP");
+        if (target) {
+          target.qty += item.qty;
+          target.swap_brand = brand; target.swap_fee = fee;
+          target.price = target.base_price + fee;
+          state.cart = state.cart.filter(i => i !== item);
+        } else {
+          item.sale_mode = "SWAP"; item.swap_brand = brand; item.swap_fee = fee;
+          item.price = item.base_price + fee;
+        }
+        drawCart(locationId);
+      });
+      return;
+    }
     // merge into an existing line with the same new mode, if one exists
     const target = state.cart.find(i => i.product_id === pid && i.sale_mode === newMode);
     if (target) {
@@ -375,9 +395,72 @@ async function renderPOS(c) {
     } else {
       item.sale_mode = newMode;
       item.price = item.base_price + (newMode === "DEPOSIT" ? item.deposit_price : 0);
+      delete item.swap_brand; delete item.swap_fee;
     }
     drawCart(locationId);
   };
+  window.__posEditSwap = (pid) => {
+    const item = state.cart.find(i => i.product_id === pid && i.sale_mode === "SWAP");
+    if (!item) return;
+    openSwapDialog(item, (brand, fee) => {
+      item.swap_brand = brand; item.swap_fee = fee;
+      item.price = item.base_price + fee;
+      drawCart(locationId);
+    });
+  };
+}
+
+// Common LPG brands a customer may bring in to swap for ours.
+const SWAP_BRANDS = ["Petron Gasul", "Shellane", "Prycegas", "Fiesta Gas", "Regasco", "Phoenix LPG", "Island Gas", "Total Gas"];
+
+// Modal for a brand swap: which brand the customer's empty is, and the swap
+// fee per cylinder (added on top of the gas price).
+function openSwapDialog(item, onOk, onCancel) {
+  const cur = item.swap_brand || "";
+  const isPreset = SWAP_BRANDS.includes(cur);
+  const fee = item.swap_fee ? item.swap_fee : "";
+  openModal(`Swap &mdash; ${esc(item.name)}`, `
+    <p style="color:var(--muted);font-size:13px;margin-top:0">Customer hands over an empty cylinder of another brand in exchange for a full ${esc(item.name)}.</p>
+    <div class="field"><label>Brand of LPG being swapped</label>
+      <select id="swapBrand">
+        <option value="">-- Select brand --</option>
+        ${SWAP_BRANDS.map(b => `<option ${b === cur ? "selected" : ""}>${esc(b)}</option>`).join("")}
+        <option value="__other" ${cur && !isPreset ? "selected" : ""}>Other (type below)</option>
+      </select>
+    </div>
+    <div class="field" id="swapOtherWrap" style="${cur && !isPreset ? "" : "display:none"}">
+      <label>Other brand</label><input type="text" id="swapOther" value="${cur && !isPreset ? esc(cur) : ""}" placeholder="Brand name">
+    </div>
+    <div class="field"><label>Swapping fee per cylinder <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+      <input type="number" id="swapFee" min="0" step="0.01" value="${fee}" placeholder="Leave blank if no fee">
+    </div>
+    <div class="field" style="font-size:13px">Price per cylinder: <b id="swapPreview"></b>
+      <span style="color:var(--muted)">(${money(item.base_price)} gas + fee)</span></div>
+    <div class="modal-actions">
+      <button class="btn" id="swapCancel" type="button">Cancel</button>
+      <button class="btn green" id="swapOk" type="button">Apply Swap</button>
+    </div>
+  `, () => {
+    const sel = document.getElementById("swapBrand");
+    const feeIn = document.getElementById("swapFee");
+    const preview = () => { document.getElementById("swapPreview").textContent = money(item.base_price + (parseFloat(feeIn.value) || 0)); };
+    sel.addEventListener("change", () => {
+      document.getElementById("swapOtherWrap").style.display = sel.value === "__other" ? "" : "none";
+    });
+    feeIn.addEventListener("input", preview);
+    preview();
+    document.getElementById("swapCancel").addEventListener("click", () => { closeModal(); if (onCancel) onCancel(); });
+    document.getElementById("swapOk").addEventListener("click", () => {
+      const brand = sel.value === "__other" ? document.getElementById("swapOther").value.trim() : sel.value;
+      const raw = feeIn.value.trim();
+      const f = raw === "" ? 0 : parseFloat(raw);
+      if (!brand) { toast("Select the LPG brand being swapped", "error"); return; }
+      if (isNaN(f) || f < 0) { toast("Swapping fee must be a number (0 or more), or leave it blank", "error"); return; }
+      const rounded = Math.round(f * 100) / 100;
+      closeModal();
+      onOk(brand, rounded);
+    });
+  });
 }
 
 // Discounts usable on a cart line (all-items promos + ones for this product).
@@ -414,12 +497,15 @@ function drawCart(locationId) {
     <h3 style="margin-top:0">Cart</h3>
     <div id="cartLines">${state.cart.length ? state.cart.map(i => `
       <div class="cart-line">
-        <div class="cname">${esc(i.name)} ${i.sale_mode === 'DEPOSIT' ? '<span class="badge warn">DEPOSIT</span>' : ''}<br>
+        <div class="cname">${esc(i.name)} ${i.sale_mode === 'DEPOSIT' ? '<span class="badge warn">DEPOSIT</span>' : ''}${i.sale_mode === 'SWAP' ? '<span class="badge blue">SWAP</span>' : ''}<br>
           <span style="color:var(--muted);font-size:12px">${money(i.price)} each</span>
-          ${i.deposit_price > 0 ? `<select style="margin-left:6px;font-size:11px;padding:2px 4px" onchange="__posMode(${i.product_id}, '${i.sale_mode}', this.value)">
+          ${i.is_cylinder ? `<select style="margin-left:6px;font-size:11px;padding:2px 4px" onchange="__posMode(${i.product_id}, '${i.sale_mode}', this.value)">
             <option value="REFILL" ${i.sale_mode === 'REFILL' ? 'selected' : ''}>Refill (exchange empty)</option>
-            <option value="DEPOSIT" ${i.sale_mode === 'DEPOSIT' ? 'selected' : ''}>New/Deposit (+${money(i.deposit_price)})</option>
+            ${i.deposit_price > 0 ? `<option value="DEPOSIT" ${i.sale_mode === 'DEPOSIT' ? 'selected' : ''}>New/Deposit (+${money(i.deposit_price)})</option>` : ""}
+            <option value="SWAP" ${i.sale_mode === 'SWAP' ? 'selected' : ''}>Swap (other brand)</option>
           </select>` : ""}
+          ${i.sale_mode === 'SWAP' ? `<br><span style="font-size:12px">Swap from <b>${esc(i.swap_brand)}</b>${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : " &middot; no fee"}</span>
+            <button class="btn small" type="button" style="font-size:11px;padding:1px 6px" onclick="__posEditSwap(${i.product_id})">Edit</button>` : ""}
           ${(() => {
             const opts = discountsFor(i);
             if (!opts.length) return "";
@@ -513,6 +599,7 @@ async function openCheckout(locationId) {
         items: state.cart.map(i => ({
           product_id: i.product_id, qty: i.qty, sale_mode: i.sale_mode,
           discount_id: lineDiscount(i) > 0 ? i.discount_id : null,
+          ...(i.sale_mode === "SWAP" ? { swap_brand: i.swap_brand, swap_fee: i.swap_fee } : {}),
         })),
         payments,
       };
@@ -541,7 +628,7 @@ function printReceipt(result) {
       <div>Txn: ${sale.sale_no}<br>Date: ${sale.ts}<br>Cashier: ${esc(sale.cashier_name)}<br>
       Customer: ${esc(sale.customer_name || "Walk-in")} ${sale.account_no ? "(" + sale.account_no + ")" : ""}</div>
       <div>--------------------------------</div>
-      ${items.map(i => `${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}<br>  ${i.qty} x ${money(i.price)} = ${money(i.subtotal)}${i.discount_amount > 0 ? `<br>  Less: ${esc(i.discount_name)} -${money(i.discount_amount)}` : ""}`).join("<br>")}
+      ${items.map(i => `${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}${i.sale_mode === 'SWAP' ? `<br>  SWAP from ${esc(i.swap_brand)}${i.swap_fee > 0 ? ` (fee ${money(i.swap_fee)}/cyl)` : ""}` : ''}<br>  ${i.qty} x ${money(i.price)} = ${money(i.subtotal)}${i.discount_amount > 0 ? `<br>  Less: ${esc(i.discount_name)} -${money(i.discount_amount)}` : ""}`).join("<br>")}
       <div>--------------------------------</div>
       <div>Subtotal: ${money(sale.subtotal)}<br>Discount: ${money(sale.discount)}<br><b>Total: ${money(sale.total)}</b></div>
       <div>--------------------------------</div>
@@ -585,7 +672,7 @@ window.viewSale = async (id) => {
     <div class="field"><b>Cashier:</b> ${esc(sale.cashier_name)} &nbsp; <b>Customer:</b> ${esc(sale.customer_name || "Walk-in")}</div>
     <div class="field"><b>Status:</b> <span class="badge ${sale.status === 'VOIDED' ? 'danger' : 'blue'}">${sale.status}</span></div>
     <div class="table-wrap"><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Subtotal</th></tr></thead><tbody>
-      ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}${i.discount_amount > 0 ? `<br><span style="font-size:12px;color:var(--green-dark)">${esc(i.discount_name)} &minus;${money(i.discount_amount)}</span>` : ""}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
+      ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}${i.sale_mode === 'SWAP' ? ` <span class="badge blue">SWAP</span><br><span style="font-size:12px">from ${esc(i.swap_brand)}${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : ""}</span>` : ''}${i.discount_amount > 0 ? `<br><span style="font-size:12px;color:var(--green-dark)">${esc(i.discount_name)} &minus;${money(i.discount_amount)}</span>` : ""}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
     </tbody></table></div>
     <div style="margin-top:10px">
       <div class="cart-total-row"><span>Subtotal</span><span>${money(sale.subtotal)}</span></div>

@@ -1877,14 +1877,28 @@ def create_sale():
             if qty <= 0:
                 raise ValueError("Quantity must be positive")
             sale_mode = it.get("sale_mode", "REFILL")
-            if sale_mode not in ("REFILL", "DEPOSIT"):
-                raise ValueError("sale_mode must be REFILL or DEPOSIT")
+            if sale_mode not in ("REFILL", "DEPOSIT", "SWAP"):
+                raise ValueError("sale_mode must be REFILL, DEPOSIT or SWAP")
             # server-side price, never trust frontend: REFILL is gas only;
-            # DEPOSIT adds the cylinder deposit fee (customer keeps the tank).
+            # DEPOSIT adds the cylinder deposit fee (customer keeps the tank);
+            # SWAP adds a per-cylinder swap fee (customer hands over an empty
+            # of another brand in exchange).
             gas_price = float(prod["price"])
             price = gas_price
+            swap_brand, swap_fee = None, 0.0
             if sale_mode == "DEPOSIT":
                 price += float(prod["deposit_price"])
+            elif sale_mode == "SWAP":
+                swap_brand = (it.get("swap_brand") or "").strip()
+                if not swap_brand:
+                    raise ValueError(f"Choose the LPG brand being swapped for {prod['name']}")
+                try:
+                    swap_fee = round(float(it.get("swap_fee") or 0), 2)
+                except (TypeError, ValueError):
+                    raise ValueError("Swap fee must be a number")
+                if swap_fee < 0:
+                    raise ValueError("Swap fee cannot be negative")
+                price += swap_fee
             line_total = round(price * qty, 2)
             subtotal += line_total
             # optional per-item discount, recomputed server-side
@@ -1895,7 +1909,8 @@ def create_sale():
                     raise ValueError("Selected discount no longer exists")
                 disc_amount = compute_item_discount(disc, prod["id"], gas_price, qty)
                 disc_id, disc_name = disc["id"], disc["name"]
-            resolved_items.append((prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount))
+            resolved_items.append((prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
+                                   swap_brand, swap_fee))
 
         subtotal = round(subtotal, 2)
         discount = round(sum(r[7] for r in resolved_items), 2)
@@ -1936,20 +1951,27 @@ def create_sale():
         )
         sale_id = cur.lastrowid
 
-        for prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount in resolved_items:
+        for (prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
+             swap_brand, swap_fee) in resolved_items:
             conn.execute(
                 """INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode,
-                   discount_id, discount_name, discount_amount) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                   discount_id, discount_name, discount_amount, swap_brand, swap_fee) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (sale_id, prod["id"], prod["name"], qty, price, line_total, sale_mode,
-                 disc_id, disc_name, disc_amount),
+                 disc_id, disc_name, disc_amount, swap_brand, swap_fee),
             )
+            mode_note = f"SWAP from {swap_brand}" if sale_mode == "SWAP" else sale_mode
             adjust_inventory(conn, location_id, prod["id"], -qty, "SALE", sale_no,
-                              notes=f"Sold via {sale_no} ({sale_mode})")
+                              notes=f"Sold via {sale_no} ({mode_note})")
             if sale_mode == "REFILL":
                 # Customer exchanges an empty cylinder for a full one — the empty
                 # comes back into our stock, ready to be hauled to the plant for refill.
                 add_empty_cylinders(conn, location_id, prod["id"], qty, "REFILL SALE",
                                     reference=sale_no, notes=f"Empty returned on refill sale {sale_no}")
+            elif sale_mode == "SWAP":
+                # SWAP: the customer hands over an empty of a different brand.
+                # It can't go to our plant as one of our empties, so it isn't
+                # added to empty-cylinder stock; the brand is kept on the line.
+                pass
             else:
                 # DEPOSIT: customer takes a full cylinder with no exchange — no
                 # empty comes back, and the cylinder is now outstanding on loan
@@ -2052,7 +2074,7 @@ def void_sale(sale_id):
             # case the empty was already dispatched; a negative count flags it.
             remove_empty_cylinders(conn, sale["location_id"], it["product_id"], it["qty"], "VOID REVERSAL",
                                    void_ref, notes="Empty returned on voided refill sale", allow_negative=True)
-        elif sale["customer_id"]:
+        elif it["sale_mode"] == "DEPOSIT" and sale["customer_id"]:
             # DEPOSIT sale put cylinders on loan to the customer — undo that,
             # without going below zero if some were already returned.
             conn.execute(
@@ -2587,7 +2609,8 @@ def _sales_report_rows(date_from, date_to):
     sql = """SELECT s.sale_no, s.ts, l.name location_name, u.name cashier, c.name customer,
                     CASE WHEN c.id IS NULL THEN 'Walk-in' ELSE COALESCE(NULLIF(c.category,''), 'Uncategorized') END customer_category,
                     s.sale_type, s.status, s.total sale_total, s.discount sale_discount,
-                    si.product_name || CASE WHEN si.sale_mode='DEPOSIT' THEN ' (deposit)' ELSE '' END item,
+                    si.product_name || CASE WHEN si.sale_mode='DEPOSIT' THEN ' (deposit)'
+                        WHEN si.sale_mode='SWAP' THEN ' (swap: ' || COALESCE(si.swap_brand,'') || ')' ELSE '' END item,
                     si.qty, si.price,
                     COALESCE(si.subtotal, s.subtotal) amount,
                     COALESCE(si.discount_amount, CASE WHEN si.id IS NULL THEN s.discount ELSE 0 END) discount,
