@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS sale_items (
     qty INTEGER NOT NULL,
     price REAL NOT NULL,
     subtotal REAL NOT NULL,
-    sale_mode TEXT NOT NULL DEFAULT 'REFILL' CHECK(sale_mode IN ('REFILL','DEPOSIT'))
+    sale_mode TEXT NOT NULL DEFAULT 'REFILL' CHECK(sale_mode IN ('REFILL','DEPOSIT','SWAP'))
 );
 
 CREATE TABLE IF NOT EXISTS empty_cylinder_inventory (
@@ -577,6 +577,43 @@ def migrate_schema():
     if not _column_exists(conn, "sale_items", "discount_amount"):
         conn.execute("ALTER TABLE sale_items ADD COLUMN discount_amount REAL NOT NULL DEFAULT 0")
     conn.commit()
+
+    # 9c. Brand swaps: customer hands over an empty of another LPG brand and
+    #     pays a swap fee. Record which brand came in and the fee per cylinder.
+    if not _column_exists(conn, "sale_items", "swap_brand"):
+        conn.execute("ALTER TABLE sale_items ADD COLUMN swap_brand TEXT")
+    if not _column_exists(conn, "sale_items", "swap_fee"):
+        conn.execute("ALTER TABLE sale_items ADD COLUMN swap_fee REAL NOT NULL DEFAULT 0")
+    conn.commit()
+
+    # 9d. sale_items.sale_mode CHECK must allow 'SWAP'. SQLite can't alter a
+    #     CHECK constraint, so recreate the table and copy the data across.
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='sale_items'").fetchone()
+    if row and "CHECK(sale_mode IN ('REFILL','DEPOSIT'))" in row[0]:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("""
+            CREATE TABLE sale_items_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sale_id INTEGER NOT NULL REFERENCES sales(id),
+                product_id INTEGER NOT NULL REFERENCES products(id),
+                product_name TEXT NOT NULL,
+                qty INTEGER NOT NULL,
+                price REAL NOT NULL,
+                subtotal REAL NOT NULL,
+                sale_mode TEXT NOT NULL DEFAULT 'REFILL' CHECK(sale_mode IN ('REFILL','DEPOSIT','SWAP')),
+                discount_id INTEGER,
+                discount_name TEXT,
+                discount_amount REAL NOT NULL DEFAULT 0,
+                swap_brand TEXT,
+                swap_fee REAL NOT NULL DEFAULT 0
+            )
+        """)
+        cols = "id, sale_id, product_id, product_name, qty, price, subtotal, sale_mode, discount_id, discount_name, discount_amount, swap_brand, swap_fee"
+        conn.execute(f"INSERT INTO sale_items_new ({cols}) SELECT {cols} FROM sale_items")
+        conn.execute("DROP TABLE sale_items")
+        conn.execute("ALTER TABLE sale_items_new RENAME TO sale_items")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.commit()
 
     # 10. transfers.to_location becomes nullable so empties can be dispatched
     #     to a plant (outside the system) — recreate table, copy data.
