@@ -1445,11 +1445,15 @@ async function renderEndOfDay(c) {
           <div class="cart-total-row"><span>&nbsp;&nbsp;Charged to accounts (unpaid)</span><span>${money(s.charged_to_accounts)}</span></div>
           <div class="cart-total-row"><span>Discounts given</span><span>${money(s.discount)}</span></div>
           <div class="cart-total-row"><span>Voided sales (${s.voided_count})</span><span>${money(s.voided_total)}</span></div>
-          ${d.items.length ? `<h4 style="margin:14px 0 6px">Items Sold</h4>
-          <div class="table-wrap"><table><thead><tr><th>Product</th><th>Type</th><th>Qty</th><th>Amount</th></tr></thead><tbody>
-            ${d.items.map(i => `<tr><td>${esc(i.product_name)}</td><td>${i.sale_mode}</td><td>${i.qty}</td><td>${money(i.amount)}</td></tr>`).join("")}
-          </tbody></table></div>` : ""}
         </div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <h3 style="margin-top:0">Products Sold</h3>
+        <div class="table-wrap"><table><thead><tr><th>Product</th><th>Type</th><th>Qty</th><th>Amount</th></tr></thead><tbody>
+          ${d.items.length ? d.items.map(i => `<tr><td>${esc(i.product_name)}</td><td>${i.sale_mode}</td><td>${i.qty}</td><td>${money(i.amount)}</td></tr>`).join("")
+            : `<tr><td colspan="4" style="color:var(--muted)">No products sold on this date.</td></tr>`}
+          ${d.items.length ? `<tr style="font-weight:700;background:var(--bg)"><td>TOTAL</td><td></td><td>${eodItemQty(d)}</td><td>${money(eodItemAmount(d))}</td></tr>` : ""}
+        </tbody></table></div>
       </div>
       <div class="card" style="margin-top:16px">
         <h3 style="margin-top:0">Payments Received</h3>
@@ -1476,6 +1480,9 @@ async function renderEndOfDay(c) {
   load();
 }
 
+const eodItemQty = d => d.items.reduce((a, i) => a + (i.qty || 0), 0);
+const eodItemAmount = d => d.items.reduce((a, i) => a + (i.amount || 0), 0);
+
 function printEndOfDay(d) {
   const t = d.totals, s = d.sales;
   const row = (a, b, bold) => `<tr${bold ? ' style="font-weight:700"' : ""}><td>${a}</td><td style="text-align:right">${b}</td></tr>`;
@@ -1498,6 +1505,13 @@ function printEndOfDay(d) {
       ${row("Discounts given", money(s.discount))}
       ${row(`Voided sales (${s.voided_count})`, money(s.voided_total))}
     </table>
+    <h4>Products Sold</h4>
+    <table style="width:100%;border-collapse:collapse" border="1" cellpadding="4">
+      <tr><th align="left">Product</th><th align="left">Type</th><th align="right">Qty</th><th align="right">Amount</th></tr>
+      ${d.items.length ? d.items.map(i => `<tr><td>${esc(i.product_name)}</td><td>${i.sale_mode}</td><td align="right">${i.qty}</td><td align="right">${money(i.amount)}</td></tr>`).join("")
+        : `<tr><td colspan="4">No products sold.</td></tr>`}
+      ${d.items.length ? `<tr style="font-weight:700"><td>TOTAL</td><td></td><td align="right">${eodItemQty(d)}</td><td align="right">${money(eodItemAmount(d))}</td></tr>` : ""}
+    </table>
     <h4>Payments Received</h4>
     <table style="width:100%;border-collapse:collapse" border="1" cellpadding="3">
       <tr><th>Time</th><th align="left">Sale / Invoice</th><th align="left">Customer</th><th>Type</th><th align="left">Method</th><th align="left">Ref</th><th align="right">Amount</th></tr>
@@ -1510,6 +1524,31 @@ function printEndOfDay(d) {
       <td style="text-align:center">______________________________<br>Prepared by: ${esc(d.staff_name)}</td>
       <td style="text-align:center">______________________________<br>Received / verified by</td></tr></table>
     <div style="text-align:center;color:#888;margin-top:16px;font-size:10px">Printed ${new Date().toLocaleString()} by ${esc(d.generated_by)}</div>
+  </div>`);
+}
+
+function printSwappedReport(d) {
+  const t = d.totals;
+  const tbl = `style="width:100%;border-collapse:collapse" border="1" cellpadding="3"`;
+  printDocument(`<style>@page{size:letter landscape;margin:10mm}</style>
+  <div style="font-family:Arial,sans-serif;font-size:11px">
+    <div style="text-align:center"><img src="/images/logo.png" style="height:44px"><h2 style="margin:4px 0">GREAT UNLI FOOD CORP.</h2>
+      <div>Solane LPG Distributor</div><h3 style="margin:8px 0 2px">SWAPPED CYLINDER REPORT</h3>
+      <div>${d.date_from || "All dates"} to ${d.date_to || "present"}${d.location_name ? " — " + esc(d.location_name) : ""}</div></div>
+    <h4>Summary by Brand / Size</h4>
+    <table ${tbl}><tr><th align="left">Brand Swapped</th><th align="left">Size (swapped for)</th><th align="right">Qty</th><th align="right">Swap Fees</th><th align="right">Amount</th></tr>
+      ${d.summary.map(r => `<tr><td>${esc(r.swap_brand)}</td><td>${esc(r.product_name)}</td><td align="right">${r.qty}</td><td align="right">${money(r.swap_fees)}</td><td align="right">${money(r.amount)}</td></tr>`).join("")}
+      <tr style="font-weight:700"><td>TOTAL</td><td></td><td align="right">${t.qty}</td><td align="right">${money(t.swap_fees)}</td><td align="right">${money(t.amount)}</td></tr></table>
+    <h4>Swap Transactions</h4>
+    <table ${tbl}><tr><th align="left">Date</th><th align="left">Sale #</th><th align="left">Location</th><th align="left">Cashier</th><th align="left">Customer</th><th align="left">Brand</th><th align="left">Size</th><th align="right">Qty</th><th align="right">Swap Fees</th><th align="right">Amount</th></tr>
+      ${d.rows.length ? d.rows.map(r => `<tr><td>${r.ts.slice(0, 16)}</td><td>${esc(r.sale_no)}</td><td>${esc(r.location_name)}</td><td>${esc(r.cashier)}</td><td>${esc(r.customer_name || "Walk-in")}</td>
+        <td>${esc(r.swap_brand)}</td><td>${esc(r.product_name)}</td><td align="right">${r.qty}</td><td align="right">${money(r.swap_fee_total)}</td><td align="right">${money(r.amount)}</td></tr>`).join("")
+        : `<tr><td colspan="10">No swap sales in this period.</td></tr>`}</table>
+    <h4>Swapped Empties On Hand (not yet dispatched)</h4>
+    <table ${tbl}><tr><th align="left">Location</th><th align="left">Brand</th><th align="left">Size</th><th align="right">Qty on Hand</th></tr>
+      ${d.on_hand.map(r => `<tr><td>${esc(r.location_name)}</td><td>${esc(r.brand)}</td><td>${esc(r.product_name)}</td><td align="right">${r.quantity}</td></tr>`).join("")}
+      <tr style="font-weight:700"><td>TOTAL</td><td></td><td></td><td align="right">${t.on_hand}</td></tr></table>
+    <div style="text-align:center;color:#888;margin-top:16px;font-size:10px">Printed ${new Date().toLocaleString()} by ${esc(state.user.name)}</div>
   </div>`);
 }
 
@@ -1543,7 +1582,65 @@ async function renderReports(c) {
         <a class="btn small" href="/api/reports/receivables/export?format=pdf">Export PDF</a>
       </div>
       <p style="color:var(--muted);font-size:13px;margin:0">Full detail available on the Receivables tab; use these buttons for a downloadable copy.</p>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h3 style="margin-top:0">Swapped Cylinder Report</h3>
+      <p style="color:var(--muted);font-size:13px;margin:0 0 10px">Other-brand cylinders taken in on swap sales, totalled per brand and size, plus swapped empties still on hand.</p>
+      <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center">
+        <input type="date" id="swFrom"><input type="date" id="swTo">
+        <select id="swLoc"><option value="">All locations</option>
+          ${state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}</select>
+        <button class="btn" id="runSwapRep">Run</button>
+        <button class="btn small green" id="swPrint">Print</button>
+        <a class="btn small" id="swXlsx" href="#">Export Excel</a>
+        <a class="btn small" id="swPdf" href="#">Export PDF</a>
+      </div>
+      <div id="swapRepOut"></div>
     </div>`;
+
+  const swQs = () => {
+    const qs = new URLSearchParams();
+    const f = document.getElementById("swFrom").value, t = document.getElementById("swTo").value, l = document.getElementById("swLoc").value;
+    if (f) qs.set("from", f); if (t) qs.set("to", t); if (l) qs.set("location_id", l);
+    return qs.toString();
+  };
+  function updateSwapLinks() {
+    document.getElementById("swXlsx").href = "/api/reports/swapped/export?format=xlsx&" + swQs();
+    document.getElementById("swPdf").href = "/api/reports/swapped/export?format=pdf&" + swQs();
+  }
+  ["swFrom", "swTo", "swLoc"].forEach(id => document.getElementById(id).addEventListener("change", updateSwapLinks));
+  updateSwapLinks();
+  let swapData = null;
+  document.getElementById("runSwapRep").addEventListener("click", async () => {
+    try { swapData = await api("/reports/swapped?" + swQs()); } catch (e) { return; }
+    const d = swapData, t = d.totals;
+    document.getElementById("swapRepOut").innerHTML = `
+      <div class="grid grid-2">
+        <div><h4 style="margin:6px 0">Summary by Brand / Size</h4>
+          <div class="table-wrap"><table><thead><tr><th>Brand Swapped</th><th>Size</th><th>Qty</th><th>Swap Fees</th><th>Amount</th></tr></thead><tbody>
+            ${d.summary.length ? d.summary.map(r => `<tr><td><b>${esc(r.swap_brand)}</b></td><td>${esc(r.product_name)}</td><td>${r.qty}</td><td>${money(r.swap_fees)}</td><td>${money(r.amount)}</td></tr>`).join("")
+              : `<tr><td colspan="5" style="color:var(--muted)">No swap sales in this period.</td></tr>`}
+            <tr style="font-weight:700;background:var(--bg)"><td>TOTAL</td><td></td><td>${t.qty}</td><td>${money(t.swap_fees)}</td><td>${money(t.amount)}</td></tr>
+          </tbody></table></div></div>
+        <div><h4 style="margin:6px 0">Swapped Empties On Hand</h4>
+          <div class="table-wrap"><table><thead><tr><th>Location</th><th>Brand</th><th>Size</th><th>Qty</th></tr></thead><tbody>
+            ${d.on_hand.length ? d.on_hand.map(r => `<tr><td>${esc(r.location_name)}</td><td>${esc(r.brand)}</td><td>${esc(r.product_name)}</td><td>${r.quantity}</td></tr>`).join("")
+              : `<tr><td colspan="4" style="color:var(--muted)">None on hand.</td></tr>`}
+            <tr style="font-weight:700;background:var(--bg)"><td>TOTAL</td><td></td><td></td><td>${t.on_hand}</td></tr>
+          </tbody></table></div></div>
+      </div>
+      <h4 style="margin:14px 0 6px">Swap Transactions</h4>
+      <div class="table-wrap"><table><thead><tr><th>Date</th><th>Sale #</th><th>Location</th><th>Cashier</th><th>Customer</th><th>Brand</th><th>Size</th><th>Qty</th><th>Swap Fees</th><th>Amount</th></tr></thead><tbody>
+        ${d.rows.length ? d.rows.map(r => `<tr><td>${r.ts.slice(0, 16)}</td><td>${esc(r.sale_no)}</td><td>${esc(r.location_name)}</td><td>${esc(r.cashier)}</td>
+          <td>${esc(r.customer_name || "Walk-in")}</td><td>${esc(r.swap_brand)}</td><td>${esc(r.product_name)}</td><td>${r.qty}</td>
+          <td>${money(r.swap_fee_total)}</td><td>${money(r.amount)}</td></tr>`).join("")
+          : `<tr><td colspan="10" style="color:var(--muted)">No swap sales in this period.</td></tr>`}
+      </tbody></table></div>`;
+  });
+  document.getElementById("swPrint").addEventListener("click", async () => {
+    if (!swapData) { try { swapData = await api("/reports/swapped?" + swQs()); } catch (e) { return; } }
+    printSwappedReport(swapData);
+  });
 
   function updateExportLinks() {
     const from = document.getElementById("repFrom").value, to = document.getElementById("repTo").value;
@@ -2126,11 +2223,66 @@ async function renderVehicles(c) {
 }
 
 // ================================================================== HAULING SCHEDULE
+function printHaulingCalendar(rows, month) {
+  const [y, m] = month.split("-").map(Number);
+  const first = new Date(y, m - 1, 1);
+  const daysInMonth = new Date(y, m, 0).getDate();
+  const monthName = first.toLocaleString("en-US", { month: "long", year: "numeric" });
+  const byDay = {};
+  rows.filter(h => (h.scheduled_date || "").slice(0, 7) === month)
+    .forEach(h => (byDay[parseInt(h.scheduled_date.slice(8, 10))] ||= []).push(h));
+  const total = Object.values(byDay).reduce((a, l) => a + l.length, 0);
+  const cells = [];
+  for (let i = 0; i < first.getDay(); i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+  while (cells.length % 7) cells.push(null);
+  const weeks = [];
+  for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+  const rowH = weeks.length > 5 ? 108 : 128;
+  const trip = h => `<div style="border-left:3px solid ${h.status === "CANCELLED" ? "#c0392b" : h.status === "COMPLETED" ? "#1e9e5a" : "#0b3d66"};
+      background:#f4f6f8;padding:2px 4px;margin-bottom:3px;font-size:9px;line-height:1.25;${h.status === "CANCELLED" ? "text-decoration:line-through;" : ""}">
+    <b>${esc(h.hauling_no)}</b> · ${esc(h.status)}<br>
+    ${esc(h.plant_name)}${h.destination_name ? " → " + esc(h.destination_name) : ""}<br>
+    ${h.plate_number ? esc(h.plate_number) : "No vehicle"}${h.driver ? " · " + esc(h.driver) : ""}<br>
+    ${h.items.map(i => `${esc(i.product_name)} x${i.qty}`).join(", ")}</div>`;
+  printDocument(`<style>@page{size:letter landscape;margin:8mm}
+    .haul-cal, .haul-cal *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+    .haul-cal td div{overflow-wrap:anywhere;word-break:break-word}
+    .haul-cal th, .haul-cal td{white-space:normal;text-transform:none}</style>
+  <div class="haul-cal" style="font-family:Arial,sans-serif;box-sizing:border-box">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+      <img src="/images/logo.png" style="height:36px">
+      <div style="flex:1"><div style="font-weight:700;font-size:14px">GREAT UNLI FOOD CORP. — Hauling Schedule</div>
+        <div style="font-size:11px;color:#555">Solane LPG Distributor · ${total} trip${total === 1 ? "" : "s"}</div></div>
+      <div style="font-size:20px;font-weight:700;color:#0b3d66">${monthName}</div>
+    </div>
+    <table style="width:100%;border-collapse:collapse;table-layout:fixed">
+      <tr>${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(d => `<th style="background:#0b3d66;color:#fff;font-size:11px;padding:4px;border:1px solid #0b3d66">${d}</th>`).join("")}</tr>
+      ${weeks.map(w => `<tr>${w.map(d => `<td style="border:1px solid #bbb;vertical-align:top;height:${rowH}px;padding:3px;overflow:hidden;${d ? "" : "background:#fafafa"}">
+        ${d ? `<div style="font-weight:700;font-size:11px;text-align:right">${d}</div>${(byDay[d] || []).map(trip).join("")}` : ""}</td>`).join("")}</tr>`).join("")}
+    </table>
+    <div style="text-align:right;color:#888;margin-top:4px;font-size:9px">Printed ${new Date().toLocaleString()} by ${esc(state.user.name)}</div>
+  </div>`);
+}
+
 async function renderHauling(c) {
-  c.innerHTML = `<div style="margin-bottom:12px"><button class="btn green" id="newHaulBtn">+ Schedule Hauling</button></div><div id="haulTable">Loading...</div>`;
+  const thisMonth = new Date().toISOString().slice(0, 7);
+  c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <button class="btn green" id="newHaulBtn">+ Schedule Hauling</button>
+      <span style="flex:1"></span>
+      <input type="month" id="haulMonth" value="${thisMonth}">
+      <label style="font-size:13px;display:flex;gap:4px;align-items:center"><input type="checkbox" id="haulInclCancelled"> Include cancelled</label>
+      <button class="btn" id="haulPrintCal">Print Calendar</button>
+    </div><div id="haulTable">Loading...</div>`;
   const statusColor = s => ({ SCHEDULED: "blue", LOADING: "warn", "IN TRANSIT": "warn", COMPLETED: "green", CANCELLED: "danger" }[s] || "gray");
+  let haulRows = [];
+  document.getElementById("haulPrintCal").addEventListener("click", () => {
+    const month = document.getElementById("haulMonth").value || thisMonth;
+    const incl = document.getElementById("haulInclCancelled").checked;
+    printHaulingCalendar(haulRows.filter(h => incl || h.status !== "CANCELLED"), month);
+  });
   async function load() {
-    const rows = await api("/hauling");
+    const rows = haulRows = await api("/hauling");
     document.getElementById("haulTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
       <th>Hauling #</th><th>Date</th><th>Plant</th><th>Destination</th><th>Vehicle</th><th>Products</th><th>Status</th><th></th>
     </tr></thead><tbody>

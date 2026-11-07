@@ -32,6 +32,17 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Swapped Cylinder Report** (Reports → Swapped Cylinder Report, Admin/Manager).
+  Every other-brand cylinder taken in on a swap sale, with filters for date range
+  and location. Shows totals per brand and size (qty, swap fees, sales amount),
+  each swap transaction, and the swapped empties still on hand. Print, PDF and Excel.
+- **Print the hauling schedule as a calendar** (Hauling Schedule → pick a month →
+  Print Calendar). Prints a landscape month calendar with each trip on its date:
+  hauling #, status, plant and destination, vehicle and driver, and products.
+  Cancelled trips are left out unless "Include cancelled" is ticked.
+- **Products Sold in the End of Day Report** now has its own section with a total
+  row, on screen and in the printout, the PDF and the Excel file.
+
 - **System Reset (Go Live)** (Reports & Admin → System Reset, Admin only). Run this
   once when testing is over, before the client starts real operations. It always
   clears every transaction (sales, payments, receivables/arrears, transfers,

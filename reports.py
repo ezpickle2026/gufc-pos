@@ -272,11 +272,16 @@ def eod_pdf_response(data, filename):
     flow.append(styled(summary, [300, 120]))
 
     if data["items"]:
-        flow.append(Paragraph("Items Sold", h3))
+        flow.append(Paragraph("Products Sold", h3))
         rows = [["Product", "Type", "Qty", "Amount"]]
         for i in data["items"]:
             rows.append([i["product_name"], i["sale_mode"], str(i["qty"]), m(i["amount"])])
-        flow.append(styled(rows, [210, 80, 60, 100], right_from=2))
+        rows.append(["TOTAL", "", str(sum(i["qty"] for i in data["items"])),
+                     m(sum(i["amount"] or 0 for i in data["items"]))])
+        flow.append(styled(rows, [210, 80, 60, 100], total_row=True, right_from=2))
+    else:
+        flow.append(Paragraph("Products Sold", h3))
+        flow.append(Paragraph("No products sold.", styles["Normal"]))
 
     flow.append(Paragraph("Payments Received", h3))
     rows = [["Time", "Sale / Invoice", "Customer", "Type", "Method", "Reference", "Amount"]]
@@ -336,6 +341,14 @@ def eod_xlsx_response(data, filename):
     for col, width in zip("ABCDE", (32, 12, 14, 16, 14)):
         ws.column_dimensions[col].width = width
 
+    ws.append([])
+    header(ws, ["Products Sold", "Type", "Qty", "Amount"])
+    for i in data["items"]:
+        ws.append([i["product_name"], i["sale_mode"], i["qty"], i["amount"]])
+    ws.append(["TOTAL", "", sum(i["qty"] for i in data["items"]), round(sum(i["amount"] or 0 for i in data["items"]), 2)])
+    for cell in ws[ws.max_row]:
+        cell.font = Font(bold=True)
+
     ws2 = wb.create_sheet("Payments")
     header(ws2, ["Date/Time", "Sale #", "Invoice #", "Customer", "Type", "Method", "Reference", "Collected By", "Amount"])
     for p in data["payments"]:
@@ -343,6 +356,113 @@ def eod_xlsx_response(data, filename):
                     "AR Collection" if p["payment_source"] == "AR_COLLECTION" else "POS Sale",
                     p["method"], p["reference"] or "", p["collected_by"] or "", p["amount"]])
     for col, width in zip("ABCDEFGHI", (19, 20, 20, 26, 14, 14, 18, 20, 12)):
+        ws2.column_dimensions[col].width = width
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+def _styled_table(table_data, widths, total_row=False, right_from=None):
+    t = Table(table_data, repeatRows=1, colWidths=widths)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), BLUE),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
+    ]
+    if right_from is not None:
+        style.append(("ALIGN", (right_from, 1), (-1, -1), "RIGHT"))
+    if total_row:
+        style += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+                  ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e8f5ee"))]
+    t.setStyle(TableStyle(style))
+    return t
+
+
+def swapped_pdf_response(data, subtitle, filename):
+    """Swapped Cylinder Report: per-brand/size summary, every swap line, and
+    other-brand empties still on hand."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(letter), topMargin=36, bottomMargin=36, leftMargin=36, rightMargin=36)
+    styles = getSampleStyleSheet()
+    h3 = ParagraphStyle("H3GUFC", parent=styles["Heading3"], textColor=BLUE, spaceBefore=10)
+    flow = _header_flowables("Swapped Cylinder Report", subtitle)
+    m = lambda n: f"{(n or 0):,.2f}"
+    t = data["totals"]
+
+    flow.append(Paragraph("Summary by Brand / Size", h3))
+    rows = [["Brand Swapped", "Size (swapped for)", "Qty", "Swap Fees", "Sales Amount"]]
+    for r in data["summary"]:
+        rows.append([r["swap_brand"], r["product_name"], str(r["qty"]), m(r["swap_fees"]), m(r["amount"])])
+    rows.append(["TOTAL", "", str(t["qty"]), m(t["swap_fees"]), m(t["amount"])])
+    flow.append(_styled_table(rows, [150, 180, 60, 90, 100], total_row=True, right_from=2))
+
+    flow.append(Paragraph("Swap Transactions", h3))
+    rows = [["Date", "Sale #", "Location", "Cashier", "Customer", "Brand", "Size", "Qty", "Fee / Unit", "Swap Fees", "Amount"]]
+    for r in data["rows"]:
+        rows.append([r["ts"][:16], r["sale_no"], r["location_name"][:17], r["cashier"][:16], (r["customer_name"] or "Walk-in")[:18],
+                     r["swap_brand"][:12], r["product_name"][:18], str(r["qty"]), m(r["swap_fee"]), m(r["swap_fee_total"]), m(r["amount"])])
+    if len(rows) == 1:
+        rows.append(["—", "No swap sales in this period", "", "", "", "", "", "", "", "", ""])
+    flow.append(_styled_table(rows, [68, 92, 80, 74, 82, 56, 82, 26, 46, 50, 64], right_from=7))
+
+    flow.append(Paragraph("Swapped Empties On Hand (not yet dispatched)", h3))
+    rows = [["Location", "Brand", "Size (swapped for)", "Qty on Hand"]]
+    for r in data["on_hand"]:
+        rows.append([r["location_name"], r["brand"], r["product_name"], str(r["quantity"])])
+    rows.append(["TOTAL", "", "", str(t["on_hand"])])
+    flow.append(_styled_table(rows, [150, 120, 180, 80], total_row=True, right_from=3))
+
+    doc.build(flow)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
+
+
+def swapped_xlsx_response(data, subtitle, filename):
+    wb = Workbook()
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="0B3D66", end_color="0B3D66", fill_type="solid")
+
+    def header(ws, row):
+        ws.append(row)
+        for cell in ws[ws.max_row]:
+            cell.font = header_font
+            cell.fill = header_fill
+
+    def bold_last(ws):
+        for cell in ws[ws.max_row]:
+            cell.font = Font(bold=True)
+
+    t = data["totals"]
+    ws = wb.active
+    ws.title = "Summary"
+    ws.append(["Swapped Cylinder Report"]); ws["A1"].font = Font(bold=True, size=14)
+    ws.append([subtitle])
+    ws.append([])
+    header(ws, ["Brand Swapped", "Size (swapped for)", "Qty", "Swap Fees", "Sales Amount"])
+    for r in data["summary"]:
+        ws.append([r["swap_brand"], r["product_name"], r["qty"], r["swap_fees"], r["amount"]])
+    ws.append(["TOTAL", "", t["qty"], t["swap_fees"], t["amount"]]); bold_last(ws)
+    ws.append([])
+    header(ws, ["On Hand: Location", "Brand", "Size (swapped for)", "Qty on Hand"])
+    for r in data["on_hand"]:
+        ws.append([r["location_name"], r["brand"], r["product_name"], r["quantity"]])
+    ws.append(["TOTAL", "", "", t["on_hand"]]); bold_last(ws)
+    for col, width in zip("ABCDE", (26, 24, 24, 14, 14)):
+        ws.column_dimensions[col].width = width
+
+    ws2 = wb.create_sheet("Swap Transactions")
+    header(ws2, ["Date/Time", "Sale #", "Location", "Cashier", "Customer", "Brand", "Size", "Qty",
+                 "Fee / Unit", "Swap Fees", "Amount"])
+    for r in data["rows"]:
+        ws2.append([r["ts"], r["sale_no"], r["location_name"], r["cashier"], r["customer_name"] or "Walk-in",
+                    r["swap_brand"], r["product_name"], r["qty"], r["swap_fee"], r["swap_fee_total"], r["amount"]])
+    for col, width in zip("ABCDEFGHIJK", (19, 20, 18, 18, 26, 14, 22, 8, 12, 12, 12)):
         ws2.column_dimensions[col].width = width
 
     buf = io.BytesIO()
