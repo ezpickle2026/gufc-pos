@@ -1453,6 +1453,135 @@ def adjust_inventory(conn, location_id, product_id, delta, mtype, reference, not
     )
 
 
+# ---------------------------------------------------------------- discounts & promos
+# Discounts are per item: each cart line can optionally pick one preset
+# discount. PERCENT = % off the line's gas price; FIXED = peso amount off per
+# unit. Discounts never reduce the cylinder deposit fee on DEPOSIT sales.
+
+def _discount_is_live(row, today=None):
+    today = today or datetime.now().date().isoformat()
+    if not row["active"]:
+        return False
+    if row["start_date"] and today < row["start_date"]:
+        return False
+    if row["end_date"] and today > row["end_date"]:
+        return False
+    return True
+
+
+def compute_item_discount(disc, product_id, unit_gas_price, qty):
+    """Server-side discount amount for one sale line. Raises ValueError if
+    the discount can't be applied to this line."""
+    if not _discount_is_live(disc):
+        raise ValueError(f"Discount '{disc['name']}' is not active today")
+    if disc["product_id"] and int(disc["product_id"]) != int(product_id):
+        raise ValueError(f"Discount '{disc['name']}' does not apply to this product")
+    if qty < (disc["min_qty"] or 1):
+        raise ValueError(f"Discount '{disc['name']}' needs at least {disc['min_qty']} qty")
+    gas_total = unit_gas_price * qty
+    if disc["type"] == "PERCENT":
+        amount = gas_total * float(disc["value"]) / 100.0
+    else:
+        amount = float(disc["value"]) * qty
+    return round(min(max(amount, 0), gas_total), 2)
+
+
+def _discount_payload(d):
+    name = (d.get("name") or "").strip()
+    if not name:
+        raise ValueError("Name is required")
+    dtype = (d.get("type") or "").upper()
+    if dtype not in ("PERCENT", "FIXED"):
+        raise ValueError("Type must be PERCENT or FIXED")
+    value = float(d.get("value") or 0)
+    if value <= 0:
+        raise ValueError("Value must be greater than zero")
+    if dtype == "PERCENT" and value > 100:
+        raise ValueError("Percent discount cannot exceed 100")
+    product_id = d.get("product_id") or None
+    min_qty = int(d.get("min_qty") or 1)
+    if min_qty < 1:
+        raise ValueError("Minimum qty must be at least 1")
+    start = (d.get("start_date") or "").strip() or None
+    end = (d.get("end_date") or "").strip() or None
+    for v in (start, end):
+        if v:
+            datetime.strptime(v, "%Y-%m-%d")
+    if start and end and end < start:
+        raise ValueError("End date is before start date")
+    active = 1 if d.get("active", True) in (True, 1, "1", "true") else 0
+    return (name, dtype, value, product_id, min_qty, start, end, active, (d.get("notes") or "").strip())
+
+
+@app.get("/api/discounts")
+@login_required
+def list_discounts():
+    """?live=1 returns only discounts usable today (for the POS)."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT dc.*, p.name product_name FROM discounts dc
+           LEFT JOIN products p ON p.id=dc.product_id ORDER BY dc.active DESC, dc.name"""
+    ).fetchall()
+    conn.close()
+    out = [dict(r) for r in rows]
+    if request.args.get("live"):
+        out = [r for r in out if _discount_is_live(r)]
+    return jsonify(out)
+
+
+@app.post("/api/discounts")
+@roles_required("ADMIN", "MANAGER")
+def create_discount():
+    try:
+        vals = _discount_payload(request.get_json(force=True))
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    conn = get_db()
+    cur = conn.execute(
+        """INSERT INTO discounts (name, type, value, product_id, min_qty, start_date, end_date, active, notes)
+           VALUES (?,?,?,?,?,?,?,?,?)""", vals)
+    audit(conn, "CREATE", "DISCOUNTS", cur.lastrowid, f"{vals[0]} {vals[1]} {vals[2]}")
+    conn.commit()
+    conn.close()
+    return jsonify(id=cur.lastrowid), 201
+
+
+@app.put("/api/discounts/<int:did>")
+@roles_required("ADMIN", "MANAGER")
+def update_discount(did):
+    try:
+        vals = _discount_payload(request.get_json(force=True))
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    conn = get_db()
+    cur = conn.execute(
+        """UPDATE discounts SET name=?, type=?, value=?, product_id=?, min_qty=?, start_date=?, end_date=?,
+           active=?, notes=? WHERE id=?""", vals + (did,))
+    if not cur.rowcount:
+        conn.close()
+        return jsonify(error="Discount not found"), 404
+    audit(conn, "UPDATE", "DISCOUNTS", did, f"{vals[0]} {vals[1]} {vals[2]} active={vals[7]}")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/discounts/<int:did>")
+@roles_required("ADMIN", "MANAGER")
+def delete_discount(did):
+    conn = get_db()
+    row = conn.execute("SELECT name FROM discounts WHERE id=?", (did,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Discount not found"), 404
+    # Past sales keep their own copy of the discount name/amount, so deleting is safe.
+    conn.execute("DELETE FROM discounts WHERE id=?", (did,))
+    audit(conn, "DELETE", "DISCOUNTS", did, row["name"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
 # ---------------------------------------------------------------- POS / sales
 
 @app.post("/api/sales")
@@ -1470,7 +1599,6 @@ def create_sale():
     payments = d.get("payments") or []
     sale_type = d.get("sale_type", "CASH")
     customer_id = d.get("customer_id")
-    discount = float(d.get("discount") or 0)
 
     conn = get_db()
     try:
@@ -1488,13 +1616,24 @@ def create_sale():
                 raise ValueError("sale_mode must be REFILL or DEPOSIT")
             # server-side price, never trust frontend: REFILL is gas only;
             # DEPOSIT adds the cylinder deposit fee (customer keeps the tank).
-            price = float(prod["price"])
+            gas_price = float(prod["price"])
+            price = gas_price
             if sale_mode == "DEPOSIT":
                 price += float(prod["deposit_price"])
             line_total = round(price * qty, 2)
             subtotal += line_total
-            resolved_items.append((prod, qty, price, line_total, sale_mode))
+            # optional per-item discount, recomputed server-side
+            disc_id, disc_name, disc_amount = None, None, 0.0
+            if it.get("discount_id"):
+                disc = conn.execute("SELECT * FROM discounts WHERE id=?", (it["discount_id"],)).fetchone()
+                if not disc:
+                    raise ValueError("Selected discount no longer exists")
+                disc_amount = compute_item_discount(disc, prod["id"], gas_price, qty)
+                disc_id, disc_name = disc["id"], disc["name"]
+            resolved_items.append((prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount))
 
+        subtotal = round(subtotal, 2)
+        discount = round(sum(r[7] for r in resolved_items), 2)
         total = round(subtotal - discount, 2)
         if total < 0:
             raise ValueError("Discount exceeds subtotal")
@@ -1532,10 +1671,12 @@ def create_sale():
         )
         sale_id = cur.lastrowid
 
-        for prod, qty, price, line_total, sale_mode in resolved_items:
+        for prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount in resolved_items:
             conn.execute(
-                "INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode) VALUES (?,?,?,?,?,?,?)",
-                (sale_id, prod["id"], prod["name"], qty, price, line_total, sale_mode),
+                """INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode,
+                   discount_id, discount_name, discount_amount) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (sale_id, prod["id"], prod["name"], qty, price, line_total, sale_mode,
+                 disc_id, disc_name, disc_amount),
             )
             adjust_inventory(conn, location_id, prod["id"], -qty, "SALE", sale_no,
                               notes=f"Sold via {sale_no} ({sale_mode})")

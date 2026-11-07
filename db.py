@@ -323,6 +323,20 @@ CREATE TABLE IF NOT EXISTS booked_order_items (
     qty INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS discounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL CHECK(type IN ('PERCENT','FIXED')),
+    value REAL NOT NULL,
+    product_id INTEGER REFERENCES products(id),
+    min_qty INTEGER NOT NULL DEFAULT 1,
+    start_date TEXT,
+    end_date TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS incident_reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     report_no TEXT UNIQUE NOT NULL,
@@ -553,6 +567,15 @@ def migrate_schema():
         conn.execute("UPDATE payments SET payment_source='AR_COLLECTION' WHERE reference LIKE 'AR-%'")
     if not _column_exists(conn, "sales", "is_opening_balance"):
         conn.execute("ALTER TABLE sales ADD COLUMN is_opening_balance INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+
+    # 9b. Per-item discounts/promos on sale lines.
+    if not _column_exists(conn, "sale_items", "discount_id"):
+        conn.execute("ALTER TABLE sale_items ADD COLUMN discount_id INTEGER")
+    if not _column_exists(conn, "sale_items", "discount_name"):
+        conn.execute("ALTER TABLE sale_items ADD COLUMN discount_name TEXT")
+    if not _column_exists(conn, "sale_items", "discount_amount"):
+        conn.execute("ALTER TABLE sale_items ADD COLUMN discount_amount REAL NOT NULL DEFAULT 0")
     conn.commit()
 
     # 10. transfers.to_location becomes nullable so empties can be dispatched

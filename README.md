@@ -32,6 +32,14 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Discounts & Promos settings** (Reports & Admin → Discounts & Promos, Admin/Manager).
+  Create named discounts as **% off** or **₱ off per unit**, for **all items** or one
+  specific product, with an optional minimum qty and start/end dates. In POS each
+  cart line has an optional discount dropdown; the server recomputes every discount
+  (never trusts the browser), and the receipt and sale view show it per line.
+  Discounts apply to the gas price only, never the cylinder deposit fee. The old
+  free-typed whole-sale discount box was replaced by these per-item discounts.
+
 - **Dispatch empty cylinders** — a dispatch can now carry several lines, each
   marked **Full** or **Empty**. Empties can go to another location (added to
   that location's empties when it's marked Received) or out to a **plant** for
