@@ -255,8 +255,8 @@ your existing data will carry forward untouched.
   fee and track the cylinder as on loan to the customer until returned
 - **Brand swap sales**: choose *Swap (other brand)* on a cylinder line in the cart,
   pick the LPG brand the customer is handing over (Petron Gasul, Shellane,
-  Prycegas, etc. or type another), and enter the swapping fee per cylinder — it's
-  added to the line price and the total. The brand and fee show on the receipt,
+  Prycegas, etc. or type another), and optionally type a swapping fee per cylinder
+  (leave blank for no fee) — it's added to the line price and the total. The brand and fee show on the receipt,
   sale details and sales report. Swapped-in empties of other brands are not added
   to our empty-cylinder stock.
 - Server-side validation: can't oversell inventory, can't exceed a customer's

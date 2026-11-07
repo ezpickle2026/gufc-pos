@@ -418,7 +418,7 @@ const SWAP_BRANDS = ["Petron Gasul", "Shellane", "Prycegas", "Fiesta Gas", "Rega
 function openSwapDialog(item, onOk, onCancel) {
   const cur = item.swap_brand || "";
   const isPreset = SWAP_BRANDS.includes(cur);
-  const fee = item.swap_fee ?? state.lastSwapFee ?? 0;
+  const fee = item.swap_fee ? item.swap_fee : "";
   openModal(`Swap &mdash; ${esc(item.name)}`, `
     <p style="color:var(--muted);font-size:13px;margin-top:0">Customer hands over an empty cylinder of another brand in exchange for a full ${esc(item.name)}.</p>
     <div class="field"><label>Brand of LPG being swapped</label>
@@ -431,8 +431,8 @@ function openSwapDialog(item, onOk, onCancel) {
     <div class="field" id="swapOtherWrap" style="${cur && !isPreset ? "" : "display:none"}">
       <label>Other brand</label><input type="text" id="swapOther" value="${cur && !isPreset ? esc(cur) : ""}" placeholder="Brand name">
     </div>
-    <div class="field"><label>Swapping fee (per cylinder)</label>
-      <input type="number" id="swapFee" min="0" step="0.01" value="${fee}">
+    <div class="field"><label>Swapping fee per cylinder <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+      <input type="number" id="swapFee" min="0" step="0.01" value="${fee}" placeholder="Leave blank if no fee">
     </div>
     <div class="field" style="font-size:13px">Price per cylinder: <b id="swapPreview"></b>
       <span style="color:var(--muted)">(${money(item.base_price)} gas + fee)</span></div>
@@ -452,11 +452,11 @@ function openSwapDialog(item, onOk, onCancel) {
     document.getElementById("swapCancel").addEventListener("click", () => { closeModal(); if (onCancel) onCancel(); });
     document.getElementById("swapOk").addEventListener("click", () => {
       const brand = sel.value === "__other" ? document.getElementById("swapOther").value.trim() : sel.value;
-      const f = parseFloat(feeIn.value);
+      const raw = feeIn.value.trim();
+      const f = raw === "" ? 0 : parseFloat(raw);
       if (!brand) { toast("Select the LPG brand being swapped", "error"); return; }
-      if (isNaN(f) || f < 0) { toast("Enter a valid swapping fee (0 or more)", "error"); return; }
+      if (isNaN(f) || f < 0) { toast("Swapping fee must be a number (0 or more), or leave it blank", "error"); return; }
       const rounded = Math.round(f * 100) / 100;
-      state.lastSwapFee = rounded;
       closeModal();
       onOk(brand, rounded);
     });
@@ -504,7 +504,7 @@ function drawCart(locationId) {
             ${i.deposit_price > 0 ? `<option value="DEPOSIT" ${i.sale_mode === 'DEPOSIT' ? 'selected' : ''}>New/Deposit (+${money(i.deposit_price)})</option>` : ""}
             <option value="SWAP" ${i.sale_mode === 'SWAP' ? 'selected' : ''}>Swap (other brand)</option>
           </select>` : ""}
-          ${i.sale_mode === 'SWAP' ? `<br><span style="font-size:12px">Swap from <b>${esc(i.swap_brand)}</b> &middot; fee ${money(i.swap_fee)}/cyl</span>
+          ${i.sale_mode === 'SWAP' ? `<br><span style="font-size:12px">Swap from <b>${esc(i.swap_brand)}</b>${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : " &middot; no fee"}</span>
             <button class="btn small" type="button" style="font-size:11px;padding:1px 6px" onclick="__posEditSwap(${i.product_id})">Edit</button>` : ""}
           ${(() => {
             const opts = discountsFor(i);
@@ -628,7 +628,7 @@ function printReceipt(result) {
       <div>Txn: ${sale.sale_no}<br>Date: ${sale.ts}<br>Cashier: ${esc(sale.cashier_name)}<br>
       Customer: ${esc(sale.customer_name || "Walk-in")} ${sale.account_no ? "(" + sale.account_no + ")" : ""}</div>
       <div>--------------------------------</div>
-      ${items.map(i => `${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}${i.sale_mode === 'SWAP' ? `<br>  SWAP from ${esc(i.swap_brand)} (fee ${money(i.swap_fee)}/cyl)` : ''}<br>  ${i.qty} x ${money(i.price)} = ${money(i.subtotal)}${i.discount_amount > 0 ? `<br>  Less: ${esc(i.discount_name)} -${money(i.discount_amount)}` : ""}`).join("<br>")}
+      ${items.map(i => `${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}${i.sale_mode === 'SWAP' ? `<br>  SWAP from ${esc(i.swap_brand)}${i.swap_fee > 0 ? ` (fee ${money(i.swap_fee)}/cyl)` : ""}` : ''}<br>  ${i.qty} x ${money(i.price)} = ${money(i.subtotal)}${i.discount_amount > 0 ? `<br>  Less: ${esc(i.discount_name)} -${money(i.discount_amount)}` : ""}`).join("<br>")}
       <div>--------------------------------</div>
       <div>Subtotal: ${money(sale.subtotal)}<br>Discount: ${money(sale.discount)}<br><b>Total: ${money(sale.total)}</b></div>
       <div>--------------------------------</div>
@@ -672,7 +672,7 @@ window.viewSale = async (id) => {
     <div class="field"><b>Cashier:</b> ${esc(sale.cashier_name)} &nbsp; <b>Customer:</b> ${esc(sale.customer_name || "Walk-in")}</div>
     <div class="field"><b>Status:</b> <span class="badge ${sale.status === 'VOIDED' ? 'danger' : 'blue'}">${sale.status}</span></div>
     <div class="table-wrap"><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Subtotal</th></tr></thead><tbody>
-      ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}${i.sale_mode === 'SWAP' ? ` <span class="badge blue">SWAP</span><br><span style="font-size:12px">from ${esc(i.swap_brand)} &middot; fee ${money(i.swap_fee)}/cyl</span>` : ''}${i.discount_amount > 0 ? `<br><span style="font-size:12px;color:var(--green-dark)">${esc(i.discount_name)} &minus;${money(i.discount_amount)}</span>` : ""}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
+      ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}${i.sale_mode === 'SWAP' ? ` <span class="badge blue">SWAP</span><br><span style="font-size:12px">from ${esc(i.swap_brand)}${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : ""}</span>` : ''}${i.discount_amount > 0 ? `<br><span style="font-size:12px;color:var(--green-dark)">${esc(i.discount_name)} &minus;${money(i.discount_amount)}</span>` : ""}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
     </tbody></table></div>
     <div style="margin-top:10px">
       <div class="cart-total-row"><span>Subtotal</span><span>${money(sale.subtotal)}</span></div>
