@@ -89,6 +89,7 @@ const NAV = [
   { id: "users", label: "Users", icon: "\u{1F464}", roles: ["ADMIN", "MANAGER"] },
   { id: "roles", label: "Manage Roles", icon: "\u{1F511}", roles: ["ADMIN", "MANAGER"] },
   { id: "products", label: "Products", icon: "\u{1F3F7}", roles: ["ADMIN"] },
+  { id: "discounts", label: "Discounts & Promos", icon: "\u{1F3AB}", roles: ["ADMIN", "MANAGER"] },
   { id: "locations", label: "Locations", icon: "\u{1F3E2}", roles: ["ADMIN"] },
 ];
 
@@ -158,7 +159,7 @@ function render() {
     dashboard: renderDashboard, pos: renderPOS, sales: renderSales,
     customers: renderCustomers, receivables: renderReceivables,
     inventory: renderInventory, inventory_ledger: renderInventoryLedger, transfers: renderTransfers, reports: renderReports,
-    users: renderUsers, products: renderProducts, locations: renderLocations,
+    users: renderUsers, products: renderProducts, locations: renderLocations, discounts: renderDiscounts,
     audit: renderAudit, cylinder_deposits: renderCylinderDeposits,
     hauling: renderHauling, vehicles: renderVehicles, employees: renderEmployees,
     staff_schedule: renderStaffSchedule, kpi: renderKpi,
@@ -296,6 +297,7 @@ async function renderDashboard(c) {
 async function renderPOS(c) {
   state.cart = [];
   state.products = await api("/products");
+  try { state.discounts = await api("/discounts?live=1"); } catch (e) { state.discounts = []; }
   const locationId = state.user.role === "ADMIN" ? (state.locations[0] && state.locations[0].id) : state.user.location_id;
   const inv = await api(`/inventory?location_id=${locationId}`);
   const stockMap = {};
@@ -355,6 +357,12 @@ async function renderPOS(c) {
     else item.qty = q;
     drawCart(locationId);
   };
+  window.__posDiscount = (pid, mode, val) => {
+    const item = state.cart.find(i => i.product_id === pid && i.sale_mode === mode);
+    if (!item) return;
+    item.discount_id = val ? parseInt(val) : null;
+    drawCart(locationId);
+  };
   window.__posMode = (pid, oldMode, newMode) => {
     const item = state.cart.find(i => i.product_id === pid && i.sale_mode === oldMode);
     if (!item) return;
@@ -371,14 +379,36 @@ async function renderPOS(c) {
   };
 }
 
+// Discounts usable on a cart line (all-items promos + ones for this product).
+function discountsFor(item) {
+  return (state.discounts || []).filter(d => !d.product_id || d.product_id === item.product_id);
+}
+
+// Mirrors compute_item_discount() on the server: % off the gas price, or a
+// fixed peso amount per unit. Never touches the cylinder deposit fee.
+function lineDiscount(item) {
+  if (!item.discount_id) return 0;
+  const d = (state.discounts || []).find(x => x.id === item.discount_id);
+  if (!d || (d.product_id && d.product_id !== item.product_id) || item.qty < (d.min_qty || 1)) return 0;
+  const gas = item.base_price * item.qty;
+  const amt = d.type === "PERCENT" ? gas * d.value / 100 : d.value * item.qty;
+  return Math.round(Math.min(Math.max(amt, 0), gas) * 100) / 100;
+}
+
+function discountLabel(d) {
+  const v = d.type === "PERCENT" ? `${d.value}% off` : `${money(d.value)} off/unit`;
+  return `${d.name} (${v}${d.min_qty > 1 ? `, min ${d.min_qty}` : ""})`;
+}
+
 function cartTotals() {
   const subtotal = state.cart.reduce((s, i) => s + i.price * i.qty, 0);
-  return { subtotal };
+  const discount = state.cart.reduce((s, i) => s + lineDiscount(i), 0);
+  return { subtotal, discount, total: Math.max(0, subtotal - discount) };
 }
 
 function drawCart(locationId) {
   const panel = document.getElementById("cartPanel");
-  const { subtotal } = cartTotals();
+  const { subtotal, discount, total } = cartTotals();
   panel.innerHTML = `
     <h3 style="margin-top:0">Cart</h3>
     <div id="cartLines">${state.cart.length ? state.cart.map(i => `
@@ -389,6 +419,18 @@ function drawCart(locationId) {
             <option value="REFILL" ${i.sale_mode === 'REFILL' ? 'selected' : ''}>Refill (exchange empty)</option>
             <option value="DEPOSIT" ${i.sale_mode === 'DEPOSIT' ? 'selected' : ''}>New/Deposit (+${money(i.deposit_price)})</option>
           </select>` : ""}
+          ${(() => {
+            const opts = discountsFor(i);
+            if (!opts.length) return "";
+            const ld = lineDiscount(i);
+            const blocked = i.discount_id && !ld;
+            return `<br><select style="margin-top:4px;font-size:11px;padding:2px 4px;max-width:100%" onchange="__posDiscount(${i.product_id}, '${i.sale_mode}', this.value)">
+              <option value="">No discount</option>
+              ${opts.map(d => `<option value="${d.id}" ${i.discount_id === d.id ? "selected" : ""}>${esc(discountLabel(d))}</option>`).join("")}
+            </select>
+            ${ld ? `<span style="color:var(--green-dark);font-size:12px;font-weight:600">&minus;${money(ld)}</span>` : ""}
+            ${blocked ? `<span style="color:var(--danger);font-size:11px">qty below promo minimum</span>` : ""}`;
+          })()}
         </div>
         <input type="number" min="0" value="${i.qty}" onchange="__posQty(${i.product_id}, '${i.sale_mode}', this.value)">
         <div style="width:78px;text-align:right;font-weight:600">${money(i.price * i.qty)}</div>
@@ -396,26 +438,17 @@ function drawCart(locationId) {
       </div>`).join("") : `<p style="color:var(--muted)">Cart is empty. Tap a product to add it.</p>`}
     </div>
     <div style="margin-top:10px">
-      <label style="font-size:12px;color:var(--muted)">Discount (₱)</label>
-      <input type="number" id="discountInput" value="0" min="0" style="width:100%">
-    </div>
-    <div style="margin-top:10px">
       <div class="cart-total-row"><span>Subtotal</span><span>${money(subtotal)}</span></div>
-      <div class="cart-total-row grand"><span>Total</span><span id="grandTotal">${money(subtotal)}</span></div>
+      ${discount > 0 ? `<div class="cart-total-row"><span>Item discounts</span><span>&minus;${money(discount)}</span></div>` : ""}
+      <div class="cart-total-row grand"><span>Total</span><span id="grandTotal">${money(total)}</span></div>
     </div>
     <button class="btn green" style="width:100%;margin-top:14px" id="checkoutBtn" ${state.cart.length ? "" : "disabled"}>Checkout</button>
   `;
-  const discountInput = document.getElementById("discountInput");
-  discountInput.addEventListener("input", () => {
-    const disc = parseFloat(discountInput.value) || 0;
-    document.getElementById("grandTotal").textContent = money(Math.max(0, subtotal - disc));
-  });
-  document.getElementById("checkoutBtn").addEventListener("click", () => openCheckout(locationId, subtotal));
+  document.getElementById("checkoutBtn").addEventListener("click", () => openCheckout(locationId));
 }
 
-async function openCheckout(locationId, subtotal) {
-  const discount = parseFloat(document.getElementById("discountInput").value) || 0;
-  const total = Math.max(0, subtotal - discount);
+async function openCheckout(locationId) {
+  const { total } = cartTotals();
   const customers = await api("/customers");
   const custOptions = `<option value="">-- Walk-in / no account --</option>` +
     customers.map(c => `<option value="${c.id}">${esc(c.name)} (${c.account_no}) - ${esc(c.category)}</option>`).join("");
@@ -476,8 +509,10 @@ async function openCheckout(locationId, subtotal) {
         location_id: locationId,
         customer_id: document.getElementById("custSelect").value || null,
         sale_type: document.getElementById("saleType").value,
-        discount,
-        items: state.cart.map(i => ({ product_id: i.product_id, qty: i.qty, sale_mode: i.sale_mode })),
+        items: state.cart.map(i => ({
+          product_id: i.product_id, qty: i.qty, sale_mode: i.sale_mode,
+          discount_id: lineDiscount(i) > 0 ? i.discount_id : null,
+        })),
         payments,
       };
       try {
@@ -505,7 +540,7 @@ function printReceipt(result) {
       <div>Txn: ${sale.sale_no}<br>Date: ${sale.ts}<br>Cashier: ${esc(sale.cashier_name)}<br>
       Customer: ${esc(sale.customer_name || "Walk-in")} ${sale.account_no ? "(" + sale.account_no + ")" : ""}</div>
       <div>--------------------------------</div>
-      ${items.map(i => `${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}<br>  ${i.qty} x ${money(i.price)} = ${money(i.subtotal)}`).join("<br>")}
+      ${items.map(i => `${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}<br>  ${i.qty} x ${money(i.price)} = ${money(i.subtotal)}${i.discount_amount > 0 ? `<br>  Less: ${esc(i.discount_name)} -${money(i.discount_amount)}` : ""}`).join("<br>")}
       <div>--------------------------------</div>
       <div>Subtotal: ${money(sale.subtotal)}<br>Discount: ${money(sale.discount)}<br><b>Total: ${money(sale.total)}</b></div>
       <div>--------------------------------</div>
@@ -549,7 +584,7 @@ window.viewSale = async (id) => {
     <div class="field"><b>Cashier:</b> ${esc(sale.cashier_name)} &nbsp; <b>Customer:</b> ${esc(sale.customer_name || "Walk-in")}</div>
     <div class="field"><b>Status:</b> <span class="badge ${sale.status === 'VOIDED' ? 'danger' : 'blue'}">${sale.status}</span></div>
     <div class="table-wrap"><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Subtotal</th></tr></thead><tbody>
-      ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
+      ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}${i.discount_amount > 0 ? `<br><span style="font-size:12px;color:var(--green-dark)">${esc(i.discount_name)} &minus;${money(i.discount_amount)}</span>` : ""}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
     </tbody></table></div>
     <div style="margin-top:10px">
       <div class="cart-total-row"><span>Subtotal</span><span>${money(sale.subtotal)}</span></div>
@@ -1547,6 +1582,87 @@ async function renderProducts(c) {
       });
     });
   });
+  load();
+}
+
+// ================================================================== ADMIN: DISCOUNTS & PROMOS
+async function renderDiscounts(c) {
+  c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <button class="btn green" id="newDiscBtn">+ New Discount / Promo</button>
+    <span style="font-size:12.5px;color:var(--muted)">Discounts apply per item. The cashier picks one (optional) for each cart line in POS.</span>
+  </div><div id="discTable">Loading...</div>`;
+  let rows = [];
+  const today = new Date().toISOString().slice(0, 10);
+  function statusOf(d) {
+    if (!d.active) return `<span class="badge danger">INACTIVE</span>`;
+    if (d.start_date && today < d.start_date) return `<span class="badge warn">SCHEDULED</span>`;
+    if (d.end_date && today > d.end_date) return `<span class="badge danger">EXPIRED</span>`;
+    return `<span class="badge green">ACTIVE</span>`;
+  }
+  async function load() {
+    rows = await api("/discounts");
+    document.getElementById("discTable").innerHTML = rows.length ? `<div class="table-wrap"><table><thead><tr>
+      <th>Name</th><th>Discount</th><th>Applies To</th><th>Min Qty</th><th>Valid</th><th>Status</th><th></th>
+    </tr></thead><tbody>
+      ${rows.map(d => `<tr>
+        <td>${esc(d.name)}${d.notes ? `<br><span style="font-size:12px;color:var(--muted)">${esc(d.notes)}</span>` : ""}</td>
+        <td>${d.type === "PERCENT" ? `${d.value}% off` : `${money(d.value)} off per unit`}</td>
+        <td>${d.product_id ? esc(d.product_name || "(deleted product)") : "All items"}</td>
+        <td>${d.min_qty}</td>
+        <td>${d.start_date || d.end_date ? `${d.start_date || "…"} to ${d.end_date || "…"}` : "Always"}</td>
+        <td>${statusOf(d)}</td>
+        <td style="display:flex;gap:6px">
+          <button class="btn small" onclick="editDiscount(${d.id})">Edit</button>
+          <button class="btn small danger" onclick="deleteDiscount(${d.id})">Delete</button>
+        </td></tr>`).join("")}
+    </tbody></table></div>` : `<p style="color:var(--muted)">No discounts or promos yet. Click "+ New Discount / Promo" to add one.</p>`;
+  }
+  function formFields(d = {}) {
+    const prodOpts = `<option value="">All items</option>` + state.products.map(p =>
+      `<option value="${p.id}" ${d.product_id === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+    return `
+      <div class="field"><label>Name (shown on POS and receipt)</label><input id="dName" value="${esc(d.name || "")}" placeholder="e.g. Senior Citizen, Holiday Promo"></div>
+      <div class="field"><label>Type</label><select id="dType">
+        <option value="PERCENT" ${d.type !== "FIXED" ? "selected" : ""}>Percent off (%)</option>
+        <option value="FIXED" ${d.type === "FIXED" ? "selected" : ""}>Fixed amount off per unit (₱)</option>
+      </select></div>
+      <div class="field"><label>Value</label><input type="number" step="0.01" min="0" id="dValue" value="${d.value ?? ""}"></div>
+      <div class="field"><label>Applies to item</label><select id="dProduct">${prodOpts}</select></div>
+      <div class="field"><label>Minimum qty per line</label><input type="number" min="1" id="dMinQty" value="${d.min_qty ?? 1}"></div>
+      <div class="field"><label>Start date (optional)</label><input type="date" id="dStart" value="${d.start_date || ""}"></div>
+      <div class="field"><label>End date (optional)</label><input type="date" id="dEnd" value="${d.end_date || ""}"></div>
+      <div class="field"><label>Notes</label><input id="dNotes" value="${esc(d.notes || "")}"></div>
+      <div class="field"><label><input type="checkbox" id="dActive" ${d.active === 0 ? "" : "checked"}> Active</label></div>
+      <p style="font-size:12px;color:var(--muted)">Discounts apply to the gas price only, never to the cylinder deposit fee.</p>`;
+  }
+  function readForm() {
+    return {
+      name: document.getElementById("dName").value, type: document.getElementById("dType").value,
+      value: document.getElementById("dValue").value, product_id: document.getElementById("dProduct").value || null,
+      min_qty: document.getElementById("dMinQty").value, start_date: document.getElementById("dStart").value,
+      end_date: document.getElementById("dEnd").value, notes: document.getElementById("dNotes").value,
+      active: document.getElementById("dActive").checked,
+    };
+  }
+  function openForm(d) {
+    openModal(d ? "Edit Discount / Promo" : "New Discount / Promo", formFields(d || {}) + `<div class="modal-actions">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="dSaveBtn">Save</button></div>`, () => {
+      document.getElementById("dSaveBtn").addEventListener("click", async () => {
+        try {
+          if (d) await api(`/discounts/${d.id}`, { method: "PUT", body: readForm() });
+          else await api("/discounts", { method: "POST", body: readForm() });
+          closeModal(); toast("Discount saved", "success"); load();
+        } catch (e) {}
+      });
+    });
+  }
+  document.getElementById("newDiscBtn").addEventListener("click", () => openForm(null));
+  window.editDiscount = (id) => openForm(rows.find(r => r.id === id));
+  window.deleteDiscount = async (id) => {
+    if (!confirm("Delete this discount? Past sales keep their recorded discount.")) return;
+    try { await api(`/discounts/${id}`, { method: "DELETE" }); toast("Discount deleted", "success"); load(); } catch (e) {}
+  };
   load();
 }
 
