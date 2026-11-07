@@ -1396,8 +1396,12 @@ async function renderReports(c) {
   document.getElementById("runSalesRep").addEventListener("click", async () => {
     const from = document.getElementById("repFrom").value, to = document.getElementById("repTo").value;
     const rows = await api(`/reports/sales?from=${from}&to=${to}`);
-    document.getElementById("salesRepOut").innerHTML = `<table><thead><tr><th>Sale#</th><th>Date</th><th>Location</th><th>Customer</th><th>Total</th></tr></thead><tbody>
-      ${rows.map(r => `<tr><td>${r.sale_no}</td><td>${r.ts}</td><td>${esc(r.location_name)}</td><td>${esc(r.customer || "Walk-in")}</td><td>${money(r.total)}</td></tr>`).join("")}
+    document.getElementById("salesRepOut").innerHTML = `<table><thead><tr><th>Sale#</th><th>Date</th><th>Location</th><th>Customer</th>
+      <th>Item</th><th>Qty</th><th>Amount</th><th>Discount</th><th>Net Amount</th><th>Status</th><th>Remarks</th></tr></thead><tbody>
+      ${rows.map(r => `<tr><td>${r.sale_no}</td><td>${r.ts}</td><td>${esc(r.location_name)}</td><td>${esc(r.customer || "Walk-in")}</td>
+        <td>${esc(r.item || "")}</td><td>${r.qty ?? ""}</td><td>${money(r.amount)}</td><td>${r.discount > 0 ? money(r.discount) : ""}</td>
+        <td>${money(r.net_amount)}</td><td>${r.status === "VOIDED" ? '<span class="badge danger">VOIDED</span>' : r.status}</td>
+        <td>${esc(r.remarks)}</td></tr>`).join("")}
     </tbody></table>`;
   });
   const inv = await api("/reports/inventory");

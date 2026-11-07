@@ -39,6 +39,9 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
   (never trusts the browser), and the receipt and sale view show it per line.
   Discounts apply to the gas price only, never the cylinder deposit fee. The old
   free-typed whole-sale discount box was replaced by these per-item discounts.
+- **Sales Report is now per item.** One row per item sold with its own **Qty**
+  column, plus Unit Price, Amount, Discount, Net Amount, and a **Remarks** column
+  showing the discount/promo name applied (on screen, Excel and PDF).
 
 - **Dispatch empty cylinders** — a dispatch can now carry several lines, each
   marked **Full** or **Empty**. Empties can go to another location (added to
