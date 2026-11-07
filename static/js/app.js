@@ -608,7 +608,8 @@ async function openCheckout(locationId) {
         closeModal();
         toast(`Sale ${result.sale.sale_no} completed`, "success");
         state.cart = [];
-        printReceipt(result);
+        if (result.sale.sale_type === "CREDIT") printDeliveryReceipt(result);
+        else printReceipt(result);
         switchView("pos");
       } catch (e) { /* toast already shown */ }
     });
@@ -639,6 +640,113 @@ function printReceipt(result) {
   printDocument(html);
 }
 
+// Delivery Receipt for credit / terms sales: letter-size page with two
+// copies (Customer / Office) the customer signs on receipt of the cylinders.
+function printDeliveryReceipt(result) {
+  const { sale, items } = result;
+  const fmtDate = v => v ? new Date(v.replace(" ", "T")).toLocaleDateString("en-PH", { year: "numeric", month: "long", day: "numeric" }) : "";
+  const terms = sale.customer_terms_days ? `${sale.customer_terms_days} days` : "Credit";
+  const minRows = 6;
+  const lineRows = items.map(i => {
+    const notes = [];
+    if (i.sale_mode === "REFILL") notes.push("Refill — empty returned");
+    if (i.sale_mode === "DEPOSIT") notes.push("With cylinder deposit");
+    if (i.sale_mode === "SWAP") notes.push(`Swap from ${esc(i.swap_brand || "")}${i.swap_fee > 0 ? `, fee ${money(i.swap_fee)}/cyl` : ""}`);
+    if (i.discount_amount > 0) notes.push(`Less ${esc(i.discount_name || "discount")}: −${money(i.discount_amount)}`);
+    return `<tr><td class="c">${i.qty}</td><td class="c">cyl</td>
+      <td>${esc(i.product_name)}${notes.length ? `<div class="sub">${notes.join(" · ")}</div>` : ""}</td>
+      <td class="r">${money(i.price)}</td><td class="r">${money(i.subtotal - (i.discount_amount || 0))}</td></tr>`;
+  });
+  while (lineRows.length < minRows) lineRows.push(`<tr class="blank"><td></td><td></td><td></td><td></td><td></td></tr>`);
+  const totalQty = items.reduce((a, i) => a + i.qty, 0);
+  const voided = sale.status === "VOIDED";
+
+  const copy = label => `
+  <div class="dr">
+    ${voided ? `<div class="void">VOID</div>` : ""}
+    <div class="hdr">
+      <img src="/images/logo.png" alt="">
+      <div class="co">
+        <div class="name">GREAT UNLI FOOD CORP.</div>
+        <div>Solane LPG Distributor · ${esc(sale.location_name)}</div>
+        ${sale.location_address ? `<div>${esc(sale.location_address)}</div>` : ""}
+      </div>
+      <div class="title">
+        <div class="t">DELIVERY RECEIPT</div>
+        <div class="no">No. <b>${esc(sale.dr_no || sale.sale_no)}</b></div>
+        <div class="copy">${label}</div>
+      </div>
+    </div>
+    <table class="info">
+      <tr><td class="k">Delivered to</td><td class="v"><b>${esc(sale.customer_name || "")}</b>${sale.account_no ? ` (${esc(sale.account_no)})` : ""}</td>
+          <td class="k">Date</td><td class="v">${fmtDate(sale.ts)}</td></tr>
+      <tr><td class="k">Business name</td><td class="v">${esc(sale.customer_business_name || "")}</td>
+          <td class="k">Terms</td><td class="v">${terms}</td></tr>
+      <tr><td class="k">Address</td><td class="v">${esc(sale.customer_address || "")}</td>
+          <td class="k">Due date</td><td class="v">${sale.due_date ? fmtDate(sale.due_date) : "—"}</td></tr>
+      <tr><td class="k">Contact no.</td><td class="v">${esc(sale.customer_phone || "")}</td>
+          <td class="k">Ref.</td><td class="v">${esc(sale.sale_no)}${sale.invoice_no ? ` / ${esc(sale.invoice_no)}` : ""}</td></tr>
+    </table>
+    <table class="items">
+      <thead><tr><th style="width:44px">Qty</th><th style="width:40px">Unit</th><th>Description</th><th style="width:84px">Unit Price</th><th style="width:94px">Amount</th></tr></thead>
+      <tbody>${lineRows.join("")}</tbody>
+      <tfoot>
+        <tr><td class="c"><b>${totalQty}</b></td><td colspan="3" class="r">Total amount</td><td class="r"><b>${money(sale.total)}</b></td></tr>
+        <tr><td colspan="4" class="r">Less: amount paid</td><td class="r">${money(sale.paid)}</td></tr>
+        <tr class="due"><td colspan="4" class="r">Balance charged to account</td><td class="r">${money(sale.balance)}</td></tr>
+      </tfoot>
+    </table>
+    <div class="note">Received the above items in good order and condition. Payment is due on or before the due date stated above.</div>
+    <table class="sig"><tr>
+      <td><div class="line">${esc(sale.cashier_name || "")}</div>Prepared by</td>
+      <td><div class="line">&nbsp;</div>Delivered by (driver / plate no.)</td>
+      <td><div class="line">&nbsp;</div>Received by: signature over printed name / date</td>
+    </tr></table>
+  </div>`;
+
+  const twoPerPage = items.length <= 6;
+  printDocument(`<style>
+    @page{size:letter portrait;margin:8mm}
+    .drs, .drs *{-webkit-print-color-adjust:exact;print-color-adjust:exact;box-sizing:border-box}
+    .drs{font-family:Arial,Helvetica,sans-serif;font-size:10.5px;color:#111}
+    .drs table{font-size:10px}
+    .drs th, .drs td{white-space:normal;text-transform:none;letter-spacing:0;font-size:10px;padding:2px 4px}
+    .dr{position:relative;border:1.5px solid #0b3d66;padding:10px 12px;page-break-inside:avoid;break-inside:avoid}
+    .dr .hdr{display:flex;align-items:center;gap:10px;border-bottom:2px solid #0b3d66;padding-bottom:6px;margin-bottom:6px}
+    .dr .hdr img{height:46px;width:46px;object-fit:contain}
+    .dr .co{flex:1;color:#333;line-height:1.35}
+    .dr .co .name{font-weight:700;font-size:14px;color:#0b3d66}
+    .dr .title{text-align:right}
+    .dr .title .t{font-weight:800;font-size:16px;color:#0b3d66;letter-spacing:.5px}
+    .dr .title .no{font-size:12px;margin-top:2px}
+    .dr .title .no b{color:#c0392b;font-size:13px}
+    .dr .copy{display:inline-block;margin-top:3px;padding:1px 6px;background:#1e9e5a;color:#fff;font-size:9px;font-weight:700;border-radius:3px}
+    .dr table{width:100%;border-collapse:collapse}
+    .dr .info td{padding:2px 4px;vertical-align:top;border:none}
+    .dr .info .k{width:78px;color:#555;font-size:9px}
+    .dr .info .v{border-bottom:1px solid #bbb !important}
+    .dr .items{margin-top:6px}
+    .dr .items th{background:#0b3d66;color:#fff;font-size:9px;padding:3px 4px;text-align:left;border:1px solid #0b3d66}
+    .dr .items td{border:1px solid #999;padding:3px 4px;vertical-align:top}
+    .dr .items tr.blank td{height:16px}
+    .dr .items tfoot td{border:1px solid #999}
+    .dr .items tr.due td{background:#e8f5ee;font-weight:700;font-size:11px}
+    .dr .c{text-align:center}.dr .r{text-align:right}
+    .dr .sub{font-size:8.5px;color:#555;margin-top:1px}
+    .dr .note{margin:6px 0 4px;font-size:9px;font-style:italic;color:#444}
+    .dr .sig td{width:33.3%;text-align:center;font-size:8.5px;color:#444;padding:22px 8px 0;border:none}
+    .dr .sig .line{border-top:1px solid #111;padding-top:2px;color:#111;font-size:10px;min-height:14px}
+    .dr .void{position:absolute;top:40%;left:0;right:0;text-align:center;font-size:90px;font-weight:800;color:rgba(192,57,43,.18);transform:rotate(-18deg);pointer-events:none}
+    .cut{border-top:1px dashed #888;margin:8px 0 10px;text-align:center;font-size:8px;color:#888;line-height:0}
+    .cut span{background:#fff;padding:0 6px}
+  </style>
+  <div class="drs" style="margin:-20px -12px">
+    ${copy("CUSTOMER'S COPY")}
+    ${twoPerPage ? `<div class="cut"><span>✂ cut here</span></div>` : `<div style="page-break-after:always"></div>`}
+    ${copy("OFFICE COPY")}
+  </div>`);
+}
+
 // ================================================================== SALES
 async function renderSales(c) {
   c.innerHTML = "Loading...";
@@ -654,11 +762,15 @@ async function renderSales(c) {
       <td><span class="badge ${s.status === 'VOIDED' ? 'danger' : 'blue'}">${s.status}</span></td>
       <td style="display:flex;gap:6px">
         <button class="btn small" onclick="viewSale(${s.id})">View</button>
+        ${s.sale_type === 'CREDIT' ? `<button class="btn small green" onclick="printSaleDR(${s.id})" title="Print Delivery Receipt">DR</button>` : ""}
         ${state.user.role === 'ADMIN' && s.status !== 'VOIDED' ? `<button class="btn small danger" onclick="voidSale(${s.id})">Void</button>` : ""}
       </td>
     </tr>`).join("")}
   </tbody></table></div>`;
 }
+window.printSaleDR = async (id) => {
+  try { printDeliveryReceipt(await api(`/sales/${id}`)); } catch (e) {}
+};
 window.voidSale = async (id) => {
   if (!confirm("Void this sale? This will reverse the inventory and cannot be undone.")) return;
   try { await api(`/sales/${id}/void`, { method: "POST" }); toast("Sale voided", "success"); renderSales(document.getElementById("content")); }
@@ -670,7 +782,8 @@ window.viewSale = async (id) => {
   openModal(`Sale ${sale.sale_no}`, `
     <div class="field"><b>Date:</b> ${sale.ts} &nbsp; <b>Location:</b> ${esc(sale.location_name)}</div>
     <div class="field"><b>Cashier:</b> ${esc(sale.cashier_name)} &nbsp; <b>Customer:</b> ${esc(sale.customer_name || "Walk-in")}</div>
-    <div class="field"><b>Status:</b> <span class="badge ${sale.status === 'VOIDED' ? 'danger' : 'blue'}">${sale.status}</span></div>
+    <div class="field"><b>Status:</b> <span class="badge ${sale.status === 'VOIDED' ? 'danger' : 'blue'}">${sale.status}</span>
+      ${sale.dr_no ? ` &nbsp; <b>Delivery Receipt:</b> ${esc(sale.dr_no)}` : ""}</div>
     <div class="table-wrap"><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Subtotal</th></tr></thead><tbody>
       ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}${i.sale_mode === 'SWAP' ? ` <span class="badge blue">SWAP</span><br><span style="font-size:12px">from ${esc(i.swap_brand)}${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : ""}</span>` : ''}${i.discount_amount > 0 ? `<br><span style="font-size:12px;color:var(--green-dark)">${esc(i.discount_name)} &minus;${money(i.discount_amount)}</span>` : ""}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
     </tbody></table></div>
@@ -685,10 +798,13 @@ window.viewSale = async (id) => {
     <div class="field"><b>Paid:</b> ${money(sale.paid)} &nbsp; <b>Balance:</b> ${money(sale.balance)}</div>
     <div class="modal-actions">
       <button class="btn" onclick="closeModal()">Close</button>
+      ${sale.sale_type === "CREDIT" ? `<button class="btn green" id="drBtn">Print Delivery Receipt</button>` : ""}
       <button class="btn green" id="reprintBtn">Reprint Receipt</button>
     </div>
   `, () => {
     document.getElementById("reprintBtn").addEventListener("click", () => printReceipt(result));
+    const drBtn = document.getElementById("drBtn");
+    if (drBtn) drBtn.addEventListener("click", () => printDeliveryReceipt(result));
   });
 };
 
