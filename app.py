@@ -2314,23 +2314,44 @@ def report_sales():
 
 
 def _sales_report_rows(date_from, date_to):
+    """One row per item sold, so Qty is its own column and each item's
+    discount shows in Remarks. Sales with no item lines still get one row."""
     conn = get_db()
     sql = """SELECT s.sale_no, s.ts, l.name location_name, u.name cashier, c.name customer,
-                    s.sale_type, s.subtotal, s.discount, s.total, s.paid, s.balance, s.status,
-                    (SELECT GROUP_CONCAT(si.product_name || ' x' || si.qty ||
-                            CASE WHEN si.sale_mode='DEPOSIT' THEN ' (deposit)' ELSE '' END, '; ')
-                     FROM sale_items si WHERE si.sale_id = s.id) items_summary
+                    s.sale_type, s.status, s.total sale_total, s.discount sale_discount,
+                    si.product_name || CASE WHEN si.sale_mode='DEPOSIT' THEN ' (deposit)' ELSE '' END item,
+                    si.qty, si.price,
+                    COALESCE(si.subtotal, s.subtotal) amount,
+                    COALESCE(si.discount_amount, CASE WHEN si.id IS NULL THEN s.discount ELSE 0 END) discount,
+                    si.discount_name
              FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u ON u.id=s.user_id
-             LEFT JOIN customers c ON c.id=s.customer_id WHERE s.is_opening_balance=0"""
+             LEFT JOIN customers c ON c.id=s.customer_id
+             LEFT JOIN sale_items si ON si.sale_id = s.id
+             WHERE s.is_opening_balance=0"""
     params = []
     if date_from:
         sql += " AND date(s.ts) >= date(?)"; params.append(date_from)
     if date_to:
         sql += " AND date(s.ts) <= date(?)"; params.append(date_to)
-    sql += " ORDER BY s.ts DESC"
+    sql += " ORDER BY s.ts DESC, s.id DESC, si.id"
     rows = conn.execute(sql, params).fetchall()
     conn.close()
-    return rows
+    out = [dict(r) for r in rows]
+    for d in out:
+        d["remarks"] = d["discount_name"] or ""
+    # Sales made before per-item discounts carry a whole-sale discount that
+    # isn't on any item line — show it on that sale's first row.
+    seen = {}
+    for d in out:
+        seen.setdefault(d["sale_no"], []).append(d)
+    for lines in seen.values():
+        leftover = round((lines[0]["sale_discount"] or 0) - sum(l["discount"] or 0 for l in lines), 2)
+        if leftover > 0.009 and lines[0]["item"] is not None:
+            lines[0]["discount"] = round((lines[0]["discount"] or 0) + leftover, 2)
+            lines[0]["remarks"] = "; ".join(x for x in (lines[0]["remarks"], "Whole-sale discount") if x)
+    for d in out:
+        d["net_amount"] = round((d["amount"] or 0) - (d["discount"] or 0), 2)
+    return out
 
 
 @app.get("/api/reports/sales/export")
@@ -2340,15 +2361,17 @@ def export_sales_report():
     date_from = request.args.get("from")
     date_to = request.args.get("to")
     rows = _sales_report_rows(date_from, date_to)
-    headers = ["Sale #", "Date", "Location", "Cashier", "Customer", "Items Purchased", "Type", "Subtotal", "Discount", "Total", "Paid", "Balance", "Status"]
+    headers = ["Sale #", "Date", "Location", "Cashier", "Customer", "Type", "Item", "Qty", "Unit Price",
+               "Amount", "Discount", "Net Amount", "Status", "Remarks"]
     data = [(r["sale_no"], r["ts"], r["location_name"], r["cashier"], r["customer"] or "Walk-in",
-              r["items_summary"] or "", r["sale_type"], r["subtotal"], r["discount"], r["total"],
-              r["paid"], r["balance"], r["status"]) for r in rows]
+             r["sale_type"], r["item"] or "", r["qty"] if r["qty"] is not None else "",
+             r["price"] if r["price"] is not None else "", r["amount"], r["discount"], r["net_amount"],
+             r["status"], r["remarks"]) for r in rows]
     stamp = datetime.now().strftime("%Y%m%d-%H%M")
     if fmt == "pdf":
         return pdf_table_response("Sales Report", headers, data, f"sales-report-{stamp}.pdf",
                                    subtitle=f"{date_from or 'All dates'} to {date_to or 'present'}",
-                                   col_widths=[75, 70, 70, 65, 75, 160, 45, 55, 55, 55, 55, 55, 55],
+                                   col_widths=[58, 70, 55, 48, 58, 34, 85, 26, 45, 48, 42, 50, 45, 56],
                                    landscape_mode=True)
     return xlsx_response(headers, data, f"sales-report-{stamp}.xlsx", "Sales Report")
 
