@@ -123,6 +123,29 @@ CREATE TABLE IF NOT EXISTS empty_cylinder_movements (
     notes TEXT
 );
 
+-- Empties of OTHER brands taken in on SWAP sales, broken down per brand.
+-- product_id is the size it was swapped for (e.g. Solane LPG 11kg).
+CREATE TABLE IF NOT EXISTS swapped_empty_inventory (
+    location_id INTEGER NOT NULL REFERENCES locations(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    brand TEXT NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (location_id, product_id, brand)
+);
+
+CREATE TABLE IF NOT EXISTS swapped_empty_movements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT DEFAULT (datetime('now')),
+    location_id INTEGER NOT NULL REFERENCES locations(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    brand TEXT NOT NULL,
+    qty_change INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    reference TEXT,
+    user_id INTEGER REFERENCES users(id),
+    notes TEXT
+);
+
 CREATE TABLE IF NOT EXISTS cylinder_deposits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id INTEGER NOT NULL REFERENCES customers(id),
@@ -585,6 +608,11 @@ def migrate_schema():
     if not _column_exists(conn, "sale_items", "swap_fee"):
         conn.execute("ALTER TABLE sale_items ADD COLUMN swap_fee REAL NOT NULL DEFAULT 0")
     conn.commit()
+
+    # 9e. Dispatch of swapped (other-brand) empties: which brand each line is.
+    if not _column_exists(conn, "transfer_items", "swap_brand"):
+        conn.execute("ALTER TABLE transfer_items ADD COLUMN swap_brand TEXT")
+        conn.commit()
 
     # 9d. sale_items.sale_mode CHECK must allow 'SWAP'. SQLite can't alter a
     #     CHECK constraint, so recreate the table and copy the data across.

@@ -1062,6 +1062,9 @@ async function renderInventory(c) {
   async function load() {
     const rows = await api("/inventory");
     const empties = await api("/inventory/empties");
+    const swapped = await api("/inventory/swapped-empties");
+    const brandTotals = {};
+    swapped.forEach(r => brandTotals[r.brand] = (brandTotals[r.brand] || 0) + r.quantity);
     c.innerHTML = `
       ${isAdmin ? `<div style="margin-bottom:12px;display:flex;gap:8px">
         <button class="btn green" id="adjustStockBtn">+ Adjust Stock</button>
@@ -1085,11 +1088,61 @@ async function renderInventory(c) {
           <td>${esc(e.location_name)}</td><td>${esc(e.product_name)}</td>
           <td><b${e.quantity < 0 ? ' style="color:var(--danger)" title="Negative — a voided refill sale reversed an empty that was already dispatched. Recount and adjust."' : ""}>${e.quantity}</b></td></tr>`).join("")
           : `<tr><td colspan="3" style="color:var(--muted)">No empty cylinders on hand.</td></tr>`}
+      </tbody></table></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin:20px 0 8px">
+        <h3 style="margin:0">Swapped Empties (Other Brands)</h3>
+        ${isAdmin ? `<button class="btn green" id="adjustSwappedBtn">+ Adjust Swapped Empties</button>` : ""}
+      </div>
+      <p style="color:var(--muted);font-size:13px;margin-top:0">Empties of other LPG brands taken in on swap sales — dispatch them to the plant or another location from the Dispatch page.</p>
+      ${Object.keys(brandTotals).length ? `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        ${Object.entries(brandTotals).sort((a, b) => a[0].localeCompare(b[0])).map(([b, q]) =>
+          `<div class="card" style="padding:8px 12px;min-width:120px"><div style="font-size:12px;color:var(--muted)">${esc(b)}</div><div style="font-size:20px;font-weight:800">${q}</div></div>`).join("")}
+      </div>` : ""}
+      <div class="table-wrap"><table><thead><tr><th>Location</th><th>Brand</th><th>Size (swapped for)</th><th>Empty Qty</th></tr></thead><tbody>
+        ${swapped.length ? swapped.map(e => `<tr>
+          <td>${esc(e.location_name)}</td><td><b>${esc(e.brand)}</b></td><td>${esc(e.product_name)}</td>
+          <td><b${e.quantity < 0 ? ' style="color:var(--danger)" title="Negative — a voided swap sale reversed an empty that was already dispatched. Recount and adjust."' : ""}>${e.quantity}</b></td></tr>`).join("")
+          : `<tr><td colspan="4" style="color:var(--muted)">No swapped empties on hand.</td></tr>`}
       </tbody></table></div>`;
     if (isAdmin) {
       document.getElementById("adjustStockBtn").addEventListener("click", openAdjustStockModal);
       document.getElementById("adjustEmptiesBtn").addEventListener("click", openAdjustEmptiesModal);
+      document.getElementById("adjustSwappedBtn").addEventListener("click", openAdjustSwappedModal);
     }
+  }
+  function openAdjustSwappedModal() {
+    const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+    const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+    openModal("Adjust Swapped Empties", `
+      <div class="field"><label>Location</label><select id="sLoc">${locOpts}</select></div>
+      <div class="field"><label>Brand</label><select id="sBrand">
+        ${SWAP_BRANDS.map(b => `<option>${esc(b)}</option>`).join("")}<option value="__other">Other (type below)</option></select></div>
+      <div class="field hidden" id="sOtherWrap"><label>Other brand</label><input type="text" id="sOther" placeholder="Brand name"></div>
+      <div class="field"><label>Size (swapped for)</label><select id="sProd">${prodOpts}</select></div>
+      <div class="field"><label>Quantity Change</label><input type="number" id="sDelta" placeholder="e.g. 10 or -5" value="0">
+        <div style="font-size:11.5px;color:var(--muted);margin-top:3px">Positive to add, negative to remove (e.g. damaged / written off).</div></div>
+      <div class="field"><label>Reason (required)</label><input type="text" id="sReason" placeholder="e.g. Physical count correction"></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="sSaveBtn">Save Adjustment</button></div>
+    `, () => {
+      const sel = document.getElementById("sBrand");
+      sel.addEventListener("change", () => document.getElementById("sOtherWrap").classList.toggle("hidden", sel.value !== "__other"));
+      document.getElementById("sSaveBtn").addEventListener("click", async () => {
+        const delta = parseInt(document.getElementById("sDelta").value, 10);
+        const reason = document.getElementById("sReason").value.trim();
+        const brand = sel.value === "__other" ? document.getElementById("sOther").value.trim() : sel.value;
+        if (!brand) { toast("Enter the brand", "error"); return; }
+        if (!delta) { toast("Enter a non-zero quantity change", "error"); return; }
+        if (!reason) { toast("A reason is required", "error"); return; }
+        try {
+          await api("/inventory/swapped-empties/adjust", { method: "POST", body: {
+            location_id: document.getElementById("sLoc").value,
+            product_id: document.getElementById("sProd").value, brand, delta, reason,
+          }});
+          closeModal(); toast("Swapped empties adjusted", "success"); load();
+        } catch (e) {}
+      });
+    });
   }
   function openAdjustEmptiesModal() {
     const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
@@ -1155,7 +1208,7 @@ async function renderInventory(c) {
 async function renderInventoryLedger(c) {
   c.innerHTML = `
     <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
-      <select id="ledgerStock"><option value="FULL">Full Cylinders</option><option value="EMPTY">Empty Cylinders</option></select>
+      <select id="ledgerStock"><option value="FULL">Full Cylinders</option><option value="EMPTY">Empty Cylinders</option><option value="SWAPPED">Swapped Empties (other brands)</option></select>
       <select id="ledgerLoc"><option value="">All Locations</option>${state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}</select>
       <select id="ledgerProd"><option value="">All Products</option>${state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>
       <button class="btn" id="ledgerFilterBtn">Filter</button>
@@ -1172,7 +1225,7 @@ async function renderInventoryLedger(c) {
     document.getElementById("ledgerTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
       <th>Date</th><th>Location</th><th>Product</th><th>Change</th><th>Type</th><th>Reference</th><th>Notes</th>
     </tr></thead><tbody>
-      ${rows.length ? rows.map(r => `<tr><td>${r.ts}</td><td>${esc(r.location_name)}</td><td>${esc(r.product_name)}</td>
+      ${rows.length ? rows.map(r => `<tr><td>${r.ts}</td><td>${esc(r.location_name)}</td><td>${r.brand ? `<b>${esc(r.brand)}</b> empty &middot; ` : ""}${esc(r.product_name)}</td>
         <td style="color:${r.qty_change >= 0 ? 'var(--green-dark)' : 'var(--danger)'};font-weight:700">${r.qty_change >= 0 ? '+' : ''}${r.qty_change}</td>
         <td><span class="badge blue">${esc(r.type)}</span></td><td>${esc(r.reference || "")}</td><td>${esc(r.notes || "")}</td></tr>`).join("")
         : `<tr><td colspan="7" style="color:var(--muted)">No movements found.</td></tr>`}
@@ -1194,7 +1247,7 @@ async function renderTransfers(c) {
       <th>Dispatch #</th><th>Date</th><th>From</th><th>To</th><th>Items</th><th>Status</th><th></th>
     </tr></thead><tbody>
       ${rows.map(t => `<tr><td>${t.transfer_no}</td><td>${t.ts}</td><td>${esc(t.from_name)}</td><td>${esc(t.to_name)}</td>
-        <td>${t.items.map(i => `${esc(i.product_name)} x${i.qty}${i.cylinder_state === 'EMPTY' ? ' <span class="badge gray">EMPTY</span>' : ''}`).join(", ")}</td>
+        <td>${t.items.map(i => `${i.cylinder_state === 'SWAPPED' ? `${esc(i.swap_brand)} empty (${esc(i.product_name)})` : esc(i.product_name)} x${i.qty}${i.cylinder_state === 'EMPTY' ? ' <span class="badge gray">EMPTY</span>' : i.cylinder_state === 'SWAPPED' ? ' <span class="badge warn">SWAPPED</span>' : ' <span class="badge green">FULL</span>'}`).join(", ")}</td>
         <td><span class="badge ${t.status === 'RECEIVED' ? 'green' : t.status === 'CANCELLED' ? 'danger' : 'warn'}">${t.status}</span></td>
         <td>${t.status === 'RELEASED' ? `<button class="btn small green" onclick="receiveXfer(${t.id})">Mark Received</button>` : ""}</td>
       </tr>`).join("")}
@@ -1230,7 +1283,7 @@ async function renderTransfers(c) {
     const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
     openModal("New Transfer / Dispatch", `
       <div class="field"><label>From</label><select id="xFrom">${locOpts}</select></div>
-      <div class="field"><label>To</label><select id="xTo">${locOpts}<option value="PLANT">Plant (send empties for refill)</option></select></div>
+      <div class="field"><label>To</label><select id="xTo">${locOpts}<option value="PLANT">Plant</option></select></div>
       <div class="field hidden" id="xPlantWrap"><label>Plant Name</label><input id="xPlant" placeholder="e.g. Solane Plant"></div>
       <div class="field"><label>Items</label><div id="xRows"></div>
         <button class="btn small" id="xAddRow" type="button">+ Add Item</button>
@@ -1238,15 +1291,29 @@ async function renderTransfers(c) {
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
         <button class="btn green" id="xSaveBtn">Dispatch</button></div>
     `, () => {
-      const stock = { FULL: {}, EMPTY: {} };
+      const stock = { FULL: {}, EMPTY: {}, SWAPPED: {} };
+      let swappedRows = [];
       const rowsEl = document.getElementById("xRows");
       const toPlant = () => document.getElementById("xTo").value === "PLANT";
       function stateOpts() {
-        return toPlant() ? `<option value="EMPTY">Empty</option>`
-          : `<option value="FULL">Full</option><option value="EMPTY">Empty</option>`;
+        return `<option value="FULL">Full</option><option value="EMPTY">Empty</option><option value="SWAPPED">Swapped empty (other brand)</option>`;
+      }
+      // Product list depends on the row's state: swapped empties are picked
+      // as "brand — size" from what's on hand at the origin.
+      function prodOptsFor(st) {
+        if (st !== "SWAPPED") return prodOpts;
+        return swappedRows.length
+          ? swappedRows.map(r => `<option value="${r.product_id}|${esc(r.brand)}">${esc(r.brand)} — ${esc(r.product_name)}</option>`).join("")
+          : `<option value="">No swapped empties at this location</option>`;
+      }
+      function syncProd(r) {
+        const st = r.querySelector(".xState").value, sel = r.querySelector(".xProd");
+        if (sel.dataset.mode === st) return;
+        sel.innerHTML = prodOptsFor(st); sel.dataset.mode = st;
       }
       function refreshHints() {
         rowsEl.querySelectorAll(".xRow").forEach(r => {
+          syncProd(r);
           const st = r.querySelector(".xState").value, pid = r.querySelector(".xProd").value;
           r.querySelector(".xAvail").textContent = `avail: ${stock[st][pid] ?? 0}`;
         });
@@ -1255,7 +1322,7 @@ async function renderTransfers(c) {
         const row = document.createElement("div");
         row.className = "xRow";
         row.style.cssText = "display:flex;gap:6px;margin-bottom:6px;align-items:center;flex-wrap:wrap";
-        row.innerHTML = `<select class="xProd" style="flex:2;min-width:140px">${prodOpts}</select>
+        row.innerHTML = `<select class="xProd" style="flex:2;min-width:140px" data-mode="FULL">${prodOpts}</select>
           <select class="xState" style="flex:1;min-width:80px">${stateOpts()}</select>
           <input type="number" class="xQty" value="1" min="1" style="width:80px">
           <span class="xAvail" style="font-size:11.5px;color:var(--muted);min-width:60px"></span>
@@ -1267,18 +1334,21 @@ async function renderTransfers(c) {
       }
       async function loadStock() {
         const from = document.getElementById("xFrom").value;
-        const [full, empty] = await Promise.all([api(`/inventory?location_id=${from}`), api(`/inventory/empties?location_id=${from}`)]);
-        stock.FULL = {}; stock.EMPTY = {};
+        const [full, empty, swapped] = await Promise.all([api(`/inventory?location_id=${from}`),
+          api(`/inventory/empties?location_id=${from}`), api(`/inventory/swapped-empties?location_id=${from}`)]);
+        stock.FULL = {}; stock.EMPTY = {}; stock.SWAPPED = {};
         full.forEach(r => stock.FULL[r.product_id] = r.quantity);
         empty.forEach(r => stock.EMPTY[r.product_id] = r.quantity);
+        swappedRows = swapped.filter(r => r.quantity > 0);
+        swappedRows.forEach(r => stock.SWAPPED[`${r.product_id}|${r.brand}`] = r.quantity);
+        rowsEl.querySelectorAll(".xProd").forEach(sel => { if (sel.dataset.mode === "SWAPPED") sel.dataset.mode = ""; });
         refreshHints();
       }
       document.getElementById("xFrom").addEventListener("change", loadStock);
       document.getElementById("xTo").addEventListener("change", () => {
         document.getElementById("xPlantWrap").classList.toggle("hidden", !toPlant());
         document.getElementById("xHint").textContent = toPlant()
-          ? "Only empty cylinders can go to the plant. Mark Received once the plant confirms delivery." : "";
-        rowsEl.querySelectorAll(".xState").forEach(sel => { const v = sel.value; sel.innerHTML = stateOpts(); if ([...sel.options].some(o => o.value === v)) sel.value = v; });
+          ? "Full, empty and swapped (other-brand) empties can all go to the plant. Mark Received once the plant confirms delivery." : "";
         refreshHints();
       });
       if (state.locations.length > 1) document.getElementById("xTo").selectedIndex = 1;
@@ -1291,11 +1361,15 @@ async function renderTransfers(c) {
         const plant = document.getElementById("xPlant").value.trim();
         if (to === "PLANT" && !plant) { toast("Enter the plant name", "error"); return; }
         if (to !== "PLANT" && from === to) { toast("Origin and destination must differ", "error"); return; }
-        const items = [...rowsEl.querySelectorAll(".xRow")].map(r => ({
-          product_id: r.querySelector(".xProd").value, cylinder_state: r.querySelector(".xState").value,
-          qty: parseInt(r.querySelector(".xQty").value, 10),
-        }));
+        const items = [...rowsEl.querySelectorAll(".xRow")].map(r => {
+          const st = r.querySelector(".xState").value, v = r.querySelector(".xProd").value;
+          const qty = parseInt(r.querySelector(".xQty").value, 10);
+          if (st !== "SWAPPED") return { product_id: v, cylinder_state: st, qty };
+          const cut = v.indexOf("|");
+          return { product_id: v.slice(0, cut), swap_brand: v.slice(cut + 1), cylinder_state: st, qty };
+        });
         if (!items.length) { toast("Add at least one item", "error"); return; }
+        if (items.some(i => i.cylinder_state === "SWAPPED" && !i.swap_brand)) { toast("No swapped empties to dispatch from this location", "error"); return; }
         if (items.some(i => !(i.qty > 0))) { toast("Quantities must be at least 1", "error"); return; }
         try {
           await api("/transfers", { method: "POST", body: {
