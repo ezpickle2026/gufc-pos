@@ -924,13 +924,13 @@ async function openAgingReport(canExport) {
       <a class="btn small" href="/api/reports/receivables-aging/export?format=pdf">Export PDF</a>
     </div>` : ""}
     <div class="table-wrap"><table><thead><tr>
-      <th>Customer</th>${bucketLabels.map(([, l]) => `<th>${l}</th>`).join("")}<th>Total</th>
+      <th>Customer</th><th>Category</th>${bucketLabels.map(([, l]) => `<th>${l}</th>`).join("")}<th>Total</th>
     </tr></thead><tbody>
       ${data.rows.length ? data.rows.map(r => `<tr>
-        <td>${esc(r.customer_name)} (${r.account_no})</td>
+        <td>${esc(r.customer_name)} (${r.account_no})</td><td>${esc(r.customer_category)}</td>
         ${bucketLabels.map(([k]) => `<td>${r[k] ? money(r[k]) : ""}</td>`).join("")}
         <td style="font-weight:700">${money(r.total)}</td>
-      </tr>`).join("") : `<tr><td colspan="8" style="color:var(--muted)">No outstanding receivables.</td></tr>`}
+      </tr>`).join("") : `<tr><td colspan="9" style="color:var(--muted)">No outstanding receivables.</td></tr>`}
     </tbody></table>
     <table style="margin-top:2px"><tbody>
       <tr style="font-weight:700;background:var(--bg)">
@@ -1396,9 +1396,9 @@ async function renderReports(c) {
   document.getElementById("runSalesRep").addEventListener("click", async () => {
     const from = document.getElementById("repFrom").value, to = document.getElementById("repTo").value;
     const rows = await api(`/reports/sales?from=${from}&to=${to}`);
-    document.getElementById("salesRepOut").innerHTML = `<table><thead><tr><th>Sale#</th><th>Date</th><th>Location</th><th>Customer</th>
+    document.getElementById("salesRepOut").innerHTML = `<table><thead><tr><th>Sale#</th><th>Date</th><th>Location</th><th>Customer</th><th>Category</th>
       <th>Item</th><th>Qty</th><th>Amount</th><th>Discount</th><th>Net Amount</th><th>Status</th><th>Remarks</th></tr></thead><tbody>
-      ${rows.map(r => `<tr><td>${r.sale_no}</td><td>${r.ts}</td><td>${esc(r.location_name)}</td><td>${esc(r.customer || "Walk-in")}</td>
+      ${rows.map(r => `<tr><td>${r.sale_no}</td><td>${r.ts}</td><td>${esc(r.location_name)}</td><td>${esc(r.customer || "Walk-in")}</td><td>${esc(r.customer_category)}</td>
         <td>${esc(r.item || "")}</td><td>${r.qty ?? ""}</td><td>${money(r.amount)}</td><td>${r.discount > 0 ? money(r.discount) : ""}</td>
         <td>${money(r.net_amount)}</td><td>${r.status === "VOIDED" ? '<span class="badge danger">VOIDED</span>' : r.status}</td>
         <td>${esc(r.remarks)}</td></tr>`).join("")}

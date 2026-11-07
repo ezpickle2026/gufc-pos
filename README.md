@@ -42,6 +42,9 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 - **Sales Report is now per item.** One row per item sold with its own **Qty**
   column, plus Unit Price, Amount, Discount, Net Amount, and a **Remarks** column
   showing the discount/promo name applied (on screen, Excel and PDF).
+- **Customer Category in reports.** The Sales Report, Accounts Receivable report and
+  AR Aging report now show each customer's category (ERTO, MRTO, Commercial, DOMCOM,
+  Solus, ...). Sales with no customer account show as **Walk-in**.
 
 - **Dispatch empty cylinders** — a dispatch can now carry several lines, each
   marked **Full** or **Empty**. Empties can go to another location (added to

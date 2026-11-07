@@ -1868,7 +1868,8 @@ def _build_aging_report(conn, u):
         recompute_receivable_status(conn, r["id"])
     conn.commit()
 
-    sql = """SELECT r.balance, r.due_date, c.id customer_id, c.name customer_name, c.account_no, s.location_id
+    sql = """SELECT r.balance, r.due_date, c.id customer_id, c.name customer_name, c.account_no,
+                    c.category customer_category, s.location_id
               FROM receivables r JOIN customers c ON c.id=r.customer_id JOIN sales s ON s.id=r.sale_id
               WHERE r.balance > 0.009"""
     params = []
@@ -1887,6 +1888,7 @@ def _build_aging_report(conn, u):
         key = r["customer_id"]
         if key not in by_customer:
             by_customer[key] = {"customer_name": r["customer_name"], "account_no": r["account_no"],
+                                 "customer_category": r["customer_category"] or "",
                                  **{b: 0.0 for b in AGING_BUCKETS}, "total": 0.0}
         by_customer[key][bucket] = round(by_customer[key][bucket] + r["balance"], 2)
         by_customer[key]["total"] = round(by_customer[key]["total"] + r["balance"], 2)
@@ -1914,16 +1916,16 @@ def export_receivables_aging():
     customer_rows, totals, grand_total = _build_aging_report(conn, session["user"])
     conn.close()
 
-    headers = ["Customer", "Account #", "Current", "1-30 Days", "31-60 Days", "61-90 Days", "91-120 Days", "120+ Days", "Total"]
-    data = [(r["customer_name"], r["account_no"], r["current"], r["days_1_30"], r["days_31_60"],
+    headers = ["Customer", "Account #", "Category", "Current", "1-30 Days", "31-60 Days", "61-90 Days", "91-120 Days", "120+ Days", "Total"]
+    data = [(r["customer_name"], r["account_no"], r["customer_category"], r["current"], r["days_1_30"], r["days_31_60"],
               r["days_61_90"], r["days_91_120"], r["days_120_plus"], r["total"]) for r in customer_rows]
-    data.append(("TOTAL", "", totals["current"], totals["days_1_30"], totals["days_31_60"],
+    data.append(("TOTAL", "", "", totals["current"], totals["days_1_30"], totals["days_31_60"],
                  totals["days_61_90"], totals["days_91_120"], totals["days_120_plus"], grand_total))
     stamp = datetime.now().strftime("%Y%m%d-%H%M")
     if fmt == "pdf":
         return pdf_table_response("Accounts Receivable Aging", headers, data, f"receivables-aging-{stamp}.pdf",
                                    subtitle=f"As of {datetime.now().strftime('%Y-%m-%d')}",
-                                   col_widths=[110, 60, 60, 60, 60, 60, 65, 60, 65], landscape_mode=True)
+                                   col_widths=[110, 60, 60, 60, 60, 60, 60, 60, 60, 65], landscape_mode=True)
     return xlsx_response(headers, data, f"receivables-aging-{stamp}.xlsx", "AR Aging")
 
 
@@ -2318,6 +2320,7 @@ def _sales_report_rows(date_from, date_to):
     discount shows in Remarks. Sales with no item lines still get one row."""
     conn = get_db()
     sql = """SELECT s.sale_no, s.ts, l.name location_name, u.name cashier, c.name customer,
+                    CASE WHEN c.id IS NULL THEN 'Walk-in' ELSE COALESCE(NULLIF(c.category,''), 'Uncategorized') END customer_category,
                     s.sale_type, s.status, s.total sale_total, s.discount sale_discount,
                     si.product_name || CASE WHEN si.sale_mode='DEPOSIT' THEN ' (deposit)' ELSE '' END item,
                     si.qty, si.price,
@@ -2361,17 +2364,17 @@ def export_sales_report():
     date_from = request.args.get("from")
     date_to = request.args.get("to")
     rows = _sales_report_rows(date_from, date_to)
-    headers = ["Sale #", "Date", "Location", "Cashier", "Customer", "Type", "Item", "Qty", "Unit Price",
+    headers = ["Sale #", "Date", "Location", "Cashier", "Customer", "Category", "Type", "Item", "Qty", "Unit Price",
                "Amount", "Discount", "Net Amount", "Status", "Remarks"]
     data = [(r["sale_no"], r["ts"], r["location_name"], r["cashier"], r["customer"] or "Walk-in",
-             r["sale_type"], r["item"] or "", r["qty"] if r["qty"] is not None else "",
+             r["customer_category"], r["sale_type"], r["item"] or "", r["qty"] if r["qty"] is not None else "",
              r["price"] if r["price"] is not None else "", r["amount"], r["discount"], r["net_amount"],
              r["status"], r["remarks"]) for r in rows]
     stamp = datetime.now().strftime("%Y%m%d-%H%M")
     if fmt == "pdf":
         return pdf_table_response("Sales Report", headers, data, f"sales-report-{stamp}.pdf",
                                    subtitle=f"{date_from or 'All dates'} to {date_to or 'present'}",
-                                   col_widths=[58, 70, 55, 48, 58, 34, 85, 26, 45, 48, 42, 50, 45, 56],
+                                   col_widths=[54, 64, 50, 44, 54, 46, 32, 76, 24, 42, 46, 40, 48, 44, 56],
                                    landscape_mode=True)
     return xlsx_response(headers, data, f"sales-report-{stamp}.xlsx", "Sales Report")
 
@@ -2419,18 +2422,18 @@ def export_receivables_report():
         recompute_receivable_status(conn, r["id"])
     conn.commit()
     out = conn.execute(
-        """SELECT r.invoice_no, c.name customer_name, c.account_no, s.sale_no, r.invoice_date, r.due_date,
+        """SELECT r.invoice_no, c.name customer_name, c.account_no, c.category customer_category, s.sale_no, r.invoice_date, r.due_date,
                   r.amount, r.paid, r.balance, r.status
            FROM receivables r JOIN customers c ON c.id=r.customer_id JOIN sales s ON s.id=r.sale_id
            ORDER BY r.due_date ASC"""
     ).fetchall()
     conn.close()
-    headers = ["Invoice #", "Customer", "Account #", "Sale #", "Invoice Date", "Due Date", "Amount", "Paid", "Balance", "Status"]
-    data = [(r["invoice_no"], r["customer_name"], r["account_no"], r["sale_no"], r["invoice_date"], r["due_date"],
+    headers = ["Invoice #", "Customer", "Account #", "Category", "Sale #", "Invoice Date", "Due Date", "Amount", "Paid", "Balance", "Status"]
+    data = [(r["invoice_no"], r["customer_name"], r["account_no"], r["customer_category"] or "", r["sale_no"], r["invoice_date"], r["due_date"],
               r["amount"], r["paid"], r["balance"], r["status"]) for r in out]
     stamp = datetime.now().strftime("%Y%m%d-%H%M")
     if fmt == "pdf":
-        return pdf_table_response("Accounts Receivable", headers, data, f"receivables-{stamp}.pdf")
+        return pdf_table_response("Accounts Receivable", headers, data, f"receivables-{stamp}.pdf", landscape_mode=True)
     return xlsx_response(headers, data, f"receivables-{stamp}.xlsx", "Receivables")
 
 
