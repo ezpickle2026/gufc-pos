@@ -91,6 +91,7 @@ const NAV = [
   { id: "products", label: "Products", icon: "\u{1F3F7}", roles: ["ADMIN"] },
   { id: "discounts", label: "Discounts & Promos", icon: "\u{1F3AB}", roles: ["ADMIN", "MANAGER"] },
   { id: "locations", label: "Locations", icon: "\u{1F3E2}", roles: ["ADMIN"] },
+  { id: "system_reset", label: "System Reset (Go Live)", icon: "\u{1F9F9}", roles: ["ADMIN"] },
 ];
 
 function navVisible(n) {
@@ -159,7 +160,7 @@ function render() {
     dashboard: renderDashboard, pos: renderPOS, sales: renderSales,
     customers: renderCustomers, receivables: renderReceivables,
     inventory: renderInventory, inventory_ledger: renderInventoryLedger, transfers: renderTransfers, reports: renderReports,
-    users: renderUsers, products: renderProducts, locations: renderLocations, discounts: renderDiscounts,
+    users: renderUsers, products: renderProducts, locations: renderLocations, discounts: renderDiscounts, system_reset: renderSystemReset,
     audit: renderAudit, cylinder_deposits: renderCylinderDeposits,
     hauling: renderHauling, vehicles: renderVehicles, employees: renderEmployees,
     staff_schedule: renderStaffSchedule, kpi: renderKpi,
@@ -1587,6 +1588,87 @@ async function renderProducts(c) {
     });
   });
   load();
+}
+
+// ================================================================== ADMIN: SYSTEM RESET (GO LIVE)
+async function renderSystemReset(c) {
+  c.innerHTML = `<div id="resetBox">Loading...</div>`;
+  const n = await api("/admin/reset-summary");
+  const opt = (id, label, count, hint) => `<label style="display:flex;gap:8px;align-items:flex-start;margin:8px 0">
+    <input type="checkbox" id="${id}" style="margin-top:3px">
+    <span><b>${label}</b> <span class="badge gray">${count}</span><br>
+    <span style="font-size:12.5px;color:var(--muted)">${hint}</span></span></label>`;
+  document.getElementById("resetBox").innerHTML = `
+    <div class="card" style="margin-bottom:14px;border-color:var(--danger)">
+      <h3 style="margin-top:0;color:var(--danger)">Clear test data and start real operations</h3>
+      <p style="font-size:13.5px">Use this <b>once</b>, when testing is finished. It permanently removes test data so the client starts clean.
+      A full backup copy of the database is saved on the server automatically before anything is deleted.</p>
+      <button class="btn" id="dlBackupBtn">&#11015; Download backup first (optional)</button>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h4 style="margin-top:0">Always cleared</h4>
+      <ul style="font-size:13.5px;margin:0;padding-left:18px;line-height:1.7">
+        <li>Sales <span class="badge gray">${n.sales}</span>, payments <span class="badge gray">${n.payments}</span>, receivables / previous arrears <span class="badge gray">${n.receivables}</span></li>
+        <li>Transfers / dispatches <span class="badge gray">${n.transfers}</span>, inventory ledger <span class="badge gray">${n.inventory_movements}</span>, cylinder deposits</li>
+        <li>Stock on hand set to <b>0</b> (now ${n.stock_on_hand} full, ${n.empties_on_hand} empty). Encode the real opening stock afterwards (Inventory → + Adjust Stock).</li>
+        <li>Booked orders <span class="badge gray">${n.booked_orders}</span>, commercial deliveries <span class="badge gray">${n.commercial_deliveries}</span>, hauling <span class="badge gray">${n.hauling}</span></li>
+        <li>Incident reports <span class="badge gray">${n.incident_reports}</span>, staff schedule <span class="badge gray">${n.staff_schedule}</span>, audit log <span class="badge gray">${n.audit_logs}</span></li>
+      </ul>
+      <h4>Always kept</h4>
+      <p style="font-size:13.5px;margin:0">Locations (${n.locations}), products and prices (${n.products}), roles and permissions, customer categories, and <b>your own admin account</b>.</p>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h4 style="margin-top:0">Also clear (optional)</h4>
+      ${opt("rsCustomers", "Customers", n.customers, "Tick if the customer list is only test/demo data. Leave unticked if real customers were already encoded.")}
+      ${opt("rsUsers", "All other user accounts", n.other_users, "Deletes every login except yours (including demo accounts like mgarcia, otaker, jsoliven). Create the real staff accounts in Users afterwards.")}
+      ${opt("rsStaff", "Employees and vehicles", `${n.employees} / ${n.vehicles}`, "Tick only if these were test entries.")}
+      ${opt("rsDiscounts", "Discounts & promos", n.discounts, "Tick if the discounts were only for testing.")}
+    </div>
+
+    <div class="card">
+      <h4 style="margin-top:0">Confirm</h4>
+      <div class="field"><label>Type <b>RESET</b> to confirm</label><input id="rsConfirm" autocomplete="off"></div>
+      <div class="field"><label>Your admin password</label><input type="password" id="rsPassword" autocomplete="current-password"></div>
+      <button class="btn danger" id="rsGoBtn">Reset system now</button>
+    </div>`;
+
+  document.getElementById("dlBackupBtn").addEventListener("click", () => { window.location = "/api/admin/backup"; });
+  document.getElementById("rsGoBtn").addEventListener("click", async () => {
+    const body = {
+      confirm_text: document.getElementById("rsConfirm").value,
+      password: document.getElementById("rsPassword").value,
+      options: {
+        customers: document.getElementById("rsCustomers").checked,
+        users: document.getElementById("rsUsers").checked,
+        employees_vehicles: document.getElementById("rsStaff").checked,
+        discounts: document.getElementById("rsDiscounts").checked,
+      },
+    };
+    if (body.confirm_text.trim().toUpperCase() !== "RESET") { toast("Type RESET to confirm", "error"); return; }
+    if (!confirm("This permanently deletes all test transactions and sets stock to zero. Continue?")) return;
+    const btn = document.getElementById("rsGoBtn");
+    btn.disabled = true; btn.textContent = "Resetting...";
+    try {
+      const r = await api("/admin/reset", { method: "POST", body });
+      toast("System reset complete. Ready for live use.", "success");
+      openModal("Reset complete", `<p>All test data has been cleared. Backup saved on the server as:</p>
+        <p><code>${esc(r.backup_file)}</code></p>
+        <p><b>Next steps:</b></p>
+        <ol style="padding-left:18px;line-height:1.7">
+          <li>Inventory: encode the actual opening stock per location (Inventory → + Adjust Stock, or Transfers → + Import Stock from Supplier).</li>
+          <li>Users: create the real staff accounts${body.options.users ? "" : " and disable demo accounts"}.</li>
+          <li>Customers: add or import real customers and their previous arrears.</li>
+          <li>Change your admin password if it is still the default.</li>
+        </ol>
+        <div class="modal-actions"><button class="btn green" onclick="closeModal()">OK</button></div>`);
+      state.products = await api("/products");
+      renderSystemReset(c);
+    } catch (e) {
+      btn.disabled = false; btn.textContent = "Reset system now";
+    }
+  });
 }
 
 // ================================================================== ADMIN: DISCOUNTS & PROMOS
