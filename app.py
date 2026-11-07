@@ -382,6 +382,19 @@ def list_products():
 def create_product():
     d = request.get_json(force=True)
     conn = get_db()
+    # Re-adding the SKU of a product that was deleted (archived) brings it back.
+    old = conn.execute("SELECT id FROM products WHERE sku=? AND active=0", (d.get("sku"),)).fetchone()
+    if old:
+        conn.execute(
+            "UPDATE products SET name=?, category=?, unit=?, price=?, cost=?, deposit_price=?, price_per_kg=?, min_stock=?, active=1 WHERE id=?",
+            (d["name"], d.get("category", ""), d.get("unit", "cylinder"), float(d["price"]),
+             float(d.get("cost") or 0), float(d.get("deposit_price") or 0), float(d.get("price_per_kg") or 0),
+             int(d.get("min_stock") or 0), old["id"]),
+        )
+        audit(conn, "RESTORE", "PRODUCTS", old["id"], d["name"])
+        conn.commit()
+        conn.close()
+        return jsonify(id=old["id"]), 201
     try:
         cur = conn.execute(
             "INSERT INTO products (sku, name, category, unit, price, cost, deposit_price, price_per_kg, min_stock) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -427,12 +440,20 @@ def products_csv_import():
             if not sku or not name:
                 raise ValueError("sku and name are required")
             price = float(row.get("price") or 0)
-            conn.execute(
-                "INSERT INTO products (sku, name, category, unit, price, cost, deposit_price, price_per_kg, min_stock) VALUES (?,?,?,?,?,?,?,?,?)",
-                (sku, name, (row.get("category") or "").strip(), (row.get("unit") or "cylinder").strip(),
-                 price, float(row.get("cost") or 0), float(row.get("deposit_price") or 0),
-                 float(row.get("price_per_kg") or 0), int(row.get("min_stock") or 0)),
-            )
+            vals = (name, (row.get("category") or "").strip(), (row.get("unit") or "cylinder").strip(),
+                    price, float(row.get("cost") or 0), float(row.get("deposit_price") or 0),
+                    float(row.get("price_per_kg") or 0), int(row.get("min_stock") or 0))
+            old = conn.execute("SELECT id FROM products WHERE sku=? AND active=0", (sku,)).fetchone()
+            if old:  # bring back a deleted (archived) product with the same SKU
+                conn.execute(
+                    "UPDATE products SET name=?, category=?, unit=?, price=?, cost=?, deposit_price=?, price_per_kg=?, min_stock=?, active=1 WHERE id=?",
+                    vals + (old["id"],),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO products (sku, name, category, unit, price, cost, deposit_price, price_per_kg, min_stock) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (sku,) + vals,
+                )
             created += 1
         except Exception as e:
             errors.append(f"Row {i}: {e}")
@@ -458,6 +479,52 @@ def update_product(pid):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# Every table that keeps a record of a product being used.
+PRODUCT_HISTORY_TABLES = [
+    "sale_items", "inventory_movements", "empty_cylinder_movements", "cylinder_deposits",
+    "transfer_items", "hauling_schedule", "hauling_schedule_items",
+    "commercial_deliveries", "booked_order_items",
+]
+
+
+@app.delete("/api/products/<int:pid>")
+@roles_required("ADMIN")
+def delete_product(pid):
+    conn = get_db()
+    prod = conn.execute("SELECT name FROM products WHERE id=?", (pid,)).fetchone()
+    if not prod:
+        conn.close()
+        return jsonify(error="Product not found"), 404
+    full = conn.execute("SELECT COALESCE(SUM(quantity),0) FROM inventory WHERE product_id=?", (pid,)).fetchone()[0]
+    empty = conn.execute("SELECT COALESCE(SUM(quantity),0) FROM empty_cylinder_inventory WHERE product_id=?", (pid,)).fetchone()[0]
+    if full or empty:
+        conn.close()
+        return jsonify(error=(
+            f"Can't delete — there are still {full} full and {empty} empty unit(s) of this product in stock. "
+            "Adjust its stock to 0 first (Inventory → Adjust Stock)."
+        )), 400
+    has_history = any(
+        conn.execute(f"SELECT 1 FROM {t} WHERE product_id=? LIMIT 1", (pid,)).fetchone()
+        for t in PRODUCT_HISTORY_TABLES
+    )
+    if has_history:
+        # Past sales/ledgers still point at it, so hide it instead of deleting.
+        conn.execute("UPDATE products SET active=0 WHERE id=?", (pid,))
+        conn.execute("UPDATE discounts SET active=0 WHERE product_id=?", (pid,))
+        audit(conn, "ARCHIVE", "PRODUCTS", pid, prod["name"])
+        conn.commit()
+        conn.close()
+        return jsonify(ok=True, archived=True)
+    conn.execute("DELETE FROM inventory WHERE product_id=?", (pid,))
+    conn.execute("DELETE FROM empty_cylinder_inventory WHERE product_id=?", (pid,))
+    conn.execute("DELETE FROM discounts WHERE product_id=?", (pid,))
+    conn.execute("DELETE FROM products WHERE id=?", (pid,))
+    audit(conn, "DELETE", "PRODUCTS", pid, prod["name"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, archived=False)
 
 
 # ---------------------------------------------------------------- customers
@@ -1684,6 +1751,7 @@ def system_reset():
     wipe_users = bool(opts.get("users"))
     wipe_staff_fleet = bool(opts.get("employees_vehicles"))
     wipe_discounts = bool(opts.get("discounts"))
+    wipe_products = bool(opts.get("products"))
 
     me = session["user"]
     conn = get_db()
@@ -1727,6 +1795,13 @@ def system_reset():
         if wipe_discounts:
             conn.execute("DELETE FROM discounts")
 
+        if wipe_products:
+            # All history pointing at products was cleared above.
+            conn.execute("DELETE FROM inventory")
+            conn.execute("DELETE FROM empty_cylinder_inventory")
+            conn.execute("DELETE FROM discounts WHERE product_id IS NOT NULL")
+            conn.execute("DELETE FROM products")
+
         # Restart auto-number counters for every emptied table.
         emptied = list(RESET_TRANSACTION_TABLES)
         if wipe_staff_fleet:
@@ -1735,6 +1810,8 @@ def system_reset():
             emptied.append("customers")
         if wipe_discounts:
             emptied.append("discounts")
+        if wipe_products:
+            emptied.append("products")
         conn.executemany("DELETE FROM sqlite_sequence WHERE name=?", [(t,) for t in emptied])
 
         wiped = ["transactions", "stock"]
@@ -1746,6 +1823,8 @@ def system_reset():
             wiped.append("employees & vehicles")
         if wipe_discounts:
             wiped.append("discounts")
+        if wipe_products:
+            wiped.append("products")
         audit(conn, "RESET", "SYSTEM", None,
               f"Go-live reset: cleared {', '.join(wiped)}. "
               f"Before: {before['sales']} sales, {before['transfers']} transfers, "
