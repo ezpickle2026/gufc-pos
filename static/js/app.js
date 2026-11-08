@@ -1735,7 +1735,25 @@ async function renderCustomerGrowth(c) {
       <p style="color:var(--muted);font-size:12.5px;margin:10px 0 0">Only <b>LPG cylinder</b> purchases (refill, deposit or swap) count.
         Accessories and other items are ignored. Walk-in sales can't be tracked per customer, so they're shown only as a cylinder count.</p>
     </div>
-    <div id="cgOut">Loading...</div>`;
+    <div id="cgOut">Loading...</div>
+    <div class="card" style="margin-top:16px;min-width:0">
+      <h3 style="margin-top:0">Monthly LPG per Customer (kg)</h3>
+      <p style="color:var(--muted);font-size:12.5px;margin:0 0 10px">Each customer's completed LPG cylinder orders per month, in kg
+        (cylinders × size, e.g. 3 × 11kg = 33 kg; 50kg weight-billed accounts use the actual kg billed). Voided sales are excluded.</p>
+      <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center">
+        <label style="font-size:13px;color:var(--muted)">From</label><input type="month" id="kgFrom">
+        <label style="font-size:13px;color:var(--muted)">to</label><input type="month" id="kgTo">
+        <select id="kgLoc"><option value="">All locations</option>
+          ${state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}</select>
+        <select id="kgCat"><option value="">All customer categories</option>
+          ${categories.map(k => `<option value="${esc(k.name)}">${esc(k.name)}</option>`).join("")}</select>
+        <input id="kgSearch" placeholder="Search customer..." style="max-width:180px">
+        <button class="btn" id="kgRun">Run</button>
+        <a class="btn small" id="kgXlsx" href="#">Export Excel</a>
+        <a class="btn small" id="kgPdf" href="#">Export PDF</a>
+      </div>
+      <div id="kgOut"></div>
+    </div>`;
 
   const periodSel = document.getElementById("cgPeriod"), countSel = document.getElementById("cgCount");
   function fillCounts() {
@@ -1837,6 +1855,58 @@ async function renderCustomerGrowth(c) {
       <p style="color:var(--muted);font-size:12px;margin-top:12px">Products counted as LPG cylinders:
         ${d.products_counted.length ? d.products_counted.map(p => esc(p.name)).join(", ") : "none — set a product's category to “LPG Cylinder” (or give it a deposit price) to count it."}</p>`;
   }
+
+  // ---- Monthly LPG per customer (kg)
+  const ymStr = dt => `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
+  const nowDt = new Date();
+  document.getElementById("kgTo").value = ymStr(nowDt);
+  document.getElementById("kgFrom").value = ymStr(new Date(nowDt.getFullYear(), nowDt.getMonth() - 11, 1));
+  const kgQs = () => {
+    const q = new URLSearchParams();
+    [["from", "kgFrom"], ["to", "kgTo"], ["location_id", "kgLoc"], ["category", "kgCat"]].forEach(([k, id]) => {
+      const v = document.getElementById(id).value; if (v) q.set(k, v);
+    });
+    return q.toString();
+  };
+  const fmtKg = v => v ? Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 }) : "–";
+  let kgData = null;
+  function drawKg() {
+    const d = kgData; if (!d) return;
+    const term = document.getElementById("kgSearch").value.trim().toLowerCase();
+    const rows = d.rows.filter(r => !term || `${r.name} ${r.account_no} ${r.business_name}`.toLowerCase().includes(term));
+    const t = d.totals, M = d.months;
+    const shortLbl = ym => new Date(ym + "-01T00:00:00").toLocaleString("en", { month: "short", year: "2-digit" });
+    document.getElementById("kgOut").innerHTML = `
+      <div class="table-wrap"><table><thead><tr><th>#</th><th>Customer</th><th>Category</th>
+        ${M.map(ym => `<th style="text-align:right">${shortLbl(ym)}</th>`).join("")}
+        <th style="text-align:right">Total kg</th><th style="text-align:right">Cyl.</th><th style="text-align:right">Avg kg/mo</th></tr></thead><tbody>
+        ${rows.length ? rows.map((r, i) => `<tr><td>${i + 1}</td><td><b>${esc(r.name)}</b><br><span style="color:var(--muted);font-size:12px">${esc(r.account_no)}${r.business_name ? " · " + esc(r.business_name) : ""}</span></td>
+          <td><span class="badge blue">${esc(r.category)}</span></td>
+          ${M.map(ym => `<td style="text-align:right;${r.months[ym] ? "" : "color:var(--muted)"}">${fmtKg(r.months[ym])}</td>`).join("")}
+          <td style="text-align:right"><b>${fmtKg(r.total_kg)}</b></td><td style="text-align:right">${r.cylinders}</td><td style="text-align:right">${fmtKg(r.avg_kg_per_month)}</td></tr>`).join("")
+          : `<tr><td colspan="${M.length + 6}" style="color:var(--muted)">No completed LPG orders by customers in this period.</td></tr>`}
+        <tr style="font-weight:700;background:var(--bg)"><td></td><td>TOTAL — CUSTOMERS</td><td></td>
+          ${M.map(ym => `<td style="text-align:right">${fmtKg(t.customers_months[ym])}</td>`).join("")}
+          <td style="text-align:right">${fmtKg(t.customers_kg)}</td><td style="text-align:right">${t.customers_cylinders}</td><td></td></tr>
+        ${d.walkin ? `<tr><td></td><td>Walk-in (no account)</td><td></td>${M.map(ym => `<td style="text-align:right">${fmtKg(d.walkin.months[ym])}</td>`).join("")}
+          <td style="text-align:right">${fmtKg(d.walkin.total_kg)}</td><td style="text-align:right">${d.walkin.cylinders}</td><td></td></tr>
+          <tr style="font-weight:700;background:var(--bg)"><td></td><td>GRAND TOTAL</td><td></td>${M.map(ym => `<td style="text-align:right">${fmtKg(t.months[ym])}</td>`).join("")}
+          <td style="text-align:right">${fmtKg(t.kg)}</td><td></td><td></td></tr>` : ""}
+      </tbody></table></div>
+      ${term ? `<p style="color:var(--muted);font-size:12px;margin:6px 0 0">Showing ${rows.length} of ${d.rows.length} customers; totals are for all customers.</p>` : ""}
+      ${d.unknown_size_products.length ? `<p style="color:var(--warn);font-size:12.5px;margin:8px 0 0">⚠ Not included — no kg size in the product name:
+        ${d.unknown_size_products.map(esc).join(", ")}. Add the size to the product name (e.g. "Solane LPG 11kg").</p>` : ""}`;
+  }
+  async function loadKg() {
+    document.getElementById("kgXlsx").href = "/api/reports/customer-kg/export?format=xlsx&" + kgQs();
+    document.getElementById("kgPdf").href = "/api/reports/customer-kg/export?format=pdf&" + kgQs();
+    try { kgData = await api("/reports/customer-kg?" + kgQs()); } catch (e) { return; }
+    drawKg();
+  }
+  ["kgFrom", "kgTo", "kgLoc", "kgCat"].forEach(id => document.getElementById(id).addEventListener("change", loadKg));
+  document.getElementById("kgRun").addEventListener("click", loadKg);
+  document.getElementById("kgSearch").addEventListener("input", drawKg);
+  loadKg();
 
   periodSel.addEventListener("change", () => { fillCounts(); load(); });
   ["cgCount", "cgEnd", "cgLoc", "cgCat"].forEach(id => document.getElementById(id).addEventListener("change", load));
