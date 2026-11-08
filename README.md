@@ -46,6 +46,16 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
   Excel or PDF. Walk-in sales can't be tracked per customer, so they appear only as a
   walk-in cylinder count.
 
+- **Monthly LPG per Customer (kg)** (bottom of the Customer Growth page). One row per
+  customer, one column per month, showing the kg of LPG in that customer's completed
+  orders (voided sales excluded), with total kg, cylinders, average kg per month and LPG
+  sales. kg = cylinders × the size in the product name (e.g. 3 × "Solane LPG 11kg" = 33 kg);
+  50kg commercial weight-billed sales use the actual kg billed. Pick any month range (up
+  to 24 months), location and customer category, and search by customer. Walk-in sales
+  are shown as one separate row. Export to Excel (with a second sheet broken down per
+  customer and cylinder size) or PDF. An LPG cylinder product with no kg size in its name
+  is left out and flagged on screen and in the exports.
+
 - **Delivery Receipt for credit / terms sales.** Every CREDIT sale now gets its own
   DR number (`DR-YYYYMMDD-####`). Right after a credit sale is completed, the
   Delivery Receipt prints instead of the small cash receipt: one letter-size page

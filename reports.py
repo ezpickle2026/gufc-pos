@@ -3,6 +3,7 @@ Flask responses. Kept separate from app.py so the transaction-logic file stays
 focused on business rules."""
 import io
 import os
+from xml.sax.saxutils import escape as _xml_escape
 from datetime import datetime
 
 from flask import send_file
@@ -575,6 +576,146 @@ def customer_growth_xlsx_response(data, subtitle, filename):
     for w in (ws2, ws3):
         for col, width in zip("ABCDEFGH", (12, 28, 28, 14, 16, 18, 12, 12)):
             w.column_dimensions[col].width = width
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+def _kg(v):
+    return f"{v:,.2f}".rstrip("0").rstrip(".") if v else "-"
+
+
+def customer_kg_pdf_response(data, subtitle, filename):
+    """Customer Monthly LPG (kg): one row per customer, one column per month."""
+    from reportlab.lib.pagesizes import legal
+    months = data["months"]
+    pagesize = landscape(legal) if len(months) > 12 else landscape(letter)
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=pagesize, topMargin=30, bottomMargin=30, leftMargin=24, rightMargin=24)
+    styles = getSampleStyleSheet()
+    flow = _header_flowables("Customer Monthly LPG Report (kg)", subtitle)
+    t = data["totals"]
+    short = [datetime.strptime(ym, "%Y-%m").strftime("%b %y") for ym in months]
+    cell_style = ParagraphStyle("KgCell", parent=styles["Normal"], fontSize=7, leading=8.5)
+
+    rows = [["#", "Customer", "Category"] + short + ["Total kg", "Cyl.", "Avg kg/mo"]]
+    for i, r in enumerate(data["rows"], 1):
+        label = _xml_escape(r["name"]) + (f" <font color='#6b7785'>({_xml_escape(r['account_no'])})</font>" if r["account_no"] else "")
+        rows.append([str(i), Paragraph(label, cell_style), (r["category"] or "")[:12]] + [_kg(r["months"][ym]) for ym in months]
+                    + [_kg(r["total_kg"]), str(r["cylinders"]), _kg(r["avg_kg_per_month"])])
+    if not data["rows"]:
+        rows.append(["", "No completed LPG orders by customers in this period", ""] + [""] * len(months) + ["", "", ""])
+    rows.append(["", "TOTAL", ""] + [_kg(t["customers_months"][ym]) for ym in months]
+                + [_kg(t["customers_kg"]), str(t["customers_cylinders"]), ""])
+    extra_rows = 0
+    if data["walkin"]:
+        w = data["walkin"]
+        rows.append(["", "Walk-in (no account)", ""] + [_kg(w["months"][ym]) for ym in months]
+                    + [_kg(w["total_kg"]), str(w["cylinders"]), ""])
+        rows.append(["", "GRAND TOTAL", ""] + [_kg(t["months"][ym]) for ym in months] + [_kg(t["kg"]), "", ""])
+        extra_rows = 2
+
+    avail = pagesize[0] - 48
+    fixed = 18 + 52 + 48 + 30 + 44
+    mw = min(60, max(30, (avail - fixed - 150) / max(1, len(months))))
+    cust_w = avail - fixed - mw * len(months)
+    widths = [18, cust_w, 52] + [mw] * len(months) + [48, 30, 44]
+    tbl = Table(rows, repeatRows=1, colWidths=widths)
+    total_idx = len(rows) - 1 - extra_rows
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), BLUE), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
+        ("ALIGN", (3, 0), (-1, -1), "RIGHT"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("FONTNAME", (-3, 1), (-3, -1), "Helvetica-Bold"),
+        ("FONTNAME", (0, total_idx), (-1, total_idx), "Helvetica-Bold"),
+        ("BACKGROUND", (0, total_idx), (-1, total_idx), colors.HexColor("#e8f5ee")),
+    ]
+    if extra_rows:
+        style += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+                  ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e3ecf5"))]
+    tbl.setStyle(TableStyle(style))
+    flow.append(tbl)
+
+    note = ParagraphStyle("Note", parent=styles["Normal"], fontSize=7.5, textColor=colors.HexColor("#6b7785"))
+    flow.append(Spacer(1, 8))
+    flow.append(Paragraph("kg = cylinders × cylinder size (e.g. 11kg). 50kg commercial weight-billed sales use the "
+                          "actual kg billed. Only completed sales of LPG cylinder products are included; voided sales "
+                          "are excluded. Cyl. = number of cylinders (weight-billed kg not included).", note))
+    if data["unknown_size_products"]:
+        flow.append(Paragraph("Not included — no kg size in the product name: " + ", ".join(data["unknown_size_products"]), note))
+    doc.build(flow)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
+
+
+def customer_kg_xlsx_response(data, subtitle, filename):
+    from openpyxl.utils import get_column_letter
+    wb = Workbook()
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="0B3D66", end_color="0B3D66", fill_type="solid")
+    months, labels, t = data["months"], data["month_labels"], data["totals"]
+
+    def header(ws, row):
+        ws.append(row)
+        for cell in ws[ws.max_row]:
+            cell.font = header_font
+            cell.fill = header_fill
+        return ws.max_row
+
+    def bold_last(ws):
+        for cell in ws[ws.max_row]:
+            cell.font = Font(bold=True)
+
+    def kg_format(ws, first_col, last_col, first_row):
+        for row in ws.iter_rows(min_row=first_row, min_col=first_col, max_col=last_col):
+            for cell in row:
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = "#,##0.00"
+
+    ws = wb.active
+    ws.title = "Per Customer (kg)"
+    ws.append(["Customer Monthly LPG Report (kg)"]); ws["A1"].font = Font(bold=True, size=14)
+    ws.append([subtitle])
+    ws.append([])
+    hdr = header(ws, ["Account #", "Customer", "Business Name", "Category"] + labels
+                 + ["Total kg", "Cylinders", "Avg kg / Month", "Months Bought", "LPG Sales"])
+    for r in data["rows"]:
+        ws.append([r["account_no"], r["name"], r["business_name"], r["category"]] + [r["months"][ym] for ym in months]
+                  + [r["total_kg"], r["cylinders"], r["avg_kg_per_month"], r["months_bought"], r["amount"]])
+    ws.append(["", "TOTAL — CUSTOMERS", "", ""] + [t["customers_months"][ym] for ym in months]
+              + [t["customers_kg"], t["customers_cylinders"], "", "", t["customers_amount"]]); bold_last(ws)
+    if data["walkin"]:
+        w = data["walkin"]
+        ws.append(["", "Walk-in (no account)", "", ""] + [w["months"][ym] for ym in months]
+                  + [w["total_kg"], w["cylinders"], "", "", w["amount"]])
+        ws.append(["", "GRAND TOTAL", "", ""] + [t["months"][ym] for ym in months] + [t["kg"]]); bold_last(ws)
+    n = 4 + len(months)
+    kg_format(ws, 5, n + 1, hdr + 1)
+    kg_format(ws, n + 3, n + 3, hdr + 1)
+    kg_format(ws, n + 5, n + 5, hdr + 1)
+    for i, width in enumerate([12, 28, 26, 13] + [11] * len(months) + [12, 10, 13, 13, 14], 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+    ws.freeze_panes = ws.cell(row=hdr + 1, column=5)
+    ws.append([])
+    ws.append(["kg = cylinders x cylinder size (e.g. 11kg). 50kg commercial weight-billed sales use the actual kg billed. "
+               "Only completed sales of LPG cylinder products are included."])
+    if data["unknown_size_products"]:
+        ws.append(["Not included — no kg size in the product name: " + ", ".join(data["unknown_size_products"])])
+
+    ws2 = wb.create_sheet("Per Customer & Size")
+    hdr2 = header(ws2, ["Account #", "Customer", "Product"] + labels + ["Total kg", "Cylinders"])
+    for r in data["by_size"]:
+        ws2.append([r["account_no"], r["name"], r["product_name"]] + [r["months"][ym] for ym in months]
+                   + [r["total_kg"], r["cylinders"]])
+    kg_format(ws2, 4, 4 + len(months), hdr2 + 1)
+    for i, width in enumerate([12, 28, 26] + [11] * len(months) + [12, 10], 1):
+        ws2.column_dimensions[get_column_letter(i)].width = width
+    ws2.freeze_panes = "D2"
 
     buf = io.BytesIO()
     wb.save(buf)

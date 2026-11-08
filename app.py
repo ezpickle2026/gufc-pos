@@ -2,6 +2,7 @@ import os
 import functools
 import csv
 import io
+import re
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -11,7 +12,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from db import get_db, init_db
 from reports import (xlsx_response, pdf_table_response, soa_pdf_response, commercial_billing_pdf, eod_pdf_response,
                      eod_xlsx_response, swapped_pdf_response, swapped_xlsx_response,
-                     customer_growth_pdf_response, customer_growth_xlsx_response)
+                     customer_growth_pdf_response, customer_growth_xlsx_response,
+                     customer_kg_pdf_response, customer_kg_xlsx_response)
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
@@ -3150,6 +3152,183 @@ def export_customer_growth():
     if fmt == "pdf":
         return customer_growth_pdf_response(data, subtitle, f"customer-growth-{stamp}.pdf")
     return customer_growth_xlsx_response(data, subtitle, f"customer-growth-{stamp}.xlsx")
+
+
+# ---------------------------------------------------------------- customer monthly LPG kg report
+# Per customer, how many kg of LPG they bought each month on completed sales
+# (voided sales and opening balances are ignored). Only LPG cylinder products
+# count. A cylinder line's kg = qty x the cylinder size read from the product
+# name or SKU (e.g. "Solane LPG 11kg" -> 11). 50kg commercial weight-billed
+# sales already record the kg consumed as the line qty, so that is used as-is.
+
+KG_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*kg\b", re.IGNORECASE)
+KG_REPORT_MAX_MONTHS = 24
+
+
+def product_kg_size(name, sku=None):
+    for text in (name, sku):
+        m = KG_SIZE_RE.search(text or "")
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def _month_list(start_ym, end_ym):
+    y, m = start_ym
+    out = []
+    while (y, m) <= end_ym:
+        out.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out[-KG_REPORT_MAX_MONTHS:]  # keep the most recent months
+
+
+def _parse_ym(value):
+    try:
+        d = datetime.strptime(value, "%Y-%m")
+        return d.year, d.month
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_customer_kg_report(conn, month_from=None, month_to=None, location_id=None, category=None):
+    today = datetime.now().date()
+    end_ym = _parse_ym(month_to) or (today.year, today.month)
+    start_ym = _parse_ym(month_from)
+    if not start_ym:
+        y, m = end_ym
+        m -= 11
+        while m < 1:
+            m += 12; y -= 1
+        start_ym = (y, m)
+    if start_ym > end_ym:
+        start_ym, end_ym = end_ym, start_ym
+    months = _month_list(start_ym, end_ym)
+    first_day = months[0] + "-01"
+    ly, lm = map(int, months[-1].split("-"))
+    last_day = (datetime(ly + (lm == 12), 1 if lm == 12 else lm + 1, 1).date() - timedelta(days=1)).isoformat()
+
+    where = ["s.status='COMPLETED'", "s.is_opening_balance=0", "si.qty > 0", LPG_CYLINDER_SQL,
+             "date(s.ts) BETWEEN date(?) AND date(?)"]
+    params = [first_day, last_day]
+    if location_id:
+        where.append("s.location_id=?"); params.append(location_id)
+    if category:
+        where.append("c.category=?"); params.append(category)
+    lines = conn.execute(
+        f"""SELECT s.customer_id, strftime('%Y-%m', s.ts) ym, si.qty, si.product_id, p.name product_name, p.sku,
+                   ROUND(si.subtotal - COALESCE(si.discount_amount,0), 2) amount,
+                   EXISTS(SELECT 1 FROM commercial_deliveries cd WHERE cd.sale_id = s.id) weight_billed,
+                   c.account_no, c.name customer_name, c.business_name, c.category customer_category
+            FROM sale_items si JOIN sales s ON s.id=si.sale_id JOIN products p ON p.id=si.product_id
+            {'JOIN' if category else 'LEFT JOIN'} customers c ON c.id=s.customer_id
+            WHERE {' AND '.join(where)}""",
+        params,
+    ).fetchall()
+
+    customers, walkin, by_size, unknown = {}, None, {}, {}
+    month_totals = {ym: 0.0 for ym in months}
+
+    def blank(**kw):
+        return dict(kw, months={ym: 0.0 for ym in months}, total_kg=0.0, cylinders=0, amount=0.0, orders=set())
+
+    for r in lines:
+        if r["weight_billed"]:
+            kg, cyl = float(r["qty"]), 0
+        else:
+            size = product_kg_size(r["product_name"], r["sku"])
+            if size is None:
+                unknown[r["product_id"]] = r["product_name"]
+                continue
+            kg, cyl = r["qty"] * size, r["qty"]
+        if r["customer_id"]:
+            row = customers.get(r["customer_id"])
+            if row is None:
+                row = customers[r["customer_id"]] = blank(
+                    customer_id=r["customer_id"], account_no=r["account_no"], name=r["customer_name"],
+                    business_name=r["business_name"] or "", category=r["customer_category"] or "")
+        else:
+            if walkin is None:
+                walkin = blank(customer_id=None, account_no="", name="Walk-in (no account)", business_name="", category="")
+            row = walkin
+        row["months"][r["ym"]] += kg
+        row["total_kg"] += kg
+        row["cylinders"] += cyl
+        row["amount"] += r["amount"] or 0
+        month_totals[r["ym"]] += kg
+        sk = (r["customer_id"], r["product_id"])
+        sz = by_size.setdefault(sk, {"customer_id": r["customer_id"], "account_no": row["account_no"], "name": row["name"],
+                                     "product_name": r["product_name"].replace(" (weight-billed)", ""),
+                                     "months": {ym: 0.0 for ym in months}, "total_kg": 0.0, "cylinders": 0})
+        sz["months"][r["ym"]] += kg; sz["total_kg"] += kg; sz["cylinders"] += cyl
+
+    def finish(row):
+        row["months"] = {k: round(v, 2) for k, v in row["months"].items()}
+        row["total_kg"] = round(row["total_kg"], 2)
+        if "amount" in row:
+            row["amount"] = round(row["amount"], 2)
+            active = sum(1 for v in row["months"].values() if v)
+            row["months_bought"] = active
+            row["avg_kg_per_month"] = round(row["total_kg"] / len(months), 2)
+            row.pop("orders", None)
+        return row
+
+    rows = sorted((finish(r) for r in customers.values()), key=lambda x: (-x["total_kg"], x["name"]))
+    location_name = None
+    if location_id:
+        lr = conn.execute("SELECT name FROM locations WHERE id=?", (location_id,)).fetchone()
+        location_name = lr["name"] if lr else None
+    totals_customers = {ym: round(sum(r["months"][ym] for r in rows), 2) for ym in months}
+    return {
+        "months": months,
+        "month_labels": [datetime.strptime(ym, "%Y-%m").strftime("%b %Y") for ym in months],
+        "month_from": months[0], "month_to": months[-1],
+        "location_id": location_id, "location_name": location_name, "category": category,
+        "rows": rows,
+        "walkin": finish(walkin) if walkin else None,
+        "by_size": sorted((finish(r) for r in by_size.values()), key=lambda x: (x["name"], x["product_name"])),
+        "totals": {
+            "customers_months": totals_customers,
+            "customers_kg": round(sum(r["total_kg"] for r in rows), 2),
+            "customers_cylinders": sum(r["cylinders"] for r in rows),
+            "customers_amount": round(sum(r["amount"] for r in rows), 2),
+            "months": {k: round(v, 2) for k, v in month_totals.items()},
+            "kg": round(sum(month_totals.values()), 2),
+        },
+        "unknown_size_products": sorted(unknown.values()),
+    }
+
+
+def _kg_report_args():
+    return dict(month_from=request.args.get("from") or None, month_to=request.args.get("to") or None,
+                location_id=request.args.get("location_id", type=int),
+                category=(request.args.get("category") or "").strip() or None)
+
+
+@app.get("/api/reports/customer-kg")
+@roles_or_module_required("ADMIN", "MANAGER", module="customer_growth")
+def report_customer_kg():
+    conn = get_db()
+    data = _build_customer_kg_report(conn, **_kg_report_args())
+    conn.close()
+    return jsonify(data)
+
+
+@app.get("/api/reports/customer-kg/export")
+@roles_or_module_required("ADMIN", "MANAGER", module="customer_growth")
+def export_customer_kg():
+    fmt = request.args.get("format", "xlsx")
+    conn = get_db()
+    data = _build_customer_kg_report(conn, **_kg_report_args())
+    conn.close()
+    subtitle = f"Completed LPG cylinder orders, in kg · {data['month_labels'][0]} to {data['month_labels'][-1]}"
+    if data["location_name"]:
+        subtitle += f" · {data['location_name']}"
+    if data["category"]:
+        subtitle += f" · {data['category']} customers"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    if fmt == "pdf":
+        return customer_kg_pdf_response(data, subtitle, f"customer-monthly-kg-{stamp}.pdf")
+    return customer_kg_xlsx_response(data, subtitle, f"customer-monthly-kg-{stamp}.xlsx")
 
 
 # ---------------------------------------------------------------- end of day report
