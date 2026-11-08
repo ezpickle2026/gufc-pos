@@ -68,6 +68,7 @@ const NAV = [
   { id: "customers", label: "Customers", icon: "\u{1F465}", module: "customers" },
   { id: "receivables", label: "Receivables", icon: "\u{1F4B0}", module: "receivables" },
   { id: "cylinder_deposits", label: "Cylinder Deposits", icon: "\u{1F6E2}\uFE0F", module: "cylinder_deposits" },
+  { id: "customer_growth", label: "Customer Growth", icon: "\u{1F331}", module: "customer_growth" },
 
   { section: "Inventory & Dispatch" },
   { id: "inventory", label: "Inventory", icon: "\u{1F4E6}", module: "inventory" },
@@ -166,6 +167,7 @@ function render() {
     staff_schedule: renderStaffSchedule, kpi: renderKpi,
     booked_orders: renderBookedOrders, incident_reports: renderIncidentReports, roles: renderRoles,
     commercial_deliveries: renderCommercialDeliveries, eod_report: renderEndOfDay,
+    customer_growth: renderCustomerGrowth,
   };
   (views[state.view] || renderDashboard)(c);
 }
@@ -1668,6 +1670,180 @@ function printSwappedReport(d) {
   </div>`);
 }
 
+// ================================================================== CUSTOMER GROWTH (LPG cylinders only)
+const growthPct = v => v === null || v === undefined ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(1)}%`;
+
+function growthChartSvg(rows) {
+  // Stacked bars above the axis: new (green) + returning (blue) = active.
+  // Red bars below the axis: customers lapsed vs the period before.
+  const W = 760, H = 260, padL = 34, padR = 8, padT = 14, padB = 46;
+  const maxUp = Math.max(1, ...rows.map(r => r.active));
+  const maxDown = Math.max(0, ...rows.map(r => r.lapsed));
+  const plotH = H - padT - padB;
+  const scale = plotH / (maxUp + maxDown || 1);
+  const zeroY = padT + maxUp * scale;
+  const slot = (W - padL - padR) / rows.length;
+  const bw = Math.max(6, Math.min(40, slot * 0.62));
+  const step = Math.max(1, Math.ceil(rows.length / 12));
+  let bars = "";
+  rows.forEach((r, i) => {
+    const x = padL + i * slot + (slot - bw) / 2;
+    const ret = r.active - r.new;
+    const hRet = ret * scale, hNew = r.new * scale, hLap = r.lapsed * scale;
+    const tip = `${esc(r.label)}: ${r.active} active (${r.new} new, ${ret} returning), ${r.lapsed} lapsed`;
+    bars += `<g><title>${tip}</title>
+      ${hRet ? `<rect x="${x}" y="${zeroY - hRet}" width="${bw}" height="${hRet}" fill="var(--blue)" rx="2"/>` : ""}
+      ${hNew ? `<rect x="${x}" y="${zeroY - hRet - hNew}" width="${bw}" height="${hNew}" fill="var(--green)" rx="2"/>` : ""}
+      ${hLap ? `<rect x="${x}" y="${zeroY}" width="${bw}" height="${hLap}" fill="var(--danger)" opacity=".75" rx="2"/>` : ""}
+      ${r.active ? `<text x="${x + bw / 2}" y="${zeroY - hRet - hNew - 4}" text-anchor="middle" font-size="10" fill="var(--text)">${r.active}</text>` : ""}
+    </g>`;
+    if (i % step === 0 || i === rows.length - 1) {
+      const short = r.label.includes("–") ? r.start.slice(5).replace("-", "/") : r.label;
+      bars += `<text x="${x + bw / 2}" y="${H - padB + 16}" text-anchor="middle" font-size="10" fill="var(--muted)">${esc(short)}</text>`;
+    }
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block" role="img" aria-label="Active, new and lapsed customers by period">
+    <line x1="${padL}" x2="${W - padR}" y1="${zeroY}" y2="${zeroY}" stroke="var(--border)"/>
+    <text x="${padL - 6}" y="${padT + 4}" text-anchor="end" font-size="10" fill="var(--muted)">${maxUp}</text>
+    <text x="${padL - 6}" y="${zeroY + 3}" text-anchor="end" font-size="10" fill="var(--muted)">0</text>
+    ${maxDown ? `<text x="${padL - 6}" y="${H - padB}" text-anchor="end" font-size="10" fill="var(--muted)">-${maxDown}</text>` : ""}
+    ${bars}
+    <g font-size="11" fill="var(--text)" transform="translate(${padL},${H - 12})">
+      <rect width="10" height="10" y="-9" fill="var(--green)" rx="2"/><text x="14">New</text>
+      <rect x="54" width="10" height="10" y="-9" fill="var(--blue)" rx="2"/><text x="68">Returning</text>
+      <rect x="140" width="10" height="10" y="-9" fill="var(--danger)" opacity=".75" rx="2"/><text x="154">Lapsed (vs. previous period)</text>
+    </g></svg>`;
+}
+
+async function renderCustomerGrowth(c) {
+  let categories = [];
+  try { categories = await api("/customer-categories"); } catch (e) { /* filter just stays empty */ }
+  c.innerHTML = `
+    <div class="card" style="margin-bottom:16px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <select id="cgPeriod"><option value="month">Monthly</option><option value="week">Weekly</option></select>
+        <select id="cgCount"></select>
+        <label style="font-size:13px;color:var(--muted)">up to</label><input type="date" id="cgEnd">
+        <select id="cgLoc"><option value="">All locations</option>
+          ${state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}</select>
+        <select id="cgCat"><option value="">All customer categories</option>
+          ${categories.map(k => `<option value="${esc(k.name)}">${esc(k.name)}</option>`).join("")}</select>
+        <button class="btn" id="cgRun">Refresh</button>
+        <a class="btn small" id="cgXlsx" href="#">Export Excel</a>
+        <a class="btn small" id="cgPdf" href="#">Export PDF</a>
+      </div>
+      <p style="color:var(--muted);font-size:12.5px;margin:10px 0 0">Only <b>LPG cylinder</b> purchases (refill, deposit or swap) count.
+        Accessories and other items are ignored. Walk-in sales can't be tracked per customer, so they're shown only as a cylinder count.</p>
+    </div>
+    <div id="cgOut">Loading...</div>`;
+
+  const periodSel = document.getElementById("cgPeriod"), countSel = document.getElementById("cgCount");
+  function fillCounts() {
+    const opts = periodSel.value === "week" ? [8, 12, 26, 52] : [6, 12, 24, 36];
+    const def = periodSel.value === "week" ? 12 : 12;
+    countSel.innerHTML = opts.map(n => `<option value="${n}" ${n === def ? "selected" : ""}>Last ${n} ${periodSel.value === "week" ? "weeks" : "months"}</option>`).join("");
+  }
+  fillCounts();
+  const qs = () => {
+    const q = new URLSearchParams({ period: periodSel.value, count: countSel.value });
+    const e = document.getElementById("cgEnd").value, l = document.getElementById("cgLoc").value, k = document.getElementById("cgCat").value;
+    if (e) q.set("end", e); if (l) q.set("location_id", l); if (k) q.set("category", k);
+    return q.toString();
+  };
+  function updateLinks() {
+    document.getElementById("cgXlsx").href = "/api/reports/customer-growth/export?format=xlsx&" + qs();
+    document.getElementById("cgPdf").href = "/api/reports/customer-growth/export?format=pdf&" + qs();
+  }
+
+  async function load() {
+    updateLinks();
+    const out = document.getElementById("cgOut");
+    let d;
+    try { d = await api("/reports/customer-growth?" + qs()); } catch (e) { out.innerHTML = ""; return; }
+    const cur = d.current, unit = d.period === "week" ? "week" : "month";
+    const delta = (now, before, fmt = v => v) => before === undefined || before === null ? "" :
+      `<div style="font-size:12px;margin-top:4px;color:${now > before ? "var(--green)" : now < before ? "var(--danger)" : "var(--muted)"}">
+        ${now > before ? "▲" : now < before ? "▼" : "■"} ${fmt(Math.abs(now - before))} vs last ${unit}</div>`;
+    const prev = d.previous || {};
+    const latestRows = [...d.rows].reverse();
+    out.innerHTML = `
+      <div style="color:var(--muted);font-size:13px;margin-bottom:8px">This ${unit}: <b style="color:var(--text)">${esc(cur.label)}</b>
+        (${cur.start} to ${cur.end})${d.location_name ? " · " + esc(d.location_name) : ""}${d.category ? " · " + esc(d.category) + " customers" : ""}</div>
+      <div class="grid grid-4">
+        <div class="card stat-card"><div class="label">Active Customers</div><div class="value">${cur.active}</div>${delta(cur.active, prev.active)}</div>
+        <div class="card stat-card green"><div class="label">New Customers</div><div class="value">${cur.new}</div>${delta(cur.new, prev.new)}</div>
+        <div class="card stat-card"><div class="label">Growth vs Last ${unit === "week" ? "Week" : "Month"}</div>
+          <div class="value" style="color:${(cur.growth_pct || 0) > 0 ? "var(--green)" : (cur.growth_pct || 0) < 0 ? "var(--danger)" : "inherit"}">${growthPct(cur.growth_pct)}</div>
+          <div style="font-size:12px;margin-top:4px;color:var(--muted)">Net ${cur.net_change >= 0 ? "+" : ""}${cur.net_change} customers</div></div>
+        <div class="card stat-card"><div class="label">Retention</div><div class="value">${cur.retention_pct === null ? "—" : cur.retention_pct.toFixed(1) + "%"}</div>
+          <div style="font-size:12px;margin-top:4px;color:var(--muted)">${cur.retained} of ${cur.prev_active} came back · ${cur.lapsed} lapsed</div></div>
+        <div class="card stat-card"><div class="label">Cylinders to Customers</div><div class="value">${cur.cylinders}</div>${delta(cur.cylinders, prev.cylinders)}</div>
+        <div class="card stat-card"><div class="label">Cylinders / Customer</div><div class="value">${cur.cylinders_per_customer.toFixed(2)}</div></div>
+        <div class="card stat-card"><div class="label">LPG Sales (customers)</div><div class="value">${money(cur.amount)}</div>${delta(cur.amount, prev.amount, money)}</div>
+        <div class="card stat-card"><div class="label">Total Customer Base</div><div class="value">${cur.customer_base}</div>
+          <div style="font-size:12px;margin-top:4px;color:var(--muted)">ever bought an LPG cylinder${d.category ? "" : ` · ${cur.walkin_cylinders} walk-in cyl. this ${unit}`}</div></div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h3 style="margin-top:0">Customer Growth Trend — ${d.period === "week" ? "Weekly" : "Monthly"}</h3>
+        ${growthChartSvg(d.rows)}
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h3 style="margin-top:0">By ${d.period === "week" ? "Week" : "Month"}</h3>
+        <div class="table-wrap"><table><thead><tr><th>${d.period === "week" ? "Week" : "Month"}</th><th>Active</th><th>New</th><th>Retained</th><th>Reactivated</th>
+          <th>Lapsed</th><th>Net</th><th>Growth</th><th>Retention</th><th>Cylinders</th><th>Cyl/Cust</th>${d.category ? "" : "<th>Walk-in Cyl</th>"}<th>LPG Sales</th><th>Customer Base</th></tr></thead><tbody>
+          ${latestRows.map(r => `<tr><td><b>${esc(r.label)}</b></td><td>${r.active}</td><td>${r.new ? `<span class="badge green">+${r.new}</span>` : 0}</td>
+            <td>${r.retained}</td><td>${r.reactivated}</td><td>${r.lapsed ? `<span class="badge danger">${r.lapsed}</span>` : 0}</td>
+            <td>${r.net_change > 0 ? "+" : ""}${r.net_change}</td>
+            <td style="color:${(r.growth_pct || 0) > 0 ? "var(--green)" : (r.growth_pct || 0) < 0 ? "var(--danger)" : "inherit"}">${growthPct(r.growth_pct)}</td>
+            <td>${r.retention_pct === null ? "—" : r.retention_pct.toFixed(1) + "%"}</td><td>${r.cylinders}</td><td>${r.cylinders_per_customer.toFixed(2)}</td>
+            ${d.category ? "" : `<td>${r.walkin_cylinders}</td>`}<td>${money(r.amount)}</td><td>${r.customer_base}</td></tr>`).join("")}
+          <tr style="font-weight:700;background:var(--bg)"><td>TOTAL</td><td></td><td>${d.totals.new}</td><td></td><td></td><td></td><td></td><td></td><td></td>
+            <td>${d.totals.cylinders}</td><td></td>${d.category ? "" : `<td>${d.totals.walkin_cylinders}</td>`}<td>${money(d.totals.amount)}</td><td></td></tr>
+        </tbody></table></div>
+        <p style="color:var(--muted);font-size:12px;margin:8px 0 0"><b>Active</b> = bought at least one LPG cylinder in the period. <b>New</b> = first-ever LPG cylinder purchase.
+          <b>Retained</b> = also bought the period before. <b>Reactivated</b> = came back after skipping the period before. <b>Lapsed</b> = bought the period before but not this one.</p>
+      </div>
+
+      <div class="grid grid-2" style="margin-top:16px">
+        <div class="card" style="min-width:0"><h3 style="margin-top:0">New Customers This ${unit === "week" ? "Week" : "Month"} (${d.new_customers.length})</h3>
+          <div class="table-wrap"><table><thead><tr><th>Customer</th><th>Category</th><th>First Purchase</th><th>Cylinders</th><th>Amount</th></tr></thead><tbody>
+            ${d.new_customers.length ? d.new_customers.map(x => `<tr><td><b>${esc(x.name)}</b><br><span style="color:var(--muted);font-size:12px">${esc(x.account_no)}${x.phone ? " · " + esc(x.phone) : ""}</span></td>
+              <td><span class="badge blue">${esc(x.category || "")}</span></td><td>${x.first_purchase}</td><td>${x.cylinders}</td><td>${money(x.amount)}</td></tr>`).join("")
+              : `<tr><td colspan="5" style="color:var(--muted)">No new customers yet this ${unit}.</td></tr>`}
+          </tbody></table></div></div>
+        <div class="card" style="min-width:0"><h3 style="margin-top:0">Lapsed — Follow Up (${d.lapsed_customers.length})</h3>
+          <p style="color:var(--muted);font-size:12.5px;margin:0 0 8px">Bought LPG last ${unit} but not yet this ${unit}.</p>
+          <div class="table-wrap"><table><thead><tr><th>Customer</th><th>Category</th><th>Last Purchase</th><th>Cyl. Last ${unit === "week" ? "Week" : "Month"}</th></tr></thead><tbody>
+            ${d.lapsed_customers.length ? d.lapsed_customers.map(x => `<tr><td><b>${esc(x.name)}</b><br><span style="color:var(--muted);font-size:12px">${esc(x.account_no)}${x.phone ? " · " + esc(x.phone) : ""}</span></td>
+              <td><span class="badge blue">${esc(x.category || "")}</span></td><td>${x.last_purchase || ""}</td><td>${x.prev_cylinders}</td></tr>`).join("")
+              : `<tr><td colspan="4" style="color:var(--muted)">Nobody lapsed.</td></tr>`}
+          </tbody></table></div></div>
+      </div>
+
+      <div class="grid grid-2" style="margin-top:16px">
+        <div class="card" style="min-width:0"><h3 style="margin-top:0">This ${unit === "week" ? "Week" : "Month"} by Customer Category</h3>
+          <div class="table-wrap"><table><thead><tr><th>Category</th><th>Active</th><th>New</th><th>Cylinders</th></tr></thead><tbody>
+            ${d.by_category.length ? d.by_category.map(b => `<tr><td>${esc(b.category)}</td><td>${b.active}</td><td>${b.new}</td><td>${b.cylinders}</td></tr>`).join("")
+              : `<tr><td colspan="4" style="color:var(--muted)">No customer LPG purchases yet this ${unit}.</td></tr>`}
+          </tbody></table></div></div>
+        <div class="card" style="min-width:0"><h3 style="margin-top:0">Top Customers This ${unit === "week" ? "Week" : "Month"}</h3>
+          <div class="table-wrap"><table><thead><tr><th>Customer</th><th>Category</th><th>Cylinders</th><th>Amount</th></tr></thead><tbody>
+            ${d.top_customers.length ? d.top_customers.map(x => `<tr><td>${esc(x.name)}</td><td>${esc(x.category || "")}</td><td>${x.cylinders}</td><td>${money(x.amount)}</td></tr>`).join("")
+              : `<tr><td colspan="4" style="color:var(--muted)">No customer LPG purchases yet this ${unit}.</td></tr>`}
+          </tbody></table></div></div>
+      </div>
+      <p style="color:var(--muted);font-size:12px;margin-top:12px">Products counted as LPG cylinders:
+        ${d.products_counted.length ? d.products_counted.map(p => esc(p.name)).join(", ") : "none — set a product's category to “LPG Cylinder” (or give it a deposit price) to count it."}</p>`;
+  }
+
+  periodSel.addEventListener("change", () => { fillCounts(); load(); });
+  ["cgCount", "cgEnd", "cgLoc", "cgCat"].forEach(id => document.getElementById(id).addEventListener("change", load));
+  document.getElementById("cgRun").addEventListener("click", load);
+  load();
+}
+
 // ================================================================== REPORTS
 async function renderReports(c) {
   c.innerHTML = `
@@ -2981,7 +3157,7 @@ async function renderRoles(c) {
       vehicles: "Vehicles", employees: "Employees", staff_schedule: "Staff Schedule", kpi: "Employee KPI",
       reports: "Reports", audit: "Audit Log", booked_orders: "Booked Orders", incident_reports: "Incident Reports",
       commercial_deliveries: "50kg Commercial Billing", eod_report: "End of Day Report",
-      receivables_summary: "Dashboard: Receivables Totals",
+      receivables_summary: "Dashboard: Receivables Totals", customer_growth: "Customer Growth",
     };
     openModal(`${locked ? "View" : "Edit"} Modules — ${name}`, `
       ${locked ? `<p style="color:var(--muted);font-size:13px">Admin always has full access to every module — this can't be changed.</p>` : ""}

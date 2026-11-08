@@ -10,7 +10,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from db import get_db, init_db
 from reports import (xlsx_response, pdf_table_response, soa_pdf_response, commercial_billing_pdf, eod_pdf_response,
-                     eod_xlsx_response, swapped_pdf_response, swapped_xlsx_response)
+                     eod_xlsx_response, swapped_pdf_response, swapped_xlsx_response,
+                     customer_growth_pdf_response, customer_growth_xlsx_response)
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
@@ -2924,6 +2925,231 @@ def export_swapped_report():
     if fmt == "pdf":
         return swapped_pdf_response(data, subtitle, f"swapped-cylinders-{stamp}.pdf")
     return swapped_xlsx_response(data, subtitle, f"swapped-cylinders-{stamp}.xlsx")
+
+
+# ---------------------------------------------------------------- customer growth (LPG cylinders only)
+# Weekly / monthly customer growth, counting ONLY purchases of LPG cylinder
+# products (refill, deposit or swap). Accessories and other items never make
+# someone an active / new customer. Only registered customers can be tracked
+# over time; walk-in cylinder sales are shown separately for context.
+#
+#   Active    = registered customers who bought >= 1 LPG cylinder in the period
+#   New       = active, and this is their first-ever LPG cylinder purchase
+#   Retained  = active this period AND the period before
+#   Reactivated = active, not new, but did not buy the period before
+#   Lapsed    = active the period before but not this period
+#   Retention = retained / active the period before
+#   Growth    = change in active customers vs the period before
+
+# Same rule the POS uses to treat an item as a cylinder, minus a bare "LPG"
+# match so LPG accessories (regulators, hoses) are not counted.
+LPG_CYLINDER_SQL = ("(LOWER(COALESCE(p.category,'')) LIKE '%cylinder%' "
+                    "OR COALESCE(p.deposit_price,0) > 0)")
+GROWTH_MAX_PERIODS = 60
+
+
+def _growth_periods(period, count, end_date):
+    """Return [(start, end, label)] oldest first, the last one containing end_date.
+    Weeks run Monday-Sunday."""
+    out = []
+    if period == "month":
+        y, m = end_date.year, end_date.month
+        for _ in range(count):
+            start = end_date.replace(year=y, month=m, day=1)
+            nxt = start.replace(year=y + (m == 12), month=1 if m == 12 else m + 1)
+            out.append((start, nxt - timedelta(days=1), start.strftime("%b %Y")))
+            y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+    else:
+        start = end_date - timedelta(days=end_date.weekday())
+        for _ in range(count):
+            end = start + timedelta(days=6)
+            out.append((start, end, f"{start.strftime('%b %d')}–{end.strftime('%b %d, %Y')}"))
+            start -= timedelta(days=7)
+    return list(reversed(out))
+
+
+def _pct(num, den):
+    return round(num * 100.0 / den, 1) if den else None
+
+
+def _build_customer_growth(conn, period="month", count=12, end_date=None, location_id=None, category=None):
+    period = "week" if period == "week" else "month"
+    count = max(2, min(int(count or 12), GROWTH_MAX_PERIODS))
+    end_date = end_date or datetime.now().date()
+    # One extra (hidden) period up front so the first shown period has a
+    # "previous" to compare against.
+    periods = _growth_periods(period, count + 1, end_date)
+    range_start, range_end = periods[0][0], periods[-1][1]
+
+    where = ["s.status='COMPLETED'", "s.is_opening_balance=0", "si.qty > 0", LPG_CYLINDER_SQL]
+    params = []
+    if location_id:
+        where.append("s.location_id=?"); params.append(location_id)
+    cust_where = list(where)
+    cust_params = list(params)
+    if category:
+        cust_where.append("c.category=?"); cust_params.append(category)
+
+    # Every LPG cylinder line bought by a registered customer, up to the end
+    # of the range (earlier history is needed to know who is truly "new").
+    lines = conn.execute(
+        f"""SELECT s.customer_id, date(s.ts) d, si.qty,
+                   ROUND(si.subtotal - COALESCE(si.discount_amount,0), 2) amount
+            FROM sale_items si JOIN sales s ON s.id=si.sale_id
+            JOIN products p ON p.id=si.product_id JOIN customers c ON c.id=s.customer_id
+            WHERE {' AND '.join(cust_where)} AND date(s.ts) <= date(?)""",
+        cust_params + [range_end.isoformat()],
+    ).fetchall()
+
+    first_buy, last_buy = {}, {}
+    for r in lines:
+        cid, d = r["customer_id"], r["d"]
+        if cid not in first_buy or d < first_buy[cid]:
+            first_buy[cid] = d
+        if cid not in last_buy or d > last_buy[cid]:
+            last_buy[cid] = d
+
+    walkin = {}
+    if not category:
+        for r in conn.execute(
+            f"""SELECT date(s.ts) d, SUM(si.qty) qty
+                FROM sale_items si JOIN sales s ON s.id=si.sale_id JOIN products p ON p.id=si.product_id
+                WHERE {' AND '.join(where)} AND s.customer_id IS NULL
+                  AND date(s.ts) BETWEEN date(?) AND date(?) GROUP BY date(s.ts)""",
+            params + [range_start.isoformat(), range_end.isoformat()],
+        ).fetchall():
+            walkin[r["d"]] = r["qty"]
+
+    stats = []
+    for start, end, label in periods:
+        s_iso, e_iso = start.isoformat(), end.isoformat()
+        active, qty, amount = {}, 0, 0.0
+        for r in lines:
+            if s_iso <= r["d"] <= e_iso:
+                a = active.setdefault(r["customer_id"], {"qty": 0, "amount": 0.0})
+                a["qty"] += r["qty"]; a["amount"] += r["amount"] or 0
+                qty += r["qty"]; amount += r["amount"] or 0
+        stats.append({
+            "label": label, "start": s_iso, "end": e_iso, "active_map": active,
+            "cylinders": qty, "amount": round(amount, 2),
+            "walkin_cylinders": sum(v for d, v in walkin.items() if s_iso <= d <= e_iso),
+            "customer_base": sum(1 for d in first_buy.values() if d <= e_iso),
+        })
+
+    rows = []
+    for prev, cur in zip(stats, stats[1:]):
+        act, pact = set(cur["active_map"]), set(prev["active_map"])
+        new = {c for c in act if cur["start"] <= first_buy[c] <= cur["end"]}
+        retained = act & pact
+        cur["_sets"] = {"new": new, "lapsed": pact - act, "prev": prev["active_map"]}
+        rows.append({
+            "label": cur["label"], "start": cur["start"], "end": cur["end"],
+            "active": len(act), "new": len(new), "retained": len(retained),
+            "reactivated": len(act - new - retained), "lapsed": len(pact - act),
+            "prev_active": len(pact),
+            "growth_pct": _pct(len(act) - len(pact), len(pact)),
+            "net_change": len(act) - len(pact),
+            "retention_pct": _pct(len(retained), len(pact)),
+            "cylinders": cur["cylinders"], "amount": cur["amount"],
+            "cylinders_per_customer": round(cur["cylinders"] / len(act), 2) if act else 0,
+            "walkin_cylinders": cur["walkin_cylinders"],
+            "customer_base": cur["customer_base"],
+        })
+
+    latest = stats[-1]
+    ids = set(latest["active_map"]) | latest["_sets"]["lapsed"]
+    info = {}
+    if ids:
+        qmarks = ",".join("?" * len(ids))
+        for r in conn.execute(f"SELECT id, account_no, name, business_name, phone, category FROM customers WHERE id IN ({qmarks})",
+                              list(ids)).fetchall():
+            info[r["id"]] = dict(r)
+
+    def cust(cid, extra):
+        d = dict(info.get(cid, {"id": cid, "name": "?", "account_no": "", "category": ""}))
+        d.update(extra)
+        return d
+
+    new_customers = sorted(
+        (cust(c, {"first_purchase": first_buy[c], "cylinders": latest["active_map"][c]["qty"],
+                  "amount": round(latest["active_map"][c]["amount"], 2)}) for c in latest["_sets"]["new"]),
+        key=lambda x: (x["first_purchase"], x["name"]))
+    lapsed_customers = sorted(
+        (cust(c, {"last_purchase": last_buy.get(c), "prev_cylinders": latest["_sets"]["prev"][c]["qty"]})
+         for c in latest["_sets"]["lapsed"]),
+        key=lambda x: (-x["prev_cylinders"], x["name"]))
+
+    by_category = {}
+    for c, a in latest["active_map"].items():
+        cat = (info.get(c, {}).get("category") or "Uncategorized")
+        b = by_category.setdefault(cat, {"category": cat, "active": 0, "new": 0, "cylinders": 0})
+        b["active"] += 1; b["cylinders"] += a["qty"]
+        if c in latest["_sets"]["new"]:
+            b["new"] += 1
+    top_customers = sorted(
+        (cust(c, {"cylinders": a["qty"], "amount": round(a["amount"], 2)}) for c, a in latest["active_map"].items()),
+        key=lambda x: (-x["cylinders"], x["name"]))[:10]
+
+    products = [dict(r) for r in conn.execute(
+        f"SELECT p.name, p.category FROM products p WHERE p.active=1 AND {LPG_CYLINDER_SQL} ORDER BY p.name").fetchall()]
+    location_name = None
+    if location_id:
+        r = conn.execute("SELECT name FROM locations WHERE id=?", (location_id,)).fetchone()
+        location_name = r["name"] if r else None
+
+    return {
+        "period": period, "count": count, "end_date": end_date.isoformat(),
+        "location_id": location_id, "location_name": location_name, "category": category,
+        "rows": rows, "current": rows[-1], "previous": rows[-2] if len(rows) > 1 else None,
+        "new_customers": new_customers, "lapsed_customers": lapsed_customers,
+        "by_category": sorted(by_category.values(), key=lambda x: -x["active"]),
+        "top_customers": top_customers, "products_counted": products,
+        "totals": {"new": sum(r["new"] for r in rows), "cylinders": sum(r["cylinders"] for r in rows),
+                   "amount": round(sum(r["amount"] for r in rows), 2),
+                   "walkin_cylinders": sum(r["walkin_cylinders"] for r in rows)},
+    }
+
+
+def _growth_args():
+    end = request.args.get("end")
+    try:
+        end_date = datetime.strptime(end, "%Y-%m-%d").date() if end else None
+    except ValueError:
+        end_date = None
+    return dict(period=request.args.get("period", "month"),
+                count=request.args.get("count", type=int) or 12,
+                end_date=end_date,
+                location_id=request.args.get("location_id", type=int),
+                category=(request.args.get("category") or "").strip() or None)
+
+
+@app.get("/api/reports/customer-growth")
+@roles_or_module_required("ADMIN", "MANAGER", module="customer_growth")
+def report_customer_growth():
+    conn = get_db()
+    data = _build_customer_growth(conn, **_growth_args())
+    conn.close()
+    return jsonify(data)
+
+
+@app.get("/api/reports/customer-growth/export")
+@roles_or_module_required("ADMIN", "MANAGER", module="customer_growth")
+def export_customer_growth():
+    fmt = request.args.get("format", "xlsx")
+    conn = get_db()
+    data = _build_customer_growth(conn, **_growth_args())
+    conn.close()
+    rows = data["rows"]
+    subtitle = (f"{'Weekly' if data['period'] == 'week' else 'Monthly'} · LPG cylinder purchases only · "
+                f"{rows[0]['start']} to {rows[-1]['end']}")
+    if data["location_name"]:
+        subtitle += f" · {data['location_name']}"
+    if data["category"]:
+        subtitle += f" · {data['category']} customers"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    if fmt == "pdf":
+        return customer_growth_pdf_response(data, subtitle, f"customer-growth-{stamp}.pdf")
+    return customer_growth_xlsx_response(data, subtitle, f"customer-growth-{stamp}.xlsx")
 
 
 # ---------------------------------------------------------------- end of day report

@@ -470,3 +470,114 @@ def swapped_xlsx_response(data, subtitle, filename):
     buf.seek(0)
     return send_file(buf, as_attachment=True, download_name=filename,
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+def _growth_fmt_pct(v):
+    return "—" if v is None else f"{v:+.1f}%"
+
+
+def customer_growth_pdf_response(data, subtitle, filename):
+    """Customer Growth (LPG cylinders only): period-by-period table, plus the
+    new and lapsed customers of the latest period."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(letter), topMargin=36, bottomMargin=36, leftMargin=36, rightMargin=36)
+    styles = getSampleStyleSheet()
+    h3 = ParagraphStyle("H3GUFC", parent=styles["Heading3"], textColor=BLUE, spaceBefore=10)
+    flow = _header_flowables("Customer Growth Report", subtitle)
+    m = lambda n: f"{(n or 0):,.2f}"
+    cur = data["current"]
+
+    flow.append(Paragraph(f"By {'Week' if data['period'] == 'week' else 'Month'}", h3))
+    rows = [["Period", "Active", "New", "Retained", "Reactivated", "Lapsed", "Net", "Growth", "Retention",
+             "Cylinders", "Cyl / Cust", "Walk-in Cyl", "Sales", "Customer Base"]]
+    for r in data["rows"]:
+        rows.append([r["label"], r["active"], r["new"], r["retained"], r["reactivated"], r["lapsed"],
+                     f"{r['net_change']:+d}", _growth_fmt_pct(r["growth_pct"]),
+                     "—" if r["retention_pct"] is None else f"{r['retention_pct']:.1f}%",
+                     r["cylinders"], f"{r['cylinders_per_customer']:.2f}", r["walkin_cylinders"], m(r["amount"]),
+                     r["customer_base"]])
+    t = data["totals"]
+    rows.append(["TOTAL", "", t["new"], "", "", "", "", "", "", t["cylinders"], "", t["walkin_cylinders"], m(t["amount"]), ""])
+    rows = [[str(c) for c in r] for r in rows]
+    flow.append(_styled_table(rows, [118, 40, 36, 46, 56, 42, 34, 46, 50, 48, 46, 52, 70, 60], total_row=True, right_from=1))
+
+    flow.append(Paragraph(f"New Customers — {cur['label']} ({len(data['new_customers'])})", h3))
+    rows = [["Account #", "Customer", "Business", "Category", "Phone", "First LPG Purchase", "Cylinders", "Amount"]]
+    for c in data["new_customers"]:
+        rows.append([c["account_no"], c["name"][:28], (c.get("business_name") or "")[:28], c.get("category") or "",
+                     c.get("phone") or "", c["first_purchase"], str(c["cylinders"]), m(c["amount"])])
+    if len(rows) == 1:
+        rows.append(["—", "No new customers in this period", "", "", "", "", "", ""])
+    flow.append(_styled_table(rows, [70, 140, 140, 70, 80, 90, 50, 70], right_from=6))
+
+    flow.append(Paragraph(f"Lapsed Customers — bought last period, not in {cur['label']} ({len(data['lapsed_customers'])})", h3))
+    rows = [["Account #", "Customer", "Business", "Category", "Phone", "Last LPG Purchase", "Cylinders Last Period"]]
+    for c in data["lapsed_customers"]:
+        rows.append([c["account_no"], c["name"][:28], (c.get("business_name") or "")[:28], c.get("category") or "",
+                     c.get("phone") or "", c["last_purchase"] or "", str(c["prev_cylinders"])])
+    if len(rows) == 1:
+        rows.append(["—", "No lapsed customers", "", "", "", "", ""])
+    flow.append(_styled_table(rows, [70, 150, 150, 70, 90, 90, 90], right_from=6))
+
+    names = ", ".join(p["name"] for p in data["products_counted"]) or "none"
+    flow.append(Spacer(1, 10))
+    flow.append(Paragraph(f"Products counted (LPG cylinders): {names}",
+                          ParagraphStyle("Note", parent=styles["Normal"], fontSize=8, textColor=colors.HexColor("#6b7785"))))
+    doc.build(flow)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
+
+
+def customer_growth_xlsx_response(data, subtitle, filename):
+    wb = Workbook()
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="0B3D66", end_color="0B3D66", fill_type="solid")
+
+    def header(ws, row):
+        ws.append(row)
+        for cell in ws[ws.max_row]:
+            cell.font = header_font
+            cell.fill = header_fill
+
+    ws = wb.active
+    ws.title = "Growth"
+    ws.append(["Customer Growth Report"]); ws["A1"].font = Font(bold=True, size=14)
+    ws.append([subtitle])
+    ws.append(["Products counted: " + (", ".join(p["name"] for p in data["products_counted"]) or "none")])
+    ws.append([])
+    header(ws, ["Period", "Start", "End", "Active Customers", "New", "Retained", "Reactivated", "Lapsed", "Net Change",
+                "Growth %", "Retention %", "Cylinders Sold", "Cylinders / Customer", "Walk-in Cylinders",
+                "LPG Sales", "Customer Base (cumulative)"])
+    for r in data["rows"]:
+        ws.append([r["label"], r["start"], r["end"], r["active"], r["new"], r["retained"], r["reactivated"], r["lapsed"],
+                   r["net_change"], r["growth_pct"], r["retention_pct"], r["cylinders"], r["cylinders_per_customer"],
+                   r["walkin_cylinders"], r["amount"], r["customer_base"]])
+    t = data["totals"]
+    ws.append(["TOTAL", "", "", "", t["new"], "", "", "", "", "", "", t["cylinders"], "", t["walkin_cylinders"], t["amount"], ""])
+    for cell in ws[ws.max_row]:
+        cell.font = Font(bold=True)
+    for i, width in enumerate((26, 12, 12, 10, 8, 10, 12, 8, 11, 10, 11, 10, 12, 12, 14, 14)):
+        ws.column_dimensions[chr(65 + i)].width = width
+
+    cur = data["current"]["label"]
+    ws2 = wb.create_sheet("New Customers")
+    ws2.append([f"New customers — {cur}"]); ws2["A1"].font = Font(bold=True)
+    header(ws2, ["Account #", "Customer", "Business", "Category", "Phone", "First LPG Purchase", "Cylinders", "Amount"])
+    for c in data["new_customers"]:
+        ws2.append([c["account_no"], c["name"], c.get("business_name") or "", c.get("category") or "",
+                    c.get("phone") or "", c["first_purchase"], c["cylinders"], c["amount"]])
+    ws3 = wb.create_sheet("Lapsed Customers")
+    ws3.append([f"Bought LPG last period but not in {cur}"]); ws3["A1"].font = Font(bold=True)
+    header(ws3, ["Account #", "Customer", "Business", "Category", "Phone", "Last LPG Purchase", "Cylinders Last Period"])
+    for c in data["lapsed_customers"]:
+        ws3.append([c["account_no"], c["name"], c.get("business_name") or "", c.get("category") or "",
+                    c.get("phone") or "", c["last_purchase"] or "", c["prev_cylinders"]])
+    for w in (ws2, ws3):
+        for col, width in zip("ABCDEFGH", (12, 28, 28, 14, 16, 18, 12, 12)):
+            w.column_dimensions[col].width = width
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

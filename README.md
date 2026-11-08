@@ -32,6 +32,20 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Customer Growth dashboard** (Customers & Money → Customer Growth; Admin, Manager and
+  Accounting by default, grantable to other roles as the "Customer Growth" module).
+  Weekly (Mon–Sun) or monthly tracking of customer growth that counts **only LPG cylinder
+  purchases** (refill, deposit or swap) — products whose category contains "cylinder" or
+  that have a cylinder deposit price. Accessories never make someone an active or new
+  customer. Voided sales and opening-balance entries are ignored. For each period it shows
+  active customers, new (first-ever LPG cylinder purchase), retained, reactivated, lapsed,
+  growth % and retention % vs the previous period, cylinders sold, cylinders per customer,
+  LPG sales and the cumulative customer base, plus a trend chart. It also lists this
+  period's new customers, lapsed customers to follow up, a breakdown by customer category
+  and the top customers. Filter by location, customer category and end date. Export to
+  Excel or PDF. Walk-in sales can't be tracked per customer, so they appear only as a
+  walk-in cylinder count.
+
 - **Delivery Receipt for credit / terms sales.** Every CREDIT sale now gets its own
   DR number (`DR-YYYYMMDD-####`). Right after a credit sale is completed, the
   Delivery Receipt prints instead of the small cash receipt: one letter-size page
