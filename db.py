@@ -719,7 +719,31 @@ def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    _track_for_request(conn)
     return conn
+
+
+def _track_for_request(conn):
+    """Remember connections opened while handling a web request so the app can
+    close them when the request ends. A route that hits an unexpected error
+    before its own conn.close() would otherwise leave its transaction open and
+    hold SQLite's write lock ("database is locked" on the next save)."""
+    try:
+        from flask import g, has_app_context
+    except ImportError:
+        return
+    if has_app_context():
+        g.setdefault("_db_conns", []).append(conn)
+
+
+def close_request_connections():
+    from flask import g
+    for conn in g.pop("_db_conns", []):
+        try:
+            conn.rollback()  # no-op if the route already committed / closed
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_db():

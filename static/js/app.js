@@ -1173,6 +1173,15 @@ window.payReceivable = (id, balance) => {
   });
 };
 
+// Reload products and locations so pick-lists never offer something that was
+// deleted or re-encoded (e.g. after a System Reset) since the page was opened.
+async function refreshLookups() {
+  try {
+    const [products, locations] = await Promise.all([api("/products"), api("/locations")]);
+    state.products = products; state.locations = locations;
+  } catch (e) { /* keep the lists we already have */ }
+}
+
 // ================================================================== INVENTORY
 async function renderInventory(c) {
   c.innerHTML = "Loading...";
@@ -1228,7 +1237,8 @@ async function renderInventory(c) {
       document.getElementById("adjustSwappedBtn").addEventListener("click", openAdjustSwappedModal);
     }
   }
-  function openAdjustSwappedModal() {
+  async function openAdjustSwappedModal() {
+    await refreshLookups();
     const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
     const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
     openModal("Adjust Swapped Empties", `
@@ -1262,7 +1272,8 @@ async function renderInventory(c) {
       });
     });
   }
-  function openAdjustEmptiesModal() {
+  async function openAdjustEmptiesModal() {
+    await refreshLookups();
     const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
     const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
     openModal("Adjust Empty Cylinders", `
@@ -1289,7 +1300,8 @@ async function renderInventory(c) {
       });
     });
   }
-  function openAdjustStockModal() {
+  async function openAdjustStockModal() {
+    await refreshLookups();
     const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
     const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
     openModal("Adjust Stock", `

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, session, send_from_directory, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from db import get_db, init_db
+from db import get_db, init_db, close_request_connections
 from reports import (xlsx_response, pdf_table_response, soa_pdf_response, commercial_billing_pdf, eod_pdf_response,
                      eod_xlsx_response, swapped_pdf_response, swapped_xlsx_response,
                      customer_growth_pdf_response, customer_growth_xlsx_response,
@@ -18,6 +18,33 @@ from reports import (xlsx_response, pdf_table_response, soa_pdf_response, commer
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+
+
+@app.teardown_request
+def _close_db_connections(exc=None):
+    close_request_connections()
+
+
+@app.errorhandler(Exception)
+def _api_error(e):
+    """Unexpected errors on API calls come back as JSON with the real reason,
+    so the screen shows it instead of a bare "Request failed"."""
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        if request.path.startswith("/api/"):
+            return jsonify(error=e.description or e.name), e.code
+        return e
+    app.logger.exception("Unhandled error on %s %s", request.method, request.path)
+    if not request.path.startswith("/api/"):
+        return "Internal Server Error", 500
+    if isinstance(e, sqlite3.IntegrityError):
+        msg = ("Could not save: a selected record (location, product, customer or user) no longer exists "
+               "or a value is not allowed. Refresh the page (F5) and try again. Details: " + str(e))
+    elif isinstance(e, sqlite3.OperationalError) and "locked" in str(e).lower():
+        msg = "The database is busy. Please wait a moment and try again."
+    else:
+        msg = f"Server error: {type(e).__name__}: {e}"
+    return jsonify(error=msg), 500
 
 init_db()
 
@@ -1345,6 +1372,10 @@ def adjust_swapped_empties():
     if not reason:
         return jsonify(error="A reason is required for adjustments"), 400
     conn = get_db()
+    problem = _check_location_product(conn, location_id, product_id)
+    if problem:
+        conn.close()
+        return jsonify(error=problem), 400
     try:
         if delta > 0:
             add_swapped_empties(conn, location_id, product_id, brand, delta, "ADJUSTMENT", "MANUAL-ADMIN", reason)
@@ -1358,6 +1389,20 @@ def adjust_swapped_empties():
         return jsonify(error=str(e)), 400
     conn.close()
     return jsonify(ok=True)
+
+
+def _check_location_product(conn, location_id, product_id):
+    """Return an error message if the location / product picked on screen no
+    longer exists (e.g. products were deleted or re-encoded after the page was
+    opened), else None."""
+    if not conn.execute("SELECT 1 FROM locations WHERE id=?", (location_id,)).fetchone():
+        return "That location no longer exists. Refresh the page (F5) and pick it again."
+    p = conn.execute("SELECT active FROM products WHERE id=?", (product_id,)).fetchone()
+    if not p:
+        return "That product no longer exists (the product list may have changed). Refresh the page (F5) and pick it again."
+    if not p["active"]:
+        return "That product has been deleted. Pick another product."
+    return None
 
 
 @app.post("/api/inventory/empties/adjust")
@@ -1381,6 +1426,10 @@ def adjust_empty_cylinders():
         return jsonify(error="A reason is required for empty cylinder adjustments"), 400
 
     conn = get_db()
+    problem = _check_location_product(conn, location_id, product_id)
+    if problem:
+        conn.close()
+        return jsonify(error=problem), 400
     try:
         if delta > 0:
             add_empty_cylinders(conn, location_id, product_id, delta, "ADJUSTMENT", "MANUAL-ADMIN", reason)
@@ -1499,6 +1548,10 @@ def manual_inventory_adjust():
         return jsonify(error="A reason is required for manual inventory adjustments"), 400
 
     conn = get_db()
+    problem = _check_location_product(conn, location_id, product_id)
+    if problem:
+        conn.close()
+        return jsonify(error=problem), 400
     try:
         adjust_inventory(conn, location_id, product_id, delta, "ADJUSTMENT", "MANUAL-ADMIN",
                           notes=reason, allow_negative=allow_negative)
