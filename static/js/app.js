@@ -813,6 +813,7 @@ window.viewSale = async (id) => {
 // ================================================================== CUSTOMERS
 async function renderCustomers(c) {
   const isAdmin = state.user.role === "ADMIN";
+  const canPortal = ["ADMIN", "MANAGER"].includes(state.user.role);
   const categories = await api("/customer-categories");
   c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
     <input type="text" id="custSearch" placeholder="Search customers..." style="flex:1;min-width:180px">
@@ -836,14 +837,70 @@ async function renderCustomers(c) {
       ${list.map(cu => `<tr><td>${cu.account_no}</td><td>${esc(cu.name)}</td>
         <td><span class="badge blue">${esc(cu.category)}</span></td><td>${esc(cu.phone || "")}</td>
         <td>${cu.terms_days} days</td><td>${money(cu.credit_limit)}</td>
-        <td><span class="badge ${cu.status === 'ACTIVE' ? 'green' : 'gray'}">${cu.status}</span></td>
+        <td><span class="badge ${cu.status === 'ACTIVE' ? 'green' : 'gray'}">${cu.status}</span>
+          ${cu.portal_username ? `<br><span class="badge ${cu.portal_active ? 'blue' : 'gray'}" title="Portal username: ${esc(cu.portal_username)}">Portal${cu.portal_active ? "" : " (off)"}</span>` : ""}</td>
         <td style="display:flex;gap:6px">
           <button class="btn small" onclick="openCustomerLedger(${cu.id})">Ledger / SOA</button>
+          ${canPortal ? `<button class="btn small" onclick="openPortalLogin(${cu.id})">Portal Login</button>` : ""}
           ${isAdmin ? `<button class="btn small" onclick="editCustomer(${cu.id})">Edit</button>
             <button class="btn small danger" onclick="deleteCustomer(${cu.id})">Delete</button>` : ""}
         </td></tr>`).join("")}
     </tbody></table></div>`;
   }
+
+  window.openPortalLogin = async (cid) => {
+    let d;
+    try { d = await api(`/customers/${cid}/portal-account`); } catch (e) { return; }
+    const a = d.account, portalUrl = `${location.origin}/portal`;
+    const genPw = () => {
+      const chars = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+      const buf = new Uint32Array(10); crypto.getRandomValues(buf);
+      return [...buf].map(n => chars[n % chars.length]).join("");
+    };
+    openModal(`Customer Portal Login — ${esc(d.customer.name)}`, `
+      <p style="font-size:13px;color:var(--muted);margin-top:0">The customer logs in at
+        <code>${esc(portalUrl)}</code> to place orders, follow their order status, see purchases and, for credit / terms accounts, their billing and SOA.</p>
+      ${a ? `<p style="font-size:13px">Status: <span class="badge ${a.active ? "green" : "gray"}">${a.active ? "Active" : "Disabled"}</span>
+        ${d.locked ? ` <span class="badge danger">Locked (too many wrong passwords) — saving unlocks it</span>` : ""}
+        · Last login: ${esc(a.last_login || "never")}</p>` : `<p style="font-size:13px">No portal login yet.</p>`}
+      <div class="field"><label>Username</label><input id="plUser" value="${esc(a ? a.username : d.suggested_username)}" autocapitalize="none"></div>
+      <div class="field"><label>${a ? "New password (leave blank to keep the current one)" : "Password"}</label>
+        <div style="display:flex;gap:6px"><input id="plPass" type="text" autocomplete="off" placeholder="at least 8 characters">
+        <button class="btn small" id="plGen" type="button">Generate</button></div></div>
+      <div class="field"><label style="display:flex;align-items:center;gap:6px;font-weight:400">
+        <input type="checkbox" id="plActive" style="width:auto" ${!a || a.active ? "checked" : ""}> Login enabled</label></div>
+      <div class="modal-actions">
+        ${a ? `<button class="btn danger" id="plDelete">Remove Login</button>` : ""}
+        <button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="plSave">${a ? "Save" : "Create Login"}</button></div>
+    `, () => {
+      document.getElementById("plGen").addEventListener("click", () => { document.getElementById("plPass").value = genPw(); });
+      document.getElementById("plSave").addEventListener("click", async () => {
+        const username = document.getElementById("plUser").value.trim(), password = document.getElementById("plPass").value;
+        try {
+          await api(`/customers/${cid}/portal-account`, { method: "POST", body: {
+            username, password, active: document.getElementById("plActive").checked } });
+        } catch (e) { return; }
+        closeModal(); load(document.getElementById("custSearch").value);
+        if (password) {
+          openModal("Portal Login Saved", `
+            <p>Give these to the customer (the password is not shown again):</p>
+            <div class="card" style="font-size:14px;line-height:1.8">Link: <b>${esc(portalUrl)}</b><br>Username: <b>${esc(username.toLowerCase())}</b><br>Password: <b>${esc(password)}</b></div>
+            <div class="modal-actions"><button class="btn" id="plCopy">Copy</button><button class="btn green" onclick="closeModal()">Done</button></div>`, () => {
+            document.getElementById("plCopy").addEventListener("click", () =>
+              navigator.clipboard.writeText(`GUFC Customer Portal\n${portalUrl}\nUsername: ${username.toLowerCase()}\nPassword: ${password}`)
+                .then(() => toast("Copied", "success")));
+          });
+        } else toast("Portal login saved", "success");
+      });
+      const del = document.getElementById("plDelete");
+      if (del) del.addEventListener("click", async () => {
+        if (!confirm("Remove this customer's portal login? They will no longer be able to log in.")) return;
+        try { await api(`/customers/${cid}/portal-account`, { method: "DELETE" }); } catch (e) { return; }
+        closeModal(); toast("Portal login removed", "success"); load(document.getElementById("custSearch").value);
+      });
+    });
+  };
 
   function customerFormFields(cu = {}) {
     return `
@@ -2924,7 +2981,7 @@ async function renderBookedOrders(c) {
         <td>${o.order_no}</td><td>${o.order_date}</td>
         <td>${esc(o.customer_name || o.customer_name_freeform || "—")}${o.customer_phone ? " (" + esc(o.customer_phone) + ")" : ""}
           ${o.delivery_address ? `<br><span style="color:var(--muted);font-size:11.5px">${esc(o.delivery_address)}</span>` : ""}</td>
-        <td><span class="badge ${o.source === 'CUSTOMER' ? 'warn' : 'blue'}">${o.source === 'CUSTOMER' ? 'Online' : 'Staff'}</span></td>
+        <td><span class="badge ${o.source === 'CUSTOMER' ? 'warn' : 'blue'}">${o.source === 'CUSTOMER' ? (o.customer_id ? 'Portal' : 'Online') : 'Staff'}</span></td>
         <td>${o.showroom_name ? esc(o.showroom_name) : '<span class="badge danger">Unassigned</span>'}</td>
         <td>${o.items.map(i => `${esc(i.product_name)} x${i.qty}`).join(", ")}</td>
         <td>${esc(o.created_by_name || "—")}</td>

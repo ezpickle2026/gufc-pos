@@ -6,7 +6,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta
 
-from flask import Flask, request, jsonify, session, send_from_directory, Response
+from flask import Flask, request, jsonify, session, send_from_directory, Response, g
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from db import get_db, init_db, close_request_connections
@@ -213,7 +213,7 @@ def logout():
     audit(conn, "LOGOUT", "AUTH", session["user"]["id"])
     conn.commit()
     conn.close()
-    session.clear()
+    session.pop("user", None)
     return jsonify(ok=True)
 
 
@@ -567,14 +567,16 @@ def delete_product(pid):
 def list_customers():
     q = request.args.get("q", "").strip()
     conn = get_db()
+    base = """SELECT c.*, ca.username portal_username, ca.active portal_active
+               FROM customers c LEFT JOIN customer_accounts ca ON ca.customer_id = c.id"""
     if q:
         like = f"%{q}%"
         rows = conn.execute(
-            "SELECT * FROM customers WHERE name LIKE ? OR business_name LIKE ? OR account_no LIKE ? OR phone LIKE ? ORDER BY name",
+            base + " WHERE c.name LIKE ? OR c.business_name LIKE ? OR c.account_no LIKE ? OR c.phone LIKE ? ORDER BY c.name",
             (like, like, like, like),
         ).fetchall()
     else:
-        rows = conn.execute("SELECT * FROM customers ORDER BY name").fetchall()
+        rows = conn.execute(base + " ORDER BY c.name").fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
@@ -644,6 +646,7 @@ def delete_customer(cid):
             "break the sales/receivables history. Set their status to INACTIVE instead (edit the customer)."
         )), 400
     try:
+        conn.execute("DELETE FROM customer_accounts WHERE customer_id=?", (cid,))
         cur = conn.execute("DELETE FROM customers WHERE id=?", (cid,))
     except sqlite3.IntegrityError:
         conn.close()
@@ -1028,6 +1031,431 @@ def submit_public_order():
         return jsonify(error=f"Could not submit order: {e}"), 400
     conn.close()
     return jsonify(order_no=order_no), 201
+
+
+# ---------------------------------------------------------------- customer portal
+# Customers log in at /portal to place orders, follow their order status, see
+# their purchases and, for credit / terms accounts, their billing and SOA.
+#
+# Security model:
+#  - Portal logins live in `customer_accounts`, separate from staff `users`,
+#    and the portal session is stored under session["customer"]. Every staff
+#    route checks session["user"], so a customer login can never reach them.
+#  - Every portal query is scoped to the logged-in customer_id taken from the
+#    session, never from the request.
+#  - 5 wrong passwords lock the login for 15 minutes. Resetting the password
+#    or disabling the login bumps session_version, which ends open sessions.
+
+PORTAL_MAX_FAILED = 5
+PORTAL_LOCK_MINUTES = 15
+PORTAL_MIN_PASSWORD = 8
+PORTAL_MAX_OPEN_ORDERS = 10
+
+
+def _portal_audit(conn, action, record_id=None, details=None, username=None):
+    acct = session.get("customer") or {}
+    conn.execute(
+        "INSERT INTO audit_logs (user_id, username, action, module, record_id, details) VALUES (?,?,?,?,?,?)",
+        (None, f"portal:{username or acct.get('username', '?')}", action, "CUSTOMER_PORTAL",
+         str(record_id) if record_id is not None else None, details),
+    )
+
+
+def portal_required(fn):
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        sess = session.get("customer")
+        if not sess:
+            return jsonify(error="Please log in"), 401
+        conn = get_db()
+        row = conn.execute(
+            """SELECT ca.id account_id, ca.username, ca.active, ca.session_version, c.*
+               FROM customer_accounts ca JOIN customers c ON c.id = ca.customer_id WHERE ca.id=?""",
+            (sess.get("account_id"),),
+        ).fetchone()
+        conn.close()
+        if (not row or not row["active"] or row["status"] != "ACTIVE"
+                or row["session_version"] != sess.get("session_version")):
+            session.pop("customer", None)
+            return jsonify(error="Your session has ended. Please log in again."), 401
+        g.portal = dict(row)
+        return fn(*a, **kw)
+    return wrapper
+
+
+def _portal_is_credit(conn, cust):
+    if (cust["terms_days"] or 0) > 0 or (cust["credit_limit"] or 0) > 0:
+        return True
+    return conn.execute("SELECT 1 FROM receivables WHERE customer_id=? LIMIT 1", (cust["id"],)).fetchone() is not None
+
+
+def _portal_profile(conn, cust):
+    keys = ("id", "account_no", "name", "business_name", "phone", "address", "category", "terms_days", "credit_limit")
+    out = {k: cust[k] for k in keys}
+    out["username"] = cust["username"]
+    out["is_credit"] = _portal_is_credit(conn, cust)
+    return out
+
+
+# ---- staff side: create / reset / disable a customer's portal login
+
+@app.get("/api/customers/<int:cid>/portal-account")
+@roles_required("ADMIN", "MANAGER")
+def get_portal_account(cid):
+    conn = get_db()
+    cust = conn.execute("SELECT id, account_no, name FROM customers WHERE id=?", (cid,)).fetchone()
+    if not cust:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    acct = conn.execute(
+        "SELECT username, active, last_login, locked_until, failed_attempts, created_at FROM customer_accounts WHERE customer_id=?",
+        (cid,)).fetchone()
+    conn.close()
+    locked = bool(acct and acct["locked_until"] and acct["locked_until"] > datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    return jsonify(customer=dict(cust), account=dict(acct) if acct else None, locked=locked,
+                   suggested_username=cust["account_no"].lower())
+
+
+@app.post("/api/customers/<int:cid>/portal-account")
+@roles_required("ADMIN", "MANAGER")
+def save_portal_account(cid):
+    d = request.get_json(force=True) or {}
+    username = (d.get("username") or "").strip().lower()
+    password = d.get("password") or ""
+    active = 1 if d.get("active", True) else 0
+    if not re.fullmatch(r"[a-z0-9._@-]{3,60}", username):
+        return jsonify(error="Username must be 3-60 characters: letters, numbers, . _ - or @ (no spaces)"), 400
+    if password and len(password) < PORTAL_MIN_PASSWORD:
+        return jsonify(error=f"Password must be at least {PORTAL_MIN_PASSWORD} characters"), 400
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM customers WHERE id=?", (cid,)).fetchone():
+        conn.close()
+        return jsonify(error="Customer not found"), 404
+    taken = conn.execute("SELECT customer_id FROM customer_accounts WHERE username=?", (username,)).fetchone()
+    if taken and taken["customer_id"] != cid:
+        conn.close()
+        return jsonify(error="That username is already used by another customer"), 400
+    existing = conn.execute("SELECT * FROM customer_accounts WHERE customer_id=?", (cid,)).fetchone()
+    if not existing:
+        if not password:
+            conn.close()
+            return jsonify(error="Set a password for the new portal login"), 400
+        conn.execute(
+            "INSERT INTO customer_accounts (customer_id, username, password_hash, active, created_by) VALUES (?,?,?,?,?)",
+            (cid, username, generate_password_hash(password), active, session["user"]["id"]))
+        audit(conn, "CREATE", "CUSTOMER_PORTAL", cid, f"portal login '{username}' created")
+    else:
+        # Ending open sessions on a password reset, a disable, or a username change.
+        bump = 1 if (password or not active or username != existing["username"]) else 0
+        conn.execute(
+            """UPDATE customer_accounts SET username=?, active=?, session_version=session_version+?,
+                   failed_attempts=0, locked_until=NULL WHERE customer_id=?""",
+            (username, active, bump, cid))
+        if password:
+            conn.execute("UPDATE customer_accounts SET password_hash=? WHERE customer_id=?",
+                         (generate_password_hash(password), cid))
+        audit(conn, "UPDATE", "CUSTOMER_PORTAL", cid,
+              f"portal login '{username}'" + (" password reset" if password else "")
+              + ("" if active else " disabled"))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/customers/<int:cid>/portal-account")
+@roles_required("ADMIN", "MANAGER")
+def delete_portal_account(cid):
+    conn = get_db()
+    cur = conn.execute("DELETE FROM customer_accounts WHERE customer_id=?", (cid,))
+    if cur.rowcount:
+        audit(conn, "DELETE", "CUSTOMER_PORTAL", cid, "portal login removed")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---- portal: auth
+
+@app.post("/api/portal/login")
+def portal_login():
+    d = request.get_json(force=True) or {}
+    username = (d.get("username") or "").strip().lower()
+    password = d.get("password") or ""
+    generic = "Invalid username or password"
+    conn = get_db()
+    acct = conn.execute(
+        """SELECT ca.*, c.status customer_status FROM customer_accounts ca
+           JOIN customers c ON c.id = ca.customer_id WHERE ca.username=?""", (username,)).fetchone()
+    if not acct:
+        conn.close()
+        check_password_hash(generate_password_hash("x"), password)  # similar timing either way
+        return jsonify(error=generic), 401
+    now = datetime.now()
+    if acct["locked_until"] and acct["locked_until"] > now.strftime("%Y-%m-%d %H:%M:%S"):
+        conn.close()
+        return jsonify(error=f"Too many wrong passwords. Try again after {acct['locked_until'][11:16]}, "
+                             "or ask GUFC to reset your password."), 429
+    if not check_password_hash(acct["password_hash"], password):
+        fails = acct["failed_attempts"] + 1
+        locked_until = None
+        if fails >= PORTAL_MAX_FAILED:
+            locked_until = (now + timedelta(minutes=PORTAL_LOCK_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
+            fails = 0
+            _portal_audit(conn, "LOCKED", acct["customer_id"], "too many failed logins", username=username)
+        conn.execute("UPDATE customer_accounts SET failed_attempts=?, locked_until=? WHERE id=?",
+                     (fails, locked_until, acct["id"]))
+        conn.commit()
+        conn.close()
+        return jsonify(error=generic), 401
+    if not acct["active"] or acct["customer_status"] != "ACTIVE":
+        conn.close()
+        return jsonify(error="This portal login is disabled. Please contact GUFC."), 403
+    conn.execute("UPDATE customer_accounts SET failed_attempts=0, locked_until=NULL, last_login=datetime('now') WHERE id=?",
+                 (acct["id"],))
+    session["customer"] = {"account_id": acct["id"], "customer_id": acct["customer_id"],
+                           "username": acct["username"], "session_version": acct["session_version"]}
+    _portal_audit(conn, "LOGIN", acct["customer_id"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/portal/logout")
+def portal_logout():
+    session.pop("customer", None)
+    return jsonify(ok=True)
+
+
+@app.get("/api/portal/me")
+@portal_required
+def portal_me():
+    conn = get_db()
+    out = _portal_profile(conn, g.portal)
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/portal/change-password")
+@portal_required
+def portal_change_password():
+    d = request.get_json(force=True) or {}
+    new = d.get("new_password") or ""
+    if len(new) < PORTAL_MIN_PASSWORD:
+        return jsonify(error=f"New password must be at least {PORTAL_MIN_PASSWORD} characters"), 400
+    conn = get_db()
+    row = conn.execute("SELECT password_hash FROM customer_accounts WHERE id=?", (g.portal["account_id"],)).fetchone()
+    if not check_password_hash(row["password_hash"], d.get("current_password") or ""):
+        conn.close()
+        return jsonify(error="Current password is incorrect"), 400
+    conn.execute("UPDATE customer_accounts SET password_hash=?, session_version=session_version+1 WHERE id=?",
+                 (generate_password_hash(new), g.portal["account_id"]))
+    _portal_audit(conn, "CHANGE_PASSWORD", g.portal["id"])
+    conn.commit()
+    ver = conn.execute("SELECT session_version FROM customer_accounts WHERE id=?", (g.portal["account_id"],)).fetchone()[0]
+    conn.close()
+    session["customer"] = {**session["customer"], "session_version": ver}  # stay logged in here only
+    return jsonify(ok=True)
+
+
+# ---- portal: ordering and order status
+
+def _portal_order_status(o):
+    if o["status"] == "CANCELLED":
+        return "Cancelled", "Your order was cancelled."
+    if o["status"] == "FULFILLED":
+        return "Completed", f"Completed on {(o['fulfilled_at'] or '')[:10]}."
+    if o["showroom_location_id"]:
+        return "Confirmed", f"Confirmed and being prepared by {o['location_name'] or 'our team'}."
+    return "Received", "We received your order and will confirm it shortly."
+
+
+@app.get("/api/portal/products")
+@portal_required
+def portal_products():
+    conn = get_db()
+    rows = conn.execute("SELECT id, name, unit, price, category FROM products WHERE active=1 ORDER BY name").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.get("/api/portal/orders")
+@portal_required
+def portal_orders():
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT bo.id, bo.order_no, bo.order_date, bo.status, bo.showroom_location_id, bo.delivery_address,
+                  bo.notes, bo.source, bo.fulfilled_at, l.name location_name
+           FROM booked_orders bo LEFT JOIN locations l ON l.id = bo.showroom_location_id
+           WHERE bo.customer_id=? ORDER BY bo.order_date DESC, bo.id DESC LIMIT 200""",
+        (g.portal["id"],)).fetchall()
+    out = []
+    for o in rows:
+        items = conn.execute(
+            """SELECT p.name product_name, boi.qty, p.price FROM booked_order_items boi
+               JOIN products p ON p.id = boi.product_id WHERE boi.order_id=?""", (o["id"],)).fetchall()
+        label, detail = _portal_order_status(o)
+        out.append({**dict(o), "status_label": label, "status_detail": detail,
+                    "can_cancel": o["status"] == "PENDING" and not o["showroom_location_id"],
+                    "items": [dict(i) for i in items],
+                    "estimated_total": round(sum(i["qty"] * (i["price"] or 0) for i in items), 2)})
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/portal/orders")
+@portal_required
+def portal_place_order():
+    d = request.get_json(force=True) or {}
+    items = d.get("items") or []
+    address = (d.get("delivery_address") or "").strip() or (g.portal["address"] or "")
+    if not items:
+        return jsonify(error="Add at least one product"), 400
+    if len(items) > 20:
+        return jsonify(error="Too many line items"), 400
+    if not address:
+        return jsonify(error="Delivery address is required"), 400
+    conn = get_db()
+    open_orders = conn.execute("SELECT COUNT(*) FROM booked_orders WHERE customer_id=? AND status='PENDING'",
+                               (g.portal["id"],)).fetchone()[0]
+    if open_orders >= PORTAL_MAX_OPEN_ORDERS:
+        conn.close()
+        return jsonify(error=f"You already have {open_orders} open orders. Please wait for them to be completed, "
+                             "or call us."), 400
+    merged = {}
+    for it in items:
+        try:
+            pid, qty = int(it.get("product_id")), int(it.get("qty") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="Invalid product or quantity"), 400
+        if qty <= 0 or qty > 500:
+            conn.close()
+            return jsonify(error="Quantity must be between 1 and 500"), 400
+        if not conn.execute("SELECT 1 FROM products WHERE id=? AND active=1", (pid,)).fetchone():
+            conn.close()
+            return jsonify(error="One of the selected products is no longer available. Please reload the page."), 400
+        merged[pid] = merged.get(pid, 0) + qty
+    order_no = next_number(conn, "ORD", "booked_orders", "order_no")
+    cur = conn.execute(
+        """INSERT INTO booked_orders (order_no, customer_id, customer_phone, delivery_address, source, notes)
+           VALUES (?,?,?,?,?,?)""",
+        (order_no, g.portal["id"], g.portal["phone"] or "", address[:500], "CUSTOMER",
+         ("[Customer Portal] " + (d.get("notes") or "").strip())[:500]))
+    for pid, qty in merged.items():
+        conn.execute("INSERT INTO booked_order_items (order_id, product_id, qty) VALUES (?,?,?)", (cur.lastrowid, pid, qty))
+    audit_detail = f"{order_no} placed in customer portal"
+    _portal_audit(conn, "CREATE_ORDER", cur.lastrowid, audit_detail)
+    conn.commit()
+    conn.close()
+    return jsonify(order_no=order_no), 201
+
+
+@app.post("/api/portal/orders/<int:oid>/cancel")
+@portal_required
+def portal_cancel_order(oid):
+    conn = get_db()
+    o = conn.execute("SELECT * FROM booked_orders WHERE id=? AND customer_id=?", (oid, g.portal["id"])).fetchone()
+    if not o:
+        conn.close()
+        return jsonify(error="Order not found"), 404
+    if o["status"] != "PENDING" or o["showroom_location_id"]:
+        conn.close()
+        return jsonify(error="This order is already confirmed and can't be cancelled online. Please call us."), 400
+    conn.execute("UPDATE booked_orders SET status='CANCELLED' WHERE id=?", (oid,))
+    _portal_audit(conn, "CANCEL_ORDER", oid, f"{o['order_no']} cancelled by customer")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---- portal: purchases, billing and SOA
+
+@app.get("/api/portal/purchases")
+@portal_required
+def portal_purchases():
+    date_from, date_to = request.args.get("from") or None, request.args.get("to") or None
+    sql = """SELECT s.id, s.sale_no, s.dr_no, s.ts, s.sale_type, s.status, s.subtotal, s.discount, s.total,
+                    s.paid, s.balance, l.name location_name, r.invoice_no, r.due_date, r.status invoice_status
+             FROM sales s JOIN locations l ON l.id = s.location_id LEFT JOIN receivables r ON r.sale_id = s.id
+             WHERE s.customer_id=? AND s.is_opening_balance=0"""
+    params = [g.portal["id"]]
+    if date_from:
+        sql += " AND date(s.ts) >= date(?)"; params.append(date_from)
+    if date_to:
+        sql += " AND date(s.ts) <= date(?)"; params.append(date_to)
+    conn = get_db()
+    rows = conn.execute(sql + " ORDER BY s.ts DESC, s.id DESC LIMIT 500", params).fetchall()
+    out = []
+    for s in rows:
+        items = conn.execute(
+            """SELECT product_name, qty, price, subtotal, sale_mode, COALESCE(discount_amount,0) discount, swap_brand
+               FROM sale_items WHERE sale_id=? ORDER BY id""", (s["id"],)).fetchall()
+        out.append({**dict(s), "items": [dict(i) for i in items]})
+    conn.close()
+    done = [s for s in out if s["status"] == "COMPLETED"]
+    return jsonify(purchases=out, totals={"count": len(done), "amount": round(sum(s["total"] for s in done), 2),
+                                          "cylinders": sum(i["qty"] for s in done for i in s["items"]
+                                                           if float(i["qty"]).is_integer())})
+
+
+@app.get("/api/portal/billing")
+@portal_required
+def portal_billing():
+    conn = get_db()
+    cid = g.portal["id"]
+    for r in conn.execute("SELECT id FROM receivables WHERE customer_id=? AND balance > 0.009", (cid,)).fetchall():
+        recompute_receivable_status(conn, r["id"])
+    conn.commit()
+    invoices = [dict(r) for r in conn.execute(
+        """SELECT r.id, r.invoice_no, r.invoice_date, r.due_date, r.amount, r.paid, r.balance, r.status,
+                  s.sale_no, s.dr_no, s.is_opening_balance
+           FROM receivables r JOIN sales s ON s.id = r.sale_id
+           WHERE r.customer_id=? AND s.status='COMPLETED' ORDER BY r.due_date DESC, r.id DESC""", (cid,)).fetchall()]
+    payments = [dict(r) for r in conn.execute(
+        """SELECT p.ts, p.amount, p.method, p.reference, s.sale_no, r.invoice_no
+           FROM payments p JOIN sales s ON s.id = p.sale_id LEFT JOIN receivables r ON r.sale_id = s.id
+           WHERE s.customer_id=? AND s.sale_type='CREDIT' ORDER BY p.ts DESC LIMIT 100""", (cid,)).fetchall()]
+    is_credit = _portal_is_credit(conn, g.portal)
+    conn.close()
+    today = datetime.now().date().isoformat()
+    open_inv = [i for i in invoices if i["balance"] > 0.009]
+    outstanding = round(sum(i["balance"] for i in open_inv), 2)
+    overdue = round(sum(i["balance"] for i in open_inv if i["due_date"] < today), 2)
+    next_due = min((i for i in open_inv if i["due_date"] >= today), key=lambda i: i["due_date"], default=None)
+    limit = g.portal["credit_limit"] or 0
+    return jsonify(
+        is_credit=is_credit, terms_days=g.portal["terms_days"], credit_limit=limit,
+        available_credit=round(max(limit - outstanding, 0), 2) if limit else None,
+        outstanding=outstanding, overdue=overdue, open_count=len(open_inv),
+        next_due={"invoice_no": next_due["invoice_no"], "due_date": next_due["due_date"], "balance": next_due["balance"]}
+        if next_due else None,
+        invoices=invoices, payments=payments)
+
+
+def _portal_soa_args():
+    return request.args.get("from") or None, request.args.get("to") or None
+
+
+@app.get("/api/portal/soa")
+@portal_required
+def portal_soa():
+    conn = get_db()
+    entries, beginning, ending = build_customer_ledger(conn, g.portal["id"], *_portal_soa_args())
+    conn.close()
+    return jsonify(entries=entries, beginning_balance=beginning, ending_balance=ending)
+
+
+@app.get("/api/portal/soa/export")
+@portal_required
+def portal_soa_export():
+    conn = get_db()
+    entries, beginning, ending = build_customer_ledger(conn, g.portal["id"], *_portal_soa_args())
+    cust = dict(conn.execute("SELECT * FROM customers WHERE id=?", (g.portal["id"],)).fetchone())
+    _portal_audit(conn, "DOWNLOAD_SOA", g.portal["id"])
+    conn.commit()
+    conn.close()
+    fname = f"SOA-{cust['account_no']}-{datetime.now().strftime('%Y%m%d')}.pdf"
+    return soa_pdf_response(cust, entries, beginning, ending, fname)
 
 
 # ---------------------------------------------------------------- incident reports
@@ -1943,6 +2371,7 @@ def system_reset():
             conn.execute("DELETE FROM users WHERE id<>?", (me["id"],))
 
         if wipe_customers:
+            conn.execute("DELETE FROM customer_accounts")
             conn.execute("DELETE FROM customers")
 
         if wipe_discounts:
@@ -1960,7 +2389,7 @@ def system_reset():
         if wipe_staff_fleet:
             emptied += ["employees", "vehicles"]
         if wipe_customers:
-            emptied.append("customers")
+            emptied += ["customer_accounts", "customers"]
         if wipe_discounts:
             emptied.append("discounts")
         if wipe_products:
@@ -4404,6 +4833,11 @@ def index():
 @app.get("/order")
 def public_order_page():
     return send_from_directory("static", "order.html")
+
+
+@app.get("/portal")
+def customer_portal_page():
+    return send_from_directory("static", "portal.html")
 
 
 if __name__ == "__main__":
