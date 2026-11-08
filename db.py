@@ -412,7 +412,7 @@ MODULE_KEYS = [
     "inventory_ledger", "cylinder_deposits", "transfers", "hauling", "vehicles",
     "employees", "staff_schedule", "kpi", "reports", "audit",
     "booked_orders", "incident_reports", "commercial_deliveries",
-    "eod_report", "receivables_summary",
+    "eod_report", "receivables_summary", "customer_growth",
 ]
 
 DEFAULT_ROLE_PERMISSIONS = {
@@ -422,10 +422,11 @@ DEFAULT_ROLE_PERMISSIONS = {
         "inventory_ledger", "cylinder_deposits", "hauling", "vehicles",
         "employees", "staff_schedule", "kpi", "reports", "audit",
         "booked_orders", "incident_reports", "commercial_deliveries", "eod_report",
+        "customer_growth",
     ],
     "ACCOUNTING": [
         "dashboard", "sales", "customers", "receivables", "reports", "eod_report",
-        "receivables_summary",
+        "receivables_summary", "customer_growth",
     ],
     "ATTENDANT": [
         "dashboard", "pos", "sales", "customers", "receivables", "inventory",
@@ -697,6 +698,17 @@ def migrate_schema():
             day = (r[1] or "")[:10].replace("-", "")
             seq[day] = seq.get(day, 0) + 1
             conn.execute("UPDATE sales SET dr_no=? WHERE id=?", (f"DR-{day}-{seq[day]:04d}", r[0]))
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
+        conn.commit()
+
+    # 13. Customer Growth dashboard module: grant it to the built-in Manager
+    #     and Accounting roles on databases seeded before it existed. Runs once.
+    MIGRATION_KEY = "grant_customer_growth_default"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        for role_name in ("MANAGER", "ACCOUNTING"):
+            if conn.execute("SELECT 1 FROM roles WHERE name=?", (role_name,)).fetchone():
+                conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES (?, 'customer_growth')",
+                             (role_name,))
         conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 
