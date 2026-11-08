@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Customer Portal | Great Unli Food Corp.</title>
+<link rel="icon" type="image/png" href="/images/favicon.png">
+<style>
+:root{
+  --blue:#0b3d66; --blue-dark:#082a47; --green:#1e9e5a; --green-dark:#157a45;
+  --bg:#f4f6f8; --card:#ffffff; --border:#e2e6ea; --text:#1c2733; --muted:#6b7785;
+  --danger:#c0392b; --warn:#d68910; --radius:10px;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:14.5px}
+.hidden{display:none !important}
+button{font-family:inherit}
+/* login */
+.login{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;
+  background:linear-gradient(160deg,var(--blue),var(--blue-dark))}
+.login .box{background:var(--card);border-radius:14px;padding:28px 22px;width:100%;max-width:380px}
+.login img{width:64px;height:64px;object-fit:contain;display:block;margin:0 auto 8px}
+.login h1{font-size:19px;margin:0;text-align:center;color:var(--blue)}
+.login p.sub{text-align:center;color:var(--muted);margin:4px 0 20px;font-size:13px}
+.login .help{color:#cfdbe6;font-size:12.5px;margin-top:16px;text-align:center;max-width:380px}
+/* shell */
+.top{background:linear-gradient(160deg,var(--blue),var(--blue-dark));color:#fff;padding:14px 16px}
+.top .row{max-width:960px;margin:0 auto;display:flex;align-items:center;gap:12px}
+.top img{width:38px;height:38px;object-fit:contain;background:#fff;border-radius:8px;padding:3px}
+.top .who{flex:1;min-width:0}
+.top .who b{display:block;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top .who span{font-size:12px;opacity:.8}
+.top button{background:rgba(255,255,255,.12);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:8px;padding:7px 12px;cursor:pointer}
+.tabs{background:var(--card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5}
+.tabs .row{max-width:960px;margin:0 auto;display:flex;overflow-x:auto;scrollbar-width:none}
+.tabs button{background:none;border:none;border-bottom:3px solid transparent;padding:13px 14px;font-size:14px;color:var(--muted);cursor:pointer;white-space:nowrap;font-weight:600}
+.tabs button.active{color:var(--blue);border-bottom-color:var(--green)}
+.wrap{max-width:960px;margin:0 auto;padding:16px 16px 60px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:14px}
+h2{font-size:16px;margin:0 0 12px;color:var(--blue)}
+h3{font-size:14.5px;margin:0 0 8px}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(4,1fr);margin-bottom:14px}
+@media (max-width:760px){.grid{grid-template-columns:repeat(2,1fr)}}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px}
+.stat .l{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.stat .v{font-size:20px;font-weight:700;margin-top:4px}
+.stat .s{font-size:12px;color:var(--muted);margin-top:2px}
+.stat.danger .v{color:var(--danger)} .stat.green .v{color:var(--green-dark)}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:13px;font-weight:600;color:var(--muted);margin-bottom:6px}
+input,select,textarea{width:100%;font-family:inherit;font-size:15px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:#fff;color:var(--text)}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--blue);outline-offset:0}
+.btn{background:#fff;border:1px solid var(--border);border-radius:8px;padding:9px 14px;font-size:14px;font-weight:600;color:var(--blue);cursor:pointer;text-decoration:none;display:inline-block}
+.btn.green{background:var(--green);border-color:var(--green);color:#fff}
+.btn.green:hover{background:var(--green-dark)}
+.btn.danger{color:var(--danger)}
+.btn.block{width:100%;padding:13px;font-size:15px}
+.btn:disabled{opacity:.6;cursor:not-allowed}
+.btn.small{padding:6px 10px;font-size:12.5px}
+.badge{display:inline-block;border-radius:20px;padding:2px 9px;font-size:11.5px;font-weight:700}
+.b-blue{background:#e3ecf5;color:var(--blue)} .b-green{background:#e2f6ea;color:var(--green-dark)}
+.b-warn{background:#fdf1dc;color:var(--warn)} .b-danger{background:#fbe6e3;color:var(--danger)} .b-gray{background:#eef0f2;color:var(--muted)}
+.msg{padding:10px 12px;border-radius:8px;font-size:13.5px;margin-bottom:12px}
+.msg.err{background:#fbe6e3;color:var(--danger)} .msg.ok{background:#e2f6ea;color:var(--green-dark)}
+.muted{color:var(--muted)} .small{font-size:12.5px} .right{text-align:right}
+.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:8px}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th{background:var(--bg);text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);padding:9px 10px;white-space:nowrap}
+td{padding:9px 10px;border-top:1px solid var(--border);vertical-align:top}
+.table-wrap td{white-space:nowrap} .table-wrap td.wrap{white-space:normal;min-width:200px}
+.item-row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.item-row select{flex:1;min-width:0}
+.item-row input{width:74px;text-align:center}
+.item-row .rm{background:none;border:1px solid var(--border);border-radius:8px;width:40px;height:42px;color:var(--danger);font-size:18px;cursor:pointer;flex-shrink:0}
+.add-btn{background:none;border:1px dashed var(--border);border-radius:8px;padding:10px;width:100%;color:var(--blue);font-weight:600;cursor:pointer}
+.order{border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;margin-bottom:10px;background:var(--card)}
+.order .hd{display:flex;justify-content:space-between;gap:8px;align-items:flex-start;flex-wrap:wrap}
+.steps{display:flex;gap:4px;margin:10px 0 6px}
+.steps div{flex:1;height:6px;border-radius:4px;background:var(--border)}
+.steps div.on{background:var(--green)}
+.steps.cancel div.on{background:var(--danger)}
+.steplbl{display:flex;justify-content:space-between;font-size:11px;color:var(--muted)}
+.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.filters input{width:auto;flex:0 1 160px}
+.toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--text);color:#fff;padding:10px 16px;border-radius:8px;font-size:14px;z-index:50;max-width:90vw}
+.toast.err{background:var(--danger)} .toast.ok{background:var(--green-dark)}
+details summary{cursor:pointer;color:var(--blue);font-size:13px;font-weight:600}
+</style>
+</head>
+<body>
+
+<div id="loginView" class="login">
+  <div class="box">
+    <img src="/images/logo.png" alt="GUFC logo">
+    <h1>Customer Portal</h1>
+    <p class="sub">Great Unli Food Corp. · Solane LPG</p>
+    <div id="loginErr" class="msg err hidden"></div>
+    <form id="loginForm">
+      <div class="field"><label for="lUser">Username</label><input id="lUser" autocomplete="username" autocapitalize="none" required></div>
+      <div class="field"><label for="lPass">Password</label><input id="lPass" type="password" autocomplete="current-password" required></div>
+      <button class="btn green block" id="loginBtn">Log In</button>
+    </form>
+  </div>
+  <p class="help">No login yet, or forgot your password? Please call or message GUFC and we'll set it up for you.</p>
+</div>
+
+<div id="appView" class="hidden">
+  <div class="top"><div class="row">
+    <img src="/images/logo.png" alt="">
+    <div class="who"><b id="custName"></b><span id="custSub"></span></div>
+    <button id="logoutBtn">Log out</button>
+  </div></div>
+  <nav class="tabs"><div class="row" id="tabs"></div></nav>
+  <main class="wrap" id="main"></main>
+</div>
+
+<script src="/js/portal.js"></script>
+</body>
+</html>

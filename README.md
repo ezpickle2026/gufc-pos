@@ -32,6 +32,33 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Customer Portal** (`/portal`). Customers log in with their own username and
+  password to:
+  - **Place orders**: pick products and quantities, see the estimated total, and confirm
+    the delivery address. Orders land in Booked Orders marked **Portal** for staff to
+    assign and fulfil, the same as other orders.
+  - **Follow their orders**: Received → Confirmed (once staff assign a warehouse/showroom)
+    → Completed, or Cancelled. Customers can cancel an order themselves only while it is
+    still unconfirmed.
+  - **See their purchases**: every receipt with items, totals, DR number and, for credit
+    sales, the invoice, due date and payment status.
+  - **Billing & SOA** (credit / terms accounts only): balance due, overdue amount, next due
+    date, credit limit and available credit, unpaid invoices, payments received, and the
+    Statement of Account for any date range with a PDF download.
+  - **Change their password.**
+
+  **Setting up a login** (Admin / Manager): Customers → **Portal Login** on the customer's
+  row. Set a username and password (or press Generate), then give the customer the link,
+  username and password shown on screen. The same window resets a password, disables the
+  login, unlocks it or removes it. Customers with a login show a **Portal** badge.
+
+  **Security:** portal logins are separate from staff accounts and can never open staff
+  screens. Each customer only ever sees their own account. Passwords are at least 8
+  characters. After 5 wrong passwords the login is locked for 15 minutes (saving the login
+  in Portal Login unlocks it). Resetting the password, disabling the login or changing the
+  username logs the customer out everywhere. Portal logins, orders, cancellations and SOA
+  downloads are recorded in the Audit Log as `portal:<username>`.
+
 - **Customer Growth dashboard** (Customers & Money → Customer Growth; Admin, Manager and
   Accounting by default, grantable to other roles as the "Customer Growth" module).
   Weekly (Mon–Sun) or monthly tracking of customer growth that counts **only LPG cylinder

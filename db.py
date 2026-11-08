@@ -346,6 +346,22 @@ CREATE TABLE IF NOT EXISTS booked_order_items (
     qty INTEGER NOT NULL
 );
 
+-- Customer Portal logins: one per customer account. Kept apart from the
+-- staff `users` table so a customer login can never reach staff screens.
+CREATE TABLE IF NOT EXISTS customer_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER UNIQUE NOT NULL REFERENCES customers(id),
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    session_version INTEGER NOT NULL DEFAULT 1,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT,
+    last_login TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    created_by INTEGER REFERENCES users(id)
+);
+
 CREATE TABLE IF NOT EXISTS discounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
