@@ -406,7 +406,8 @@ screen and disable the seeded ones.
    This avoids Railpack downloading its build tools from GitHub on every deploy.
 3. Set environment variables in the Railway dashboard:
    - `SESSION_SECRET` — a long random string (`python3 -c "import secrets; print(secrets.token_hex(32))"`)
-4. The container starts `gunicorn app:app` on Railway's `$PORT` (see the `Dockerfile`).
+4. The container starts `gunicorn app:app`; `gunicorn.conf.py` picks up Railway's `PORT`.
+   Leave Railway's custom Start Command empty (a command containing `$PORT` fails there).
 5. **Important:** SQLite on Railway's default filesystem is ephemeral — it resets
    on redeploy. For anything beyond a demo, either attach a Railway volume and set
    `DB_PATH=/data/gufc.db`, or migrate to Postgres (next section).
