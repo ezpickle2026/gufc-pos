@@ -402,10 +402,11 @@ screen and disable the seeded ones.
 ## Deploying to Railway
 
 1. Push this folder to a GitHub repo, create a new Railway project from it.
-2. Railway auto-detects Python and installs `requirements.txt`.
+2. Railway builds the app from the `Dockerfile` (Python 3.13 + `requirements.txt`).
+   This avoids Railpack downloading its build tools from GitHub on every deploy.
 3. Set environment variables in the Railway dashboard:
    - `SESSION_SECRET` — a long random string (`python3 -c "import secrets; print(secrets.token_hex(32))"`)
-4. Railway runs the `Procfile` (`gunicorn app:app`) automatically.
+4. The container starts `gunicorn app:app` on Railway's `$PORT` (see the `Dockerfile`).
 5. **Important:** SQLite on Railway's default filesystem is ephemeral — it resets
    on redeploy. For anything beyond a demo, either attach a Railway volume and set
    `DB_PATH=/data/gufc.db`, or migrate to Postgres (next section).
