@@ -728,6 +728,15 @@ def migrate_schema():
         conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 
+    # 14. Walk-in customer name typed at checkout, and the 1% creditable
+    #     withholding tax the customer deducts: (gross / 1.12) x 1%.
+    if not _column_exists(conn, "sales", "walkin_name"):
+        conn.execute("ALTER TABLE sales ADD COLUMN walkin_name TEXT")
+        conn.commit()
+    if not _column_exists(conn, "sales", "withholding_tax"):
+        conn.execute("ALTER TABLE sales ADD COLUMN withholding_tax REAL NOT NULL DEFAULT 0")
+        conn.commit()
+
     conn.close()
 
 

@@ -2115,6 +2115,11 @@ def _discount_is_live(row, today=None):
     return True
 
 
+def compute_withholding_tax(gross):
+    """1% creditable withholding tax on a VAT-inclusive sale: gross / 1.12 x 1%."""
+    return round(float(gross) / 1.12 * 0.01, 2)
+
+
 def compute_item_discount(disc, product_id, unit_gas_price, qty):
     """Server-side discount amount for one sale line. Raises ValueError if
     the discount can't be applied to this line."""
@@ -2446,6 +2451,9 @@ def create_sale():
     payments = d.get("payments") or []
     sale_type = d.get("sale_type", "CASH")
     customer_id = d.get("customer_id")
+    # Walk-in buyers have no account; the cashier may type their name.
+    walkin_name = None if customer_id else ((d.get("walkin_name") or "").strip()[:120] or None)
+    apply_wht = bool(d.get("withholding_tax"))
 
     conn = get_db()
     try:
@@ -2499,10 +2507,14 @@ def create_sale():
         total = round(subtotal - discount, 2)
         if total < 0:
             raise ValueError("Discount exceeds subtotal")
+        # 1% expanded withholding tax: the customer pays the gross less
+        # (gross / 1.12) x 1%, and hands over a BIR Form 2307 for it.
+        withholding_tax = compute_withholding_tax(total) if apply_wht else 0.0
+        amount_due = round(total - withholding_tax, 2)
 
         paid_total = round(sum(float(p["amount"]) for p in payments), 2)
 
-        if sale_type == "CASH" and paid_total < total:
+        if sale_type == "CASH" and paid_total < amount_due:
             raise ValueError("Cash sale payments do not cover the total. Use CREDIT for partial payment.")
 
         # credit sale: check customer terms + credit limit
@@ -2516,22 +2528,23 @@ def create_sale():
                 "SELECT COALESCE(SUM(balance),0) b FROM receivables WHERE customer_id=? AND status!='PAID'",
                 (customer_id,),
             ).fetchone()["b"]
-            projected = outstanding + (total - paid_total)
+            projected = outstanding + (amount_due - paid_total)
             if customer["credit_limit"] > 0 and projected > customer["credit_limit"]:
                 raise ValueError(
                     f"Credit limit exceeded: outstanding+this sale = {projected:.2f}, limit = {customer['credit_limit']:.2f}"
                 )
 
-        balance = round(total - paid_total, 2)
+        balance = round(amount_due - paid_total, 2)
         sale_no = next_number(conn, "SALE", "sales", "sale_no")
         # Credit / terms sales get a Delivery Receipt number the customer signs against.
         dr_no = next_number(conn, "DR", "sales", "dr_no") if sale_type == "CREDIT" else None
 
         cur = conn.execute(
-            """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance, notes, dr_no)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance,
+                                  notes, dr_no, walkin_name, withholding_tax)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (sale_no, location_id, u["id"], customer_id, sale_type, subtotal, discount, total,
-             paid_total, balance, d.get("notes", ""), dr_no),
+             paid_total, balance, d.get("notes", ""), dr_no, walkin_name, withholding_tax),
         )
         sale_id = cur.lastrowid
 
@@ -2579,11 +2592,11 @@ def create_sale():
             conn.execute(
                 """INSERT INTO receivables (sale_id, customer_id, invoice_no, invoice_date, due_date, amount, paid, balance, status)
                    VALUES (?,?,?,?,?,?,?,?,?)""",
-                (sale_id, customer_id, invoice_no, str(invoice_date), str(due_date), total, paid_total, balance,
+                (sale_id, customer_id, invoice_no, str(invoice_date), str(due_date), amount_due, paid_total, balance,
                  "CURRENT"),
             )
 
-        audit(conn, "CREATE", "SALES", sale_id, f"{sale_no} total={total} paid={paid_total} balance={balance}")
+        audit(conn, "CREATE", "SALES", sale_id, f"{sale_no} total={total} wht={withholding_tax} paid={paid_total} balance={balance}")
         conn.commit()
     except ValueError as e:
         conn.rollback()
@@ -2603,7 +2616,7 @@ def get_sale_detail(sale_id):
     conn = get_db()
     sale = conn.execute(
         """SELECT s.*, l.name location_name, l.address location_address, u.name cashier_name,
-                  c.name customer_name, c.account_no, c.business_name customer_business_name,
+                  COALESCE(c.name, s.walkin_name) customer_name, c.account_no, c.business_name customer_business_name,
                   c.address customer_address, c.phone customer_phone, c.terms_days customer_terms_days,
                   r.invoice_no, r.due_date
            FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u ON u.id=s.user_id
@@ -2621,7 +2634,7 @@ def get_sale_detail(sale_id):
 def list_sales():
     u = session["user"]
     conn = get_db()
-    sql = """SELECT s.*, l.name location_name, u2.name cashier_name, c.name customer_name
+    sql = """SELECT s.*, l.name location_name, u2.name cashier_name, COALESCE(c.name, s.walkin_name) customer_name
               FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u2 ON u2.id=s.user_id
               LEFT JOIN customers c ON c.id=s.customer_id WHERE s.is_opening_balance=0"""
     params = []
@@ -3206,7 +3219,7 @@ def _sales_report_rows(date_from, date_to):
     """One row per item sold, so Qty is its own column and each item's
     discount shows in Remarks. Sales with no item lines still get one row."""
     conn = get_db()
-    sql = """SELECT s.sale_no, s.ts, l.name location_name, u.name cashier, c.name customer,
+    sql = """SELECT s.sale_no, s.ts, l.name location_name, u.name cashier, COALESCE(c.name, s.walkin_name) customer,
                     CASE WHEN c.id IS NULL THEN 'Walk-in' ELSE COALESCE(NULLIF(c.category,''), 'Uncategorized') END customer_category,
                     s.sale_type, s.status, s.total sale_total, s.discount sale_discount,
                     si.product_name || CASE WHEN si.sale_mode='DEPOSIT' THEN ' (deposit)'
@@ -3339,7 +3352,7 @@ def _build_swapped_report(conn, date_from=None, date_to=None, location_id=None):
     if location_id:
         where.append("s.location_id = ?"); params.append(location_id)
     rows = conn.execute(
-        f"""SELECT s.ts, s.sale_no, l.name location_name, u.name cashier, c.name customer_name,
+        f"""SELECT s.ts, s.sale_no, l.name location_name, u.name cashier, COALESCE(c.name, s.walkin_name) customer_name,
                    COALESCE(NULLIF(si.swap_brand,''), 'Unspecified') swap_brand, si.product_name,
                    si.qty, COALESCE(si.swap_fee,0) swap_fee, ROUND(COALESCE(si.swap_fee,0) * si.qty, 2) swap_fee_total,
                    si.subtotal amount
