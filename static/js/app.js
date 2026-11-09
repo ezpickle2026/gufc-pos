@@ -536,18 +536,29 @@ function drawCart(locationId) {
   document.getElementById("checkoutBtn").addEventListener("click", () => openCheckout(locationId));
 }
 
+// 1% creditable withholding tax on a VAT-inclusive sale. Mirrors
+// compute_withholding_tax() on the server: (gross / 1.12) x 1%.
+function withholdingTax(gross) { return Math.round(gross / 1.12 * 0.01 * 100) / 100; }
+
 async function openCheckout(locationId) {
-  const { total } = cartTotals();
+  const { total: gross } = cartTotals();
+  let total = gross;
   const customers = await api("/customers");
   const custOptions = `<option value="">-- Walk-in / no account --</option>` +
     customers.map(c => `<option value="${c.id}">${esc(c.name)} (${c.account_no}) - ${esc(c.category)}</option>`).join("");
 
   openModal("Checkout", `
     <div class="field"><label>Customer</label><select id="custSelect">${custOptions}</select></div>
+    <div class="field" id="walkinNameField"><label>Walk-in customer name (optional)</label>
+      <input type="text" id="walkinName" maxlength="120" placeholder="Type the customer's name"></div>
     <div class="field"><label>Sale Type</label>
       <select id="saleType"><option value="CASH">Cash Sale</option><option value="CREDIT">Credit / Terms Sale</option></select>
     </div>
-    <div class="field"><label>Total Due</label><div style="font-size:20px;font-weight:800">${money(total)}</div></div>
+    <div class="field"><label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="whtCheck" style="width:auto;margin:0"> Withholding tax (1%)</label>
+      <div id="whtInfo" style="display:none;font-size:12.5px;color:var(--muted);margin-top:4px">
+        Gross ${money(gross)} &divide; 1.12 = ${money(gross / 1.12)} &times; 1% = <b>&minus;${money(withholdingTax(gross))}</b></div></div>
+    <div class="field"><label>Total Due</label><div style="font-size:20px;font-weight:800" id="totalDue">${money(total)}</div></div>
     <div class="field">
       <label>Payments (split payments supported)</label>
       <div id="payRows"></div>
@@ -582,6 +593,20 @@ async function openCheckout(locationId) {
       document.getElementById("balSoFar").textContent = money(Math.max(0, total - paid));
     }
     document.getElementById("addPayRow").addEventListener("click", () => addRow());
+    const custSelect = document.getElementById("custSelect");
+    custSelect.addEventListener("change", () => {
+      document.getElementById("walkinNameField").style.display = custSelect.value ? "none" : "";
+    });
+    document.getElementById("whtCheck").addEventListener("change", (e) => {
+      const prev = total;
+      total = e.target.checked ? Math.round((gross - withholdingTax(gross)) * 100) / 100 : gross;
+      document.getElementById("whtInfo").style.display = e.target.checked ? "" : "none";
+      document.getElementById("totalDue").textContent = money(total);
+      // keep a single full-payment row in step with the new amount due
+      const amts = payRows.querySelectorAll(".payAmount");
+      if (amts.length === 1 && Math.abs((parseFloat(amts[0].value) || 0) - prev) < 0.005) amts[0].value = total;
+      recalc();
+    });
     document.getElementById("saleType").addEventListener("change", (e) => {
       if (e.target.value === "CASH" && payRows.children.length === 0) addRow(total);
     });
@@ -597,6 +622,8 @@ async function openCheckout(locationId) {
       const body = {
         location_id: locationId,
         customer_id: document.getElementById("custSelect").value || null,
+        walkin_name: document.getElementById("custSelect").value ? "" : document.getElementById("walkinName").value.trim(),
+        withholding_tax: document.getElementById("whtCheck").checked,
         sale_type: document.getElementById("saleType").value,
         items: state.cart.map(i => ({
           product_id: i.product_id, qty: i.qty, sale_mode: i.sale_mode,
@@ -633,7 +660,7 @@ function printReceipt(result) {
       <div>--------------------------------</div>
       ${items.map(i => `${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}${i.sale_mode === 'SWAP' ? `<br>  SWAP from ${esc(i.swap_brand)}${i.swap_fee > 0 ? ` (fee ${money(i.swap_fee)}/cyl)` : ""}` : ''}<br>  ${i.qty} x ${money(i.price)} = ${money(i.subtotal)}${i.discount_amount > 0 ? `<br>  Less: ${esc(i.discount_name)} -${money(i.discount_amount)}` : ""}`).join("<br>")}
       <div>--------------------------------</div>
-      <div>Subtotal: ${money(sale.subtotal)}<br>Discount: ${money(sale.discount)}<br><b>Total: ${money(sale.total)}</b></div>
+      <div>Subtotal: ${money(sale.subtotal)}<br>Discount: ${money(sale.discount)}<br><b>Total: ${money(sale.total)}</b>${sale.withholding_tax > 0 ? `<br>Less 1% withholding tax: -${money(sale.withholding_tax)}<br><b>Amount Due: ${money(sale.total - sale.withholding_tax)}</b>` : ""}</div>
       <div>--------------------------------</div>
       ${payments.map(p => `${esc(p.method)}: ${money(p.amount)}`).join("<br>")}
       <div>Paid: ${money(sale.paid)}<br>Balance: ${money(sale.balance)}</div>
@@ -694,6 +721,7 @@ function printDeliveryReceipt(result) {
       <tbody>${lineRows.join("")}</tbody>
       <tfoot>
         <tr><td class="c"><b>${totalQty}</b></td><td colspan="3" class="r">Total amount</td><td class="r"><b>${money(sale.total)}</b></td></tr>
+        ${sale.withholding_tax > 0 ? `<tr><td colspan="4" class="r">Less: 1% withholding tax</td><td class="r">${money(sale.withholding_tax)}</td></tr>` : ""}
         <tr><td colspan="4" class="r">Less: amount paid</td><td class="r">${money(sale.paid)}</td></tr>
         <tr class="due"><td colspan="4" class="r">Balance charged to account</td><td class="r">${money(sale.balance)}</td></tr>
       </tfoot>
@@ -793,6 +821,8 @@ window.viewSale = async (id) => {
       <div class="cart-total-row"><span>Subtotal</span><span>${money(sale.subtotal)}</span></div>
       <div class="cart-total-row"><span>Discount</span><span>${money(sale.discount)}</span></div>
       <div class="cart-total-row grand"><span>Total</span><span>${money(sale.total)}</span></div>
+      ${sale.withholding_tax > 0 ? `<div class="cart-total-row"><span>Less 1% withholding tax</span><span>&minus;${money(sale.withholding_tax)}</span></div>
+      <div class="cart-total-row grand"><span>Amount Due</span><span>${money(sale.total - sale.withholding_tax)}</span></div>` : ""}
     </div>
     <div class="field" style="margin-top:10px"><b>Payments:</b><br>
       ${payments.length ? payments.map(p => `${esc(p.method)}: ${money(p.amount)} ${p.reference ? '(' + esc(p.reference) + ')' : ''}`).join("<br>") : "None recorded"}
