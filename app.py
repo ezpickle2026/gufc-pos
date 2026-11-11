@@ -2701,7 +2701,7 @@ def get_sale_detail(sale_id):
     sale = conn.execute(
         """SELECT s.*, l.name location_name, l.address location_address, u.name cashier_name,
                   COALESCE(c.name, s.walkin_name) customer_name, c.account_no, c.business_name customer_business_name,
-                  c.address customer_address, c.phone customer_phone, c.terms_days customer_terms_days,
+                  c.address customer_address, c.phone customer_phone, c.terms_days customer_terms_days, c.category customer_category,
                   r.invoice_no, r.due_date
            FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u ON u.id=s.user_id
            LEFT JOIN customers c ON c.id=s.customer_id

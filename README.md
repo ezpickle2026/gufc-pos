@@ -41,6 +41,9 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
   50kg line is still charged. Checkout shows the amount due without the 50kg SRP and a note.
   Cash sales and non-Commercial customers are unchanged. These delivery lines are left out of
   the Monthly kg report and Sales Targets so the 50kg isn't counted twice (the billing counts it).
+- **Delivery Receipt for Commercial accounts has no amounts.** For customers in the
+  **Commercial** category the DR shows only Qty, Unit and Description (plus total quantity) —
+  no unit price, amount, totals, amount paid or balance. Other customers' DRs are unchanged.
 
 - **New role: Operation Head** (`OPERATION_HEAD`). Same access as Admin to every screen
   and module **except System Reset (Go Live)**, which stays Admin-only (menu hidden and

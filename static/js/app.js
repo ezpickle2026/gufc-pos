@@ -721,20 +721,23 @@ function printDeliveryReceipt(result) {
   const fmtDate = v => v ? new Date(v.replace(" ", "T")).toLocaleDateString("en-PH", { year: "numeric", month: "long", day: "numeric" }) : "";
   const terms = sale.customer_terms_days ? `${sale.customer_terms_days} days` : "Credit";
   const minRows = 6;
+  // Commercial accounts: the DR shows quantities only, no prices or amounts —
+  // they're charged through 50kg Commercial Billing.
+  const noAmounts = (sale.customer_category || "").trim().toLowerCase() === "commercial";
   const lineRows = items.map(i => {
     const notes = [];
     if (i.sale_mode === "REFILL") notes.push("Refill — empty returned");
     if (i.sale_mode === "DEPOSIT") notes.push("With cylinder deposit");
-    if (i.sale_mode === "SWAP") notes.push(`Swap from ${esc(i.swap_brand || "")}${i.swap_fee > 0 ? `, fee ${money(i.swap_fee)}/cyl` : ""}`);
-    if (i.discount_amount > 0) notes.push(`Less ${esc(i.discount_name || "discount")}: −${money(i.discount_amount)}`);
-    if (i.bill_later) notes.push("Gas billed separately (commercial billing)");
+    if (i.sale_mode === "SWAP") notes.push(`Swap from ${esc(i.swap_brand || "")}${i.swap_fee > 0 && !noAmounts ? `, fee ${money(i.swap_fee)}/cyl` : ""}`);
+    if (i.discount_amount > 0 && !noAmounts) notes.push(`Less ${esc(i.discount_name || "discount")}: −${money(i.discount_amount)}`);
+    if (i.bill_later && !noAmounts) notes.push("Gas billed separately (commercial billing)");
     const priceCell = i.bill_later && !i.price ? "For billing" : money(i.price);
     const amtCell = i.bill_later && !i.subtotal ? "—" : money(i.subtotal - (i.discount_amount || 0));
     return `<tr><td class="c">${i.qty}</td><td class="c">cyl</td>
       <td>${esc(i.product_name)}${notes.length ? `<div class="sub">${notes.join(" · ")}</div>` : ""}</td>
-      <td class="r">${priceCell}</td><td class="r">${amtCell}</td></tr>`;
+      ${noAmounts ? "" : `<td class="r">${priceCell}</td><td class="r">${amtCell}</td>`}</tr>`;
   });
-  while (lineRows.length < minRows) lineRows.push(`<tr class="blank"><td></td><td></td><td></td><td></td><td></td></tr>`);
+  while (lineRows.length < minRows) lineRows.push(`<tr class="blank"><td></td><td></td><td></td>${noAmounts ? "" : "<td></td><td></td>"}</tr>`);
   const totalQty = items.reduce((a, i) => a + i.qty, 0);
   const voided = sale.status === "VOIDED";
 
@@ -765,16 +768,16 @@ function printDeliveryReceipt(result) {
           <td class="k">Ref.</td><td class="v">${esc(sale.sale_no)}${sale.invoice_no ? ` / ${esc(sale.invoice_no)}` : ""}</td></tr>
     </table>
     <table class="items">
-      <thead><tr><th style="width:44px">Qty</th><th style="width:40px">Unit</th><th>Description</th><th style="width:84px">Unit Price</th><th style="width:94px">Amount</th></tr></thead>
+      <thead><tr><th style="width:44px">Qty</th><th style="width:40px">Unit</th><th>Description</th>${noAmounts ? "" : `<th style="width:84px">Unit Price</th><th style="width:94px">Amount</th>`}</tr></thead>
       <tbody>${lineRows.join("")}</tbody>
-      <tfoot>
+      ${noAmounts ? `<tfoot><tr><td class="c"><b>${totalQty}</b></td><td colspan="2">Total quantity</td></tr></tfoot>` : `<tfoot>
         <tr><td class="c"><b>${totalQty}</b></td><td colspan="3" class="r">Total amount</td><td class="r"><b>${money(sale.total)}</b></td></tr>
         ${sale.withholding_tax > 0 ? `<tr><td colspan="4" class="r">Less: 1% withholding tax</td><td class="r">${money(sale.withholding_tax)}</td></tr>` : ""}
         <tr><td colspan="4" class="r">Less: amount paid</td><td class="r">${money(sale.paid)}</td></tr>
         <tr class="due"><td colspan="4" class="r">Balance charged to account</td><td class="r">${money(sale.balance)}</td></tr>
-      </tfoot>
+      </tfoot>`}
     </table>
-    <div class="note">Received the above items in good order and condition. Payment is due on or before the due date stated above.</div>
+    <div class="note">Received the above items in good order and condition.${noAmounts ? "" : " Payment is due on or before the due date stated above."}</div>
     <table class="sig"><tr>
       <td><div class="line">${esc(sale.cashier_name || "")}</div>Prepared by</td>
       <td><div class="line">&nbsp;</div>Delivered by (driver / plate no.)</td>
