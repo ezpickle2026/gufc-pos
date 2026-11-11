@@ -39,7 +39,9 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
   OPERATION_HEAD role or change an Operation Head's account, so nobody can raise their own access.
 - **New role: Supervisor** (`SUPERVISOR`). Can **import stock from the supplier into any
   location** (new **Import Stock** page under Inventory & Dispatch, with the list of past
-  imports). Also has Dashboard, Inventory, Staff Schedule and Incident Reports.
+  imports). Can also **void sales** at any location (Sales page → Void; the void reverses
+  stock, empties and the receivable, and is logged in the Audit Log). Also has Dashboard,
+  Sales, Inventory, Staff Schedule and Incident Reports.
 - **Order Taker** can now **Dispatch** (transfers) and **Import Stock** too.
 - **Accounting** can now fully manage customers' **Portal Logins** (create, reset password,
   disable, unlock, remove), same as Admin/Manager.

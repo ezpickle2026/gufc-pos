@@ -496,7 +496,7 @@ DEFAULT_ROLE_PERMISSIONS = {
         "transfers", "stock_import",
     ],
     "SUPERVISOR": [
-        "dashboard", "inventory", "stock_import", "staff_schedule", "incident_reports",
+        "dashboard", "sales", "inventory", "stock_import", "staff_schedule", "incident_reports",
     ],
 }
 
@@ -841,6 +841,15 @@ def migrate_schema():
         conn.execute("DROP TABLE commercial_deliveries")
         conn.execute("ALTER TABLE commercial_deliveries_new RENAME TO commercial_deliveries")
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.commit()
+
+    # 17. Supervisor can view and void sales: give the built-in SUPERVISOR
+    #     role the Sales module. Runs once.
+    MIGRATION_KEY = "supervisor_sales_void"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        if conn.execute("SELECT 1 FROM roles WHERE name='SUPERVISOR'").fetchone():
+            conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES ('SUPERVISOR', 'sales')")
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 
     conn.close()
