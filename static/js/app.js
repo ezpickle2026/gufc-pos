@@ -3525,7 +3525,9 @@ async function renderCommercialDeliveries(c) {
       const custOpts = customers.map(cu => `<option value="${cu.id}">${esc(cu.name)} (${cu.account_no})</option>`).join("");
       const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
       const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
-      const isAdminOrMgr = isAdminLike(role) || role === "MANAGER";
+      // Admins/Managers pick any branch; users without an assigned branch
+      // (e.g. Accounting) must pick one too, or the server has no location.
+      const isAdminOrMgr = isAdminLike(role) || role === "MANAGER" || !state.user.location_id;
       openModal("New Commercial Billing", `
         <div class="field"><label>Billing Type</label><select id="cdType">
           <option value="DR">DR — Manual billing on delivery (delivered less residual of pull-outs)</option>

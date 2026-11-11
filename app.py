@@ -4865,7 +4865,11 @@ def last_meter_reading():
 def create_commercial_delivery():
     d = request.get_json(force=True)
     u = session["user"]
-    location_id = u["location_id"] if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER") else d.get("location_id")
+    if u["role"] in ("ADMIN", "OPERATION_HEAD", "MANAGER") or not u.get("location_id"):
+        # Users without an assigned branch (e.g. Accounting) choose one in the form.
+        location_id = d.get("location_id")
+    else:
+        location_id = u["location_id"]
     billing_type = d.get("billing_type", "WIWO")
     if billing_type not in ("WIWO", "READING", "DR"):
         return jsonify(error="billing_type must be WIWO, READING or DR"), 400
