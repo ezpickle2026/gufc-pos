@@ -41,6 +41,17 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
   50kg line is still charged. Checkout shows the amount due without the 50kg SRP and a note.
   Cash sales and non-Commercial customers are unchanged. These delivery lines are left out of
   the Monthly kg report and Sales Targets so the 50kg isn't counted twice (the billing counts it).
+- **Fix old Commercial SOA** (Customers → **Fix old Commercial SOA**, Admin / Operation Head).
+  One-time clean-up for credit sales made *before* the change above, which charged the 50kg SRP
+  to Commercial customers. It lists every such sale (date, sale/DR, 50kg lines, total and
+  balance before → after); tick the ones to fix and press Apply. The 50kg lines become
+  delivery-only (SRP kept for reference), the sale total and its receivable are lowered (a
+  receivable that drops to ₱0 with nothing paid is removed), so the SOA shows only what was
+  billed. Stock is not touched, other items stay charged, and sales from 50kg Commercial Billing
+  are never changed. A sale where the customer already paid more than the new amount due is
+  **skipped** and listed to fix by hand. A full database backup
+  (`<db>.before-commercial-soa-fix-<timestamp>.bak`) is saved first, and each fixed sale is
+  logged in the Audit Log.
 - **Delivery Receipt for Commercial accounts has no amounts.** For customers in the
   **Commercial** category the DR shows only Qty, Unit and Description (plus total quantity) —
   no unit price, amount, totals, amount paid or balance. Other customers' DRs are unchanged.

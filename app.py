@@ -4143,6 +4143,135 @@ def sales_target_achievement():
     return jsonify(month=month, month_label=datetime.strptime(month, "%Y-%m").strftime("%B %Y"), rows=out)
 
 
+# ---------------------------------------------------------------- one-time fix: old Commercial SOA
+# Before the "bill 50kg only through Commercial Billing" change, POS credit
+# sales to Commercial-category customers charged the 50kg SRP, so it sits
+# on their receivables / SOA. This turns those 50kg lines into delivery-only
+# lines (gas ₱0, SRP kept for reference), the same as new sales, and lowers
+# the sale and its receivable. Stock is not touched. Sales that came from
+# 50kg Commercial Billing itself are never changed. A sale where the
+# customer already paid more than the new amount due is skipped and listed.
+
+def _commercial_soa_fix_plan(conn):
+    rows = conn.execute(
+        """SELECT s.*, c.name customer_name, c.account_no, c.category
+           FROM sales s JOIN customers c ON c.id = s.customer_id
+           WHERE s.sale_type='CREDIT' AND s.status='COMPLETED' AND s.is_opening_balance=0
+             AND LOWER(TRIM(COALESCE(c.category,''))) = ?
+             AND NOT EXISTS (SELECT 1 FROM commercial_deliveries cd WHERE cd.sale_id = s.id)
+           ORDER BY s.ts, s.id""", (COMMERCIAL_CATEGORY,)).fetchall()
+    plan, skipped = [], []
+    for s in rows:
+        items = conn.execute(
+            """SELECT si.*, p.sku, p.deposit_price cur_deposit_price FROM sale_items si
+               JOIN products p ON p.id = si.product_id
+               WHERE si.sale_id=? AND COALESCE(si.bill_later,0)=0""", (s["id"],)).fetchall()
+        changes = []
+        for it in items:
+            if not is_commercial_cylinder({"name": it["product_name"], "sku": it["sku"]}):
+                continue
+            extra = (it["swap_fee"] or 0) if it["sale_mode"] == "SWAP" else \
+                (it["cur_deposit_price"] or 0) if it["sale_mode"] == "DEPOSIT" else 0.0
+            extra = min(max(float(extra), 0.0), float(it["price"]))
+            gas = round(float(it["price"]) - extra, 2)
+            if gas <= 0:
+                continue
+            new_sub = round(extra * it["qty"], 2)
+            changes.append({"item_id": it["id"], "product_name": it["product_name"], "qty": it["qty"],
+                            "srp_price": gas, "new_price": round(extra, 2), "new_subtotal": new_sub,
+                            "removed": round(it["subtotal"] - new_sub, 2),
+                            "old_discount": it["discount_amount"] or 0})
+        if not changes:
+            continue
+        removed_sub = round(sum(c["removed"] for c in changes), 2)
+        removed_disc = round(sum(c["old_discount"] for c in changes), 2)
+        new_subtotal = round(s["subtotal"] - removed_sub, 2)
+        new_discount = round(max((s["discount"] or 0) - removed_disc, 0), 2)
+        new_total = round(new_subtotal - new_discount, 2)
+        new_wht = compute_withholding_tax(new_total) if (s["withholding_tax"] or 0) > 0 else 0.0
+        new_due = round(new_total - new_wht, 2)
+        paid = round(s["paid"] or 0, 2)
+        recv = conn.execute("SELECT * FROM receivables WHERE sale_id=?", (s["id"],)).fetchone()
+        entry = {
+            "sale_id": s["id"], "sale_no": s["sale_no"], "dr_no": s["dr_no"], "date": s["ts"],
+            "customer_id": s["customer_id"], "customer_name": s["customer_name"], "account_no": s["account_no"],
+            "invoice_no": recv["invoice_no"] if recv else None,
+            "old_total": s["total"], "new_total": new_total, "old_due": round(s["total"] - (s["withholding_tax"] or 0), 2),
+            "new_due": new_due, "paid": paid, "old_balance": s["balance"], "new_balance": round(new_due - paid, 2),
+            "lines": [{"product_name": c["product_name"], "qty": c["qty"], "srp_price": c["srp_price"]} for c in changes],
+            "_changes": changes, "_new": (new_subtotal, new_discount, new_total, new_wht), "_recv": recv,
+        }
+        if paid > new_due + 0.009:
+            entry["reason"] = (f"Already paid {paid:,.2f}, more than the new amount due {new_due:,.2f} — "
+                               "fix by hand (e.g. refund or apply to a billing)")
+            skipped.append(entry)
+        else:
+            plan.append(entry)
+    return plan, skipped
+
+
+def _public_fix_entry(e):
+    return {k: v for k, v in e.items() if not k.startswith("_")}
+
+
+@app.get("/api/admin/commercial-soa-fix")
+@roles_required("ADMIN")
+def commercial_soa_fix_preview():
+    conn = get_db()
+    plan, skipped = _commercial_soa_fix_plan(conn)
+    conn.close()
+    return jsonify(sales=[_public_fix_entry(e) for e in plan], skipped=[_public_fix_entry(e) for e in skipped],
+                   total_removed=round(sum(e["old_balance"] - e["new_balance"] for e in plan), 2))
+
+
+@app.post("/api/admin/commercial-soa-fix")
+@roles_required("ADMIN")
+def commercial_soa_fix_apply():
+    from db import DB_PATH
+    d = request.get_json(force=True) or {}
+    wanted = {int(x) for x in (d.get("sale_ids") or [])}
+    if not wanted:
+        return jsonify(error="No sales selected"), 400
+    backup_path = f"{DB_PATH}.before-commercial-soa-fix-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak"
+    try:
+        _backup_database(backup_path)
+    except Exception as e:
+        return jsonify(error=f"Could not save a backup first, nothing was changed: {e}"), 500
+    conn = get_db()
+    plan, _ = _commercial_soa_fix_plan(conn)
+    done = []
+    try:
+        for e in plan:
+            if e["sale_id"] not in wanted:
+                continue
+            for c in e["_changes"]:
+                conn.execute(
+                    """UPDATE sale_items SET bill_later=1, srp_price=?, price=?, subtotal=?, discount_id=NULL,
+                           discount_name=NULL, discount_amount=0 WHERE id=?""",
+                    (c["srp_price"], c["new_price"], c["new_subtotal"], c["item_id"]))
+            new_subtotal, new_discount, new_total, new_wht = e["_new"]
+            conn.execute("UPDATE sales SET subtotal=?, discount=?, total=?, withholding_tax=?, balance=? WHERE id=?",
+                         (new_subtotal, new_discount, new_total, new_wht, e["new_balance"], e["sale_id"]))
+            r = e["_recv"]
+            if r:
+                if e["new_due"] <= 0.009 and e["paid"] <= 0.009:
+                    conn.execute("DELETE FROM receivables WHERE id=?", (r["id"],))
+                else:
+                    conn.execute("UPDATE receivables SET amount=?, paid=?, balance=? WHERE id=?",
+                                 (e["new_due"], e["paid"], e["new_balance"], r["id"]))
+                    recompute_receivable_status(conn, r["id"])
+            audit(conn, "FIX", "SALES", e["sale_id"],
+                  f"Commercial SOA fix {e['sale_no']}: 50kg made delivery-only, total {e['old_total']} -> {e['new_total']}, "
+                  f"balance {e['old_balance']} -> {e['new_balance']}")
+            done.append(e["sale_no"])
+        conn.commit()
+    except Exception as ex:
+        conn.rollback(); conn.close()
+        return jsonify(error=f"Fix failed, nothing was changed: {ex}"), 500
+    conn.close()
+    return jsonify(ok=True, fixed=done, backup=os.path.basename(backup_path))
+
+
 # ---------------------------------------------------------------- end of day report
 # Per-attendant cash-up: everything they collected on a given day, totalled
 # by payment method (Cash, GCash, Bank Transfer, ...), split between POS
