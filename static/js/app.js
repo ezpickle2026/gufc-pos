@@ -891,6 +891,46 @@ window.viewSale = async (id) => {
   });
 };
 
+// One-time fix: old POS credit sales to Commercial accounts that charged the
+// 50kg SRP. Preview first, then apply to the ticked sales (Admin).
+async function openCommercialSoaFix() {
+  let data;
+  try { data = await api("/admin/commercial-soa-fix"); } catch (e) { return; }
+  const row = (e, tick) => `<tr>
+    <td>${tick ? `<input type="checkbox" class="cfxChk" value="${e.sale_id}" checked style="width:auto">` : ""}</td>
+    <td>${esc(e.date.slice(0, 10))}</td><td>${esc(e.sale_no)}${e.dr_no ? `<div style="font-size:11px;color:var(--muted)">${esc(e.dr_no)}</div>` : ""}</td>
+    <td>${esc(e.customer_name)} (${esc(e.account_no)})</td>
+    <td>${e.lines.map(l => `${l.qty} x ${esc(l.product_name)} @ ${money(l.srp_price)}`).join("<br>")}</td>
+    <td>${money(e.old_total)} &rarr; <b>${money(e.new_total)}</b></td>
+    <td>${money(e.old_balance)} &rarr; <b>${money(e.new_balance)}</b></td>
+    ${tick ? "" : `<td style="color:var(--danger);font-size:12px">${esc(e.reason)}</td>`}</tr>`;
+  openModal("Fix old Commercial SOA", `
+    <p style="font-size:13px;margin-top:0">Old <b>credit</b> sales to <b>Commercial</b> customers that charged the 50kg SRP. Applying turns those 50kg lines into
+      delivery-only lines (the DR stays, stock is not touched) and lowers the sale and its receivable, so the SOA shows only what was billed
+      in 50kg Commercial Billing. Other items on the sale stay charged. A backup of the database is saved first.</p>
+    ${data.sales.length ? `<div class="table-wrap" style="max-height:340px;overflow:auto"><table><thead><tr><th></th><th>Date</th><th>Sale / DR</th><th>Customer</th><th>50kg lines (SRP)</th><th>Total</th><th>Balance</th></tr></thead>
+      <tbody>${data.sales.map(e => row(e, true)).join("")}</tbody></table></div>
+      <p style="font-size:13px"><b>${data.sales.length}</b> sale(s), balance lowered by <b>${money(data.total_removed)}</b> in total.</p>`
+      : `<p style="color:var(--muted)">Nothing to fix — no old Commercial credit sales with a 50kg SRP charge.</p>`}
+    ${data.skipped.length ? `<h4 style="margin-bottom:4px">Skipped (fix by hand)</h4><div class="table-wrap"><table><thead><tr><th></th><th>Date</th><th>Sale / DR</th><th>Customer</th><th>50kg lines</th><th>Total</th><th>Balance</th><th>Why</th></tr></thead>
+      <tbody>${data.skipped.map(e => row(e, false)).join("")}</tbody></table></div>` : ""}
+    <div class="modal-actions"><button class="btn" onclick="closeModal()">Close</button>
+      ${data.sales.length ? `<button class="btn green" id="cfxApply">Apply fix to ticked sales</button>` : ""}</div>
+  `, () => {
+    const btn = document.getElementById("cfxApply");
+    if (!btn) return;
+    btn.addEventListener("click", async () => {
+      const ids = [...document.querySelectorAll(".cfxChk:checked")].map(x => parseInt(x.value));
+      if (!ids.length) { toast("Tick at least one sale", "error"); return; }
+      if (!confirm(`Remove the 50kg SRP charge from ${ids.length} sale(s)? A database backup is saved first.`)) return;
+      try {
+        const r = await api("/admin/commercial-soa-fix", { method: "POST", body: { sale_ids: ids } });
+        closeModal(); toast(`Fixed ${r.fixed.length} sale(s). Backup: ${r.backup}`, "success");
+      } catch (e) {}
+    });
+  });
+}
+
 // ================================================================== CUSTOMERS
 async function renderCustomers(c) {
   const isAdmin = isAdminLike();
@@ -903,6 +943,7 @@ async function renderCustomers(c) {
       <button class="btn" id="manageCatBtn">Manage Categories</button>
       <a class="btn" href="/api/customers/template">Download CSV Template</a>
       <button class="btn" id="importCustBtn">Import CSV</button>
+      <button class="btn" id="commercialFixBtn" title="Remove the 50kg SRP from old Commercial credit sales">Fix old Commercial SOA</button>
     ` : ""}
   </div><div id="custTable"></div>`;
 
@@ -1027,6 +1068,7 @@ async function renderCustomers(c) {
     });
 
     document.getElementById("manageCatBtn").addEventListener("click", openCategoryManager);
+    document.getElementById("commercialFixBtn").addEventListener("click", openCommercialSoaFix);
 
     document.getElementById("importCustBtn").addEventListener("click", () => {
       openModal("Import Customers from CSV", `
