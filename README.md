@@ -32,6 +32,43 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **New role: Operation Head** (`OPERATION_HEAD`). Same access as Admin to every screen
+  and module **except System Reset (Go Live)**, which stays Admin-only (menu hidden and
+  blocked on the server). Safety rails: only Admin can give out the ADMIN role or change /
+  disable / delete an Admin account, and only Admin or an Operation Head can give out the
+  OPERATION_HEAD role or change an Operation Head's account, so nobody can raise their own access.
+- **New role: Supervisor** (`SUPERVISOR`). Can **import stock from the supplier into any
+  location** (new **Import Stock** page under Inventory & Dispatch, with the list of past
+  imports). Also has Dashboard, Inventory, Staff Schedule and Incident Reports.
+- **Order Taker** can now **Dispatch** (transfers) and **Import Stock** too.
+- **Accounting** can now fully manage customers' **Portal Logins** (create, reset password,
+  disable, unlock, remove), same as Admin/Manager.
+- **Import Stock** is now its own module ("Import Stock from Supplier" in Manage Roles), given by
+  default to Dispatcher, Order Taker and Supervisor. The Dispatch page shows the import button
+  only to roles that have it.
+- **Sales Department** (new menu section): **Customer Growth** (moved here) and **Sales Targets**.
+  - **Set Targets**: for the overall business, a location, or a customer (MRTO & ERTO by
+    default; tick "Show all categories" for others). Pick a year and fill a grid of
+    **4 tiers x 12 months**, separately for **Domestic (11kg & 1.4kg)** and **Commercial (50kg)**.
+    Every month can have a different quantity (cylinders). "Fill blank months from January"
+    copies January's values forward. A blank cell means no target.
+  - **Achievement**: pick a month to see every target (overall, each location, each customer)
+    with actual cylinders vs Tier 1–4 (% of each), the tier reached, and how many more to the
+    next tier. Actual = cylinders on completed sales that month (voided excluded); Commercial also
+    counts 50kg commercial billings (cylinders delivered).
+  - Module "Sales Targets": Admin, Operation Head and Manager by default; grantable to other roles.
+- **50kg Commercial Billing — new DR billing type** (now the default). Bill right at delivery,
+  even if the 50kg serial numbers don't match: enter the DR No., the number of cylinders
+  delivered (and kg per cylinder, default from the product, e.g. 50), and the cylinders pulled
+  out with their gross and tare weight (or the residual kg directly).
+  **Billable kg = delivered x kg per cylinder − total residual of the pulled-out cylinders**,
+  at the product's price per kg (Admin, Operation Head, Manager and Accounting can type a different
+  rate). Saving creates the credit sale, invoice/receivable and a system DR number right away
+  (status BILLED) and offers to print the Delivery Receipt. Example: 10 x 50kg delivered = 500kg,
+  10 pulled out with 65kg residual in total → bill 435kg. WIWO and READING still work as before.
+  The billing does not move inventory, same as WIWO/READING.
+
+
 - **Customer Portal** (`/portal`). Customers log in with their own username and
   password to:
   - **Place orders**: pick products and quantities, see the estimated total, and confirm
@@ -395,6 +432,8 @@ network — use your machine's LAN IP instead of localhost).
 | mmadamba    | Attendant123!  | Attendant  | Madamba Warehouse    |
 | pdispatch   | Dispatch123!   | Dispatcher | Madamba Warehouse    |
 | aaccounting | Accounting123! | Accounting | (all locations)      |
+| opshead     | OpsHead123!    | Operation Head | all (everything except System Reset) |
+| supervisor  | Supervisor123! | Supervisor | Madamba Warehouse (imports stock to any location) |
 
 **Change these before any real use** — create new users from the Admin → Users
 screen and disable the seeded ones.
