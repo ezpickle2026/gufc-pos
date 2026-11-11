@@ -32,6 +32,19 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Commercial accounts: SOA shows only what was billed.** On a **Credit / Terms** POS sale
+  to a customer in the **Commercial** category, 50kg cylinders are **delivered only**: stock
+  moves, the empty comes back and the Delivery Receipt prints (marked "For billing"), but the
+  SRP is **not charged** — no receivable and nothing on the SOA / Account Ledger / Portal. The
+  customer is charged only through **50kg Commercial Billing** (DR, WIWO or Reading). Other
+  items on the same sale (e.g. 11kg) are charged normally; a cylinder deposit or swap fee on a
+  50kg line is still charged. Checkout shows the amount due without the 50kg SRP and a note.
+  Cash sales and non-Commercial customers are unchanged. These delivery lines are left out of
+  the Monthly kg report and Sales Targets so the 50kg isn't counted twice (the billing counts it).
+- **Delivery Receipt for Commercial accounts has no amounts.** For customers in the
+  **Commercial** category the DR shows only Qty, Unit and Description (plus total quantity) —
+  no unit price, amount, totals, amount paid or balance. Other customers' DRs are unchanged.
+
 - **New role: Operation Head** (`OPERATION_HEAD`). Same access as Admin to every screen
   and module **except System Reset (Go Live)**, which stays Admin-only (menu hidden and
   blocked on the server). Safety rails: only Admin can give out the ADMIN role or change /

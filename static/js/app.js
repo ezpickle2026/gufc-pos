@@ -554,8 +554,24 @@ function drawCart(locationId) {
 // compute_withholding_tax() on the server: (gross / 1.12) x 1%.
 function withholdingTax(gross) { return Math.round(gross / 1.12 * 0.01 * 100) / 100; }
 
+// Commercial accounts: 50kg cylinders on a CREDIT sale are delivered only —
+// the gas is charged later in 50kg Commercial Billing (mirrors the server).
+function is50kgName(name) { const m = /(\d+(?:\.\d+)?)\s*-?\s*kg\b/i.exec(name || ""); return !!m && Math.abs(parseFloat(m[1]) - 50) < 0.01; }
+function cartTotalsFor(commercialCredit) {
+  if (!commercialCredit) return { ...cartTotals(), deferred: 0 };
+  let subtotal = 0, discount = 0, deferred = 0;
+  state.cart.forEach(i => {
+    const prod = state.products.find(p => p.id === i.product_id) || {};
+    if (is50kgName(i.name) || is50kgName(prod.sku)) {
+      subtotal += (i.price - i.base_price) * i.qty;  // deposit / swap fee only
+      deferred += i.base_price * i.qty;
+    } else { subtotal += i.price * i.qty; discount += lineDiscount(i); }
+  });
+  return { subtotal, discount, total: Math.max(0, subtotal - discount), deferred };
+}
+
 async function openCheckout(locationId) {
-  const { total: gross } = cartTotals();
+  let gross = cartTotals().total;
   let total = gross;
   const customers = await api("/customers");
   const custOptions = `<option value="">-- Walk-in / no account --</option>` +
@@ -572,7 +588,8 @@ async function openCheckout(locationId) {
       <input type="checkbox" id="whtCheck" style="width:auto;margin:0"> Withholding tax (1%)</label>
       <div id="whtInfo" style="display:none;font-size:12.5px;color:var(--muted);margin-top:4px">
         Gross ${money(gross)} &divide; 1.12 = ${money(gross / 1.12)} &times; 1% = <b>&minus;${money(withholdingTax(gross))}</b></div></div>
-    <div class="field"><label>Total Due</label><div style="font-size:20px;font-weight:800" id="totalDue">${money(total)}</div></div>
+    <div class="field"><label>Total Due</label><div style="font-size:20px;font-weight:800" id="totalDue">${money(total)}</div>
+      <div id="commercialNote" style="display:none;font-size:12.5px;color:var(--muted);margin-top:4px"></div></div>
     <div class="field">
       <label>Payments (split payments supported)</label>
       <div id="payRows"></div>
@@ -611,18 +628,32 @@ async function openCheckout(locationId) {
     custSelect.addEventListener("change", () => {
       document.getElementById("walkinNameField").style.display = custSelect.value ? "none" : "";
     });
-    document.getElementById("whtCheck").addEventListener("change", (e) => {
+    function refreshTotal() {
       const prev = total;
-      total = e.target.checked ? Math.round((gross - withholdingTax(gross)) * 100) / 100 : gross;
-      document.getElementById("whtInfo").style.display = e.target.checked ? "" : "none";
+      const cust = customers.find(cu => String(cu.id) === custSelect.value);
+      const commercialCredit = document.getElementById("saleType").value === "CREDIT" && cust
+        && (cust.category || "").trim().toLowerCase() === "commercial";
+      const t = cartTotalsFor(commercialCredit);
+      gross = t.total;
+      const wht = document.getElementById("whtCheck").checked;
+      total = wht ? Math.round((gross - withholdingTax(gross)) * 100) / 100 : gross;
+      document.getElementById("whtInfo").innerHTML =
+        `Gross ${money(gross)} &divide; 1.12 = ${money(gross / 1.12)} &times; 1% = <b>&minus;${money(withholdingTax(gross))}</b>`;
+      document.getElementById("whtInfo").style.display = wht ? "" : "none";
       document.getElementById("totalDue").textContent = money(total);
+      const note = document.getElementById("commercialNote");
+      note.style.display = t.deferred > 0 ? "" : "none";
+      note.innerHTML = t.deferred > 0 ? `Commercial account: the 50kg cylinders (SRP ${money(t.deferred)}) are <b>delivered only</b> — not charged here and not on the SOA. Bill them in 50kg Commercial Billing.` : "";
       // keep a single full-payment row in step with the new amount due
       const amts = payRows.querySelectorAll(".payAmount");
       if (amts.length === 1 && Math.abs((parseFloat(amts[0].value) || 0) - prev) < 0.005) amts[0].value = total;
       recalc();
-    });
+    }
+    document.getElementById("whtCheck").addEventListener("change", refreshTotal);
+    custSelect.addEventListener("change", refreshTotal);
     document.getElementById("saleType").addEventListener("change", (e) => {
       if (e.target.value === "CASH" && payRows.children.length === 0) addRow(total);
+      refreshTotal();
     });
     addRow(total); // default: single cash payment for full total
 
@@ -690,17 +721,23 @@ function printDeliveryReceipt(result) {
   const fmtDate = v => v ? new Date(v.replace(" ", "T")).toLocaleDateString("en-PH", { year: "numeric", month: "long", day: "numeric" }) : "";
   const terms = sale.customer_terms_days ? `${sale.customer_terms_days} days` : "Credit";
   const minRows = 6;
+  // Commercial accounts: the DR shows quantities only, no prices or amounts —
+  // they're charged through 50kg Commercial Billing.
+  const noAmounts = (sale.customer_category || "").trim().toLowerCase() === "commercial";
   const lineRows = items.map(i => {
     const notes = [];
     if (i.sale_mode === "REFILL") notes.push("Refill — empty returned");
     if (i.sale_mode === "DEPOSIT") notes.push("With cylinder deposit");
-    if (i.sale_mode === "SWAP") notes.push(`Swap from ${esc(i.swap_brand || "")}${i.swap_fee > 0 ? `, fee ${money(i.swap_fee)}/cyl` : ""}`);
-    if (i.discount_amount > 0) notes.push(`Less ${esc(i.discount_name || "discount")}: −${money(i.discount_amount)}`);
+    if (i.sale_mode === "SWAP") notes.push(`Swap from ${esc(i.swap_brand || "")}${i.swap_fee > 0 && !noAmounts ? `, fee ${money(i.swap_fee)}/cyl` : ""}`);
+    if (i.discount_amount > 0 && !noAmounts) notes.push(`Less ${esc(i.discount_name || "discount")}: −${money(i.discount_amount)}`);
+    if (i.bill_later && !noAmounts) notes.push("Gas billed separately (commercial billing)");
+    const priceCell = i.bill_later && !i.price ? "For billing" : money(i.price);
+    const amtCell = i.bill_later && !i.subtotal ? "—" : money(i.subtotal - (i.discount_amount || 0));
     return `<tr><td class="c">${i.qty}</td><td class="c">cyl</td>
       <td>${esc(i.product_name)}${notes.length ? `<div class="sub">${notes.join(" · ")}</div>` : ""}</td>
-      <td class="r">${money(i.price)}</td><td class="r">${money(i.subtotal - (i.discount_amount || 0))}</td></tr>`;
+      ${noAmounts ? "" : `<td class="r">${priceCell}</td><td class="r">${amtCell}</td>`}</tr>`;
   });
-  while (lineRows.length < minRows) lineRows.push(`<tr class="blank"><td></td><td></td><td></td><td></td><td></td></tr>`);
+  while (lineRows.length < minRows) lineRows.push(`<tr class="blank"><td></td><td></td><td></td>${noAmounts ? "" : "<td></td><td></td>"}</tr>`);
   const totalQty = items.reduce((a, i) => a + i.qty, 0);
   const voided = sale.status === "VOIDED";
 
@@ -731,16 +768,16 @@ function printDeliveryReceipt(result) {
           <td class="k">Ref.</td><td class="v">${esc(sale.sale_no)}${sale.invoice_no ? ` / ${esc(sale.invoice_no)}` : ""}</td></tr>
     </table>
     <table class="items">
-      <thead><tr><th style="width:44px">Qty</th><th style="width:40px">Unit</th><th>Description</th><th style="width:84px">Unit Price</th><th style="width:94px">Amount</th></tr></thead>
+      <thead><tr><th style="width:44px">Qty</th><th style="width:40px">Unit</th><th>Description</th>${noAmounts ? "" : `<th style="width:84px">Unit Price</th><th style="width:94px">Amount</th>`}</tr></thead>
       <tbody>${lineRows.join("")}</tbody>
-      <tfoot>
+      ${noAmounts ? `<tfoot><tr><td class="c"><b>${totalQty}</b></td><td colspan="2">Total quantity</td></tr></tfoot>` : `<tfoot>
         <tr><td class="c"><b>${totalQty}</b></td><td colspan="3" class="r">Total amount</td><td class="r"><b>${money(sale.total)}</b></td></tr>
         ${sale.withholding_tax > 0 ? `<tr><td colspan="4" class="r">Less: 1% withholding tax</td><td class="r">${money(sale.withholding_tax)}</td></tr>` : ""}
         <tr><td colspan="4" class="r">Less: amount paid</td><td class="r">${money(sale.paid)}</td></tr>
         <tr class="due"><td colspan="4" class="r">Balance charged to account</td><td class="r">${money(sale.balance)}</td></tr>
-      </tfoot>
+      </tfoot>`}
     </table>
-    <div class="note">Received the above items in good order and condition. Payment is due on or before the due date stated above.</div>
+    <div class="note">Received the above items in good order and condition.${noAmounts ? "" : " Payment is due on or before the due date stated above."}</div>
     <table class="sig"><tr>
       <td><div class="line">${esc(sale.cashier_name || "")}</div>Prepared by</td>
       <td><div class="line">&nbsp;</div>Delivered by (driver / plate no.)</td>

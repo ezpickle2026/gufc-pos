@@ -843,6 +843,15 @@ def migrate_schema():
         conn.execute("PRAGMA foreign_keys = ON")
         conn.commit()
 
+    # 18. Commercial accounts: 50kg lines on a POS credit sale are delivered
+    #     only (billed later in 50kg Commercial Billing). Flag + the SRP at
+    #     the time, for reference.
+    if not _column_exists(conn, "sale_items", "bill_later"):
+        conn.execute("ALTER TABLE sale_items ADD COLUMN bill_later INTEGER NOT NULL DEFAULT 0")
+    if not _column_exists(conn, "sale_items", "srp_price"):
+        conn.execute("ALTER TABLE sale_items ADD COLUMN srp_price REAL")
+    conn.commit()
+
     # 17. Supervisor can view and void sales: give the built-in SUPERVISOR
     #     role the Sales module. Runs once.
     MIGRATION_KEY = "supervisor_sales_void"
