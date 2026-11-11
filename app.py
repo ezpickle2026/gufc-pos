@@ -96,6 +96,20 @@ def next_number(conn, prefix, table, col):
     return f"{prefix}-{today}-{seq:04d}"
 
 
+COMMERCIAL_CATEGORY = "commercial"
+
+
+def is_commercial_account(customer):
+    """Customers in the "Commercial" category are charged for 50kg through
+    50kg Commercial Billing, not at SRP on the POS credit sale."""
+    return (customer["category"] or "").strip().lower() == COMMERCIAL_CATEGORY
+
+
+def is_commercial_cylinder(prod):
+    size = product_kg_size(prod["name"], prod["sku"])
+    return size is not None and abs(size - 50.0) < 0.01
+
+
 def login_required(fn):
     @functools.wraps(fn)
     def wrapper(*a, **kw):
@@ -816,6 +830,10 @@ def build_customer_ledger(conn, cid, date_from=None, date_to=None):
         if s["is_opening_balance"]:
             events.append({"date": s["ts"], "type": "PREVIOUS ARREARS", "ref": s["invoice_no"] or s["sale_no"],
                            "debit": s["total"], "credit": 0, "opening": True})
+        elif abs(s["total"] or 0) < 0.005:
+            # Nothing charged (e.g. a Commercial account's 50kg delivery,
+            # billed separately) — keep it off the SOA.
+            continue
         else:
             events.append({"date": s["ts"], "type": "SALE", "ref": s["sale_no"], "debit": s["total"], "credit": 0})
     for p in payments:
@@ -2509,6 +2527,14 @@ def create_sale():
 
     conn = get_db()
     try:
+        customer = None
+        if customer_id:
+            customer = conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+        # Commercial accounts: 50kg cylinders on a credit sale are only
+        # delivered here (stock moves, DR prints); the customer is charged
+        # later through 50kg Commercial Billing, so the SRP never hits their
+        # receivables / SOA.
+        commercial_delivery = bool(sale_type == "CREDIT" and customer and is_commercial_account(customer))
         subtotal = 0.0
         resolved_items = []
         for it in items:
@@ -2526,6 +2552,10 @@ def create_sale():
             # SWAP adds a per-cylinder swap fee (customer hands over an empty
             # of another brand in exchange).
             gas_price = float(prod["price"])
+            bill_later = commercial_delivery and is_commercial_cylinder(prod)
+            srp_price = gas_price if bill_later else None
+            if bill_later:
+                gas_price = 0.0  # charged later in 50kg Commercial Billing
             price = gas_price
             swap_brand, swap_fee = None, 0.0
             if sale_mode == "DEPOSIT":
@@ -2545,14 +2575,14 @@ def create_sale():
             subtotal += line_total
             # optional per-item discount, recomputed server-side
             disc_id, disc_name, disc_amount = None, None, 0.0
-            if it.get("discount_id"):
+            if it.get("discount_id") and not bill_later:
                 disc = conn.execute("SELECT * FROM discounts WHERE id=?", (it["discount_id"],)).fetchone()
                 if not disc:
                     raise ValueError("Selected discount no longer exists")
                 disc_amount = compute_item_discount(disc, prod["id"], gas_price, qty)
                 disc_id, disc_name = disc["id"], disc["name"]
             resolved_items.append((prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
-                                   swap_brand, swap_fee))
+                                   swap_brand, swap_fee, bill_later, srp_price))
 
         subtotal = round(subtotal, 2)
         discount = round(sum(r[7] for r in resolved_items), 2)
@@ -2569,10 +2599,11 @@ def create_sale():
         if sale_type == "CASH" and paid_total < amount_due:
             raise ValueError("Cash sale payments do not cover the total. Use CREDIT for partial payment.")
 
+        if any(r[10] for r in resolved_items) and paid_total > amount_due + 0.009:
+            raise ValueError(f"Payment is more than the amount due ({amount_due:.2f}). The 50kg cylinders for a "
+                             "Commercial account are charged later in 50kg Commercial Billing, not here.")
+
         # credit sale: check customer terms + credit limit
-        customer = None
-        if customer_id:
-            customer = conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
         if sale_type == "CREDIT":
             if not customer:
                 raise ValueError("Credit sale requires a customer with approved terms")
@@ -2601,12 +2632,13 @@ def create_sale():
         sale_id = cur.lastrowid
 
         for (prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
-             swap_brand, swap_fee) in resolved_items:
+             swap_brand, swap_fee, bill_later, srp_price) in resolved_items:
             conn.execute(
                 """INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode,
-                   discount_id, discount_name, discount_amount, swap_brand, swap_fee) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   discount_id, discount_name, discount_amount, swap_brand, swap_fee, bill_later, srp_price)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (sale_id, prod["id"], prod["name"], qty, price, line_total, sale_mode,
-                 disc_id, disc_name, disc_amount, swap_brand, swap_fee),
+                 disc_id, disc_name, disc_amount, swap_brand, swap_fee, 1 if bill_later else 0, srp_price),
             )
             mode_note = f"SWAP from {swap_brand}" if sale_mode == "SWAP" else sale_mode
             adjust_inventory(conn, location_id, prod["id"], -qty, "SALE", sale_no,
@@ -3755,8 +3787,10 @@ def _build_customer_kg_report(conn, month_from=None, month_to=None, location_id=
     ly, lm = map(int, months[-1].split("-"))
     last_day = (datetime(ly + (lm == 12), 1 if lm == 12 else lm + 1, 1).date() - timedelta(days=1)).isoformat()
 
-    where = ["s.status='COMPLETED'", "s.is_opening_balance=0", "si.qty > 0", LPG_CYLINDER_SQL,
-             "date(s.ts) BETWEEN date(?) AND date(?)"]
+    # bill_later lines (Commercial 50kg deliveries) are counted through
+    # their 50kg Commercial Billing instead, so they aren't counted twice.
+    where = ["s.status='COMPLETED'", "s.is_opening_balance=0", "si.qty > 0", "COALESCE(si.bill_later,0)=0",
+             LPG_CYLINDER_SQL, "date(s.ts) BETWEEN date(?) AND date(?)"]
     params = [first_day, last_day]
     if location_id:
         where.append("s.location_id=?"); params.append(location_id)
@@ -3917,8 +3951,8 @@ def _target_actuals(conn, month_from, month_to):
                    (SELECT COUNT(*) FROM commercial_delivery_cylinders x WHERE x.delivery_id=cd.id) wiwo_cyls
             FROM sale_items si JOIN sales s ON s.id=si.sale_id JOIN products p ON p.id=si.product_id
             LEFT JOIN commercial_deliveries cd ON cd.sale_id=s.id
-            WHERE s.status='COMPLETED' AND s.is_opening_balance=0 AND si.qty > 0 AND {LPG_CYLINDER_SQL}
-                  AND date(s.ts) BETWEEN date(?) AND date(?)""",
+            WHERE s.status='COMPLETED' AND s.is_opening_balance=0 AND si.qty > 0 AND COALESCE(si.bill_later,0)=0
+                  AND {LPG_CYLINDER_SQL} AND date(s.ts) BETWEEN date(?) AND date(?)""",
         (first_day, last_day),
     ).fetchall()
     out = {}
