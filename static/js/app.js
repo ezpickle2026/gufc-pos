@@ -807,7 +807,7 @@ async function renderSales(c) {
       <td style="display:flex;gap:6px">
         <button class="btn small" onclick="viewSale(${s.id})">View</button>
         ${s.sale_type === 'CREDIT' ? `<button class="btn small green" onclick="printSaleDR(${s.id})" title="Print Delivery Receipt">DR</button>` : ""}
-        ${isAdminLike() && s.status !== 'VOIDED' ? `<button class="btn small danger" onclick="voidSale(${s.id})">Void</button>` : ""}
+        ${(isAdminLike() || state.user.role === 'SUPERVISOR') && s.status !== 'VOIDED' ? `<button class="btn small danger" onclick="voidSale(${s.id})">Void</button>` : ""}
       </td>
     </tr>`).join("")}
   </tbody></table></div>`;

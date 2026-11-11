@@ -2690,7 +2690,8 @@ def list_sales():
               FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u2 ON u2.id=s.user_id
               LEFT JOIN customers c ON c.id=s.customer_id WHERE s.is_opening_balance=0"""
     params = []
-    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "ACCOUNTING"):
+    # Supervisor sees (and can void) sales at every location.
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "ACCOUNTING", "SUPERVISOR"):
         sql += " AND s.location_id=?"
         params.append(u["location_id"])
     sql += " ORDER BY s.ts DESC LIMIT 100"
@@ -2706,7 +2707,7 @@ def get_sale(sale_id):
 
 
 @app.post("/api/sales/<int:sale_id>/void")
-@roles_required("ADMIN")
+@roles_required("ADMIN", "SUPERVISOR")
 def void_sale(sale_id):
     conn = get_db()
     sale = conn.execute("SELECT * FROM sales WHERE id=?", (sale_id,)).fetchone()
