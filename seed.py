@@ -55,6 +55,8 @@ def run():
         ("mmadamba", "Attendant123!", "Mario Madamba", "ATTENDANT", loc["Madamba Warehouse"]),
         ("pdispatch", "Dispatch123!", "Pedro Reyes", "DISPATCHER", loc["Madamba Warehouse"]),
         ("aaccounting", "Accounting123!", "Ana Cruz", "ACCOUNTING", None),
+        ("opshead", "OpsHead123!", "Oscar Santos", "OPERATION_HEAD", None),
+        ("supervisor", "Supervisor123!", "Sofia Ramos", "SUPERVISOR", loc["Madamba Warehouse"]),
     ]
     for uname, pw, name, role, lid in users:
         conn.execute(

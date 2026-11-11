@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, session, send_from_directory, Response, g
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from db import get_db, init_db, close_request_connections
+from db import get_db, init_db, close_request_connections, ADMIN_LIKE_ROLES
 from reports import (xlsx_response, pdf_table_response, soa_pdf_response, commercial_billing_pdf, eod_pdf_response,
                      eod_xlsx_response, swapped_pdf_response, swapped_xlsx_response,
                      customer_growth_pdf_response, customer_growth_xlsx_response,
@@ -105,7 +105,34 @@ def login_required(fn):
     return wrapper
 
 
+def is_admin_like(role):
+    """ADMIN and OPERATION_HEAD. Operation Head has Admin-level access to
+    everything except the System Reset (Go Live), which uses admin_only."""
+    return role in ADMIN_LIKE_ROLES
+
+
+def _with_operation_head(roles):
+    """Any route open to ADMIN is open to OPERATION_HEAD too."""
+    roles = tuple(roles)
+    if "ADMIN" in roles and "OPERATION_HEAD" not in roles:
+        roles += ("OPERATION_HEAD",)
+    return roles
+
+
+def admin_only(fn):
+    """Strictly the ADMIN role — not Operation Head. Used for System Reset."""
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        if "user" not in session:
+            return jsonify(error="Not authenticated"), 401
+        if session["user"]["role"] != "ADMIN":
+            return jsonify(error="Forbidden: only the Admin account can do this"), 403
+        return fn(*a, **kw)
+    return wrapper
+
+
 def roles_required(*roles):
+    roles = _with_operation_head(roles)
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*a, **kw):
@@ -121,7 +148,7 @@ def roles_required(*roles):
 def has_module_access(conn, role, module_key):
     """ADMIN always has every module. Everyone else is governed by the
     role_permissions table, which Admin/Manager can edit per role."""
-    if role == "ADMIN":
+    if is_admin_like(role):
         return True
     row = conn.execute(
         "SELECT 1 FROM role_permissions WHERE role_name=? AND module_key=?", (role, module_key)
@@ -135,6 +162,7 @@ def roles_or_module_required(*roles, module=None):
     been granted `module` access via the custom role/permission system. This
     is what lets a custom role (e.g. a Manager-created 'Junior Cashier' role)
     meaningfully use a module rather than just seeing it in the sidebar."""
+    roles = _with_operation_head(roles)
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*a, **kw):
@@ -155,7 +183,7 @@ def roles_or_module_required(*roles, module=None):
 
 
 def get_permitted_modules(conn, role):
-    if role == "ADMIN":
+    if is_admin_like(role):
         from db import MODULE_KEYS
         return MODULE_KEYS
     rows = conn.execute("SELECT module_key FROM role_permissions WHERE role_name=?", (role,)).fetchall()
@@ -164,7 +192,7 @@ def get_permitted_modules(conn, role):
 
 # Roles that see receivables (and sales) across every location rather than
 # just their own assigned branch.
-ALL_LOCATION_FINANCE_ROLES = ("ADMIN", "MANAGER", "ACCOUNTING")
+ALL_LOCATION_FINANCE_ROLES = ("ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING")
 
 
 def can_view_receivables_summary(conn, role):
@@ -177,7 +205,7 @@ def can_view_receivables_summary(conn, role):
 def location_scope(row_location_id):
     """Non-admin users may only touch their own assigned location."""
     u = session["user"]
-    if u["role"] == "ADMIN":
+    if is_admin_like(u["role"]):
         return True
     return u["location_id"] == row_location_id
 
@@ -288,7 +316,7 @@ def delete_role(name):
 def get_role_permissions(name):
     from db import MODULE_KEYS
     conn = get_db()
-    if name == "ADMIN":
+    if is_admin_like(name):
         conn.close()
         return jsonify(module_keys=MODULE_KEYS, all_modules=MODULE_KEYS, locked=True)
     rows = conn.execute("SELECT module_key FROM role_permissions WHERE role_name=?", (name,)).fetchall()
@@ -300,8 +328,8 @@ def get_role_permissions(name):
 @roles_required("ADMIN", "MANAGER")
 def set_role_permissions(name):
     from db import MODULE_KEYS
-    if name == "ADMIN":
-        return jsonify(error="Admin always has full access and can't be restricted"), 400
+    if is_admin_like(name):
+        return jsonify(error=f"{name} always has full access and can't be restricted"), 400
     d = request.get_json(force=True)
     modules = [m for m in (d.get("module_keys") or []) if m in MODULE_KEYS]
     conn = get_db()
@@ -871,7 +899,7 @@ def list_booked_orders():
         # customer-submitted order that still needs a location assigned.
         sql += " AND (bo.created_by=? OR bo.showroom_location_id IS NULL)"
         params.append(u["id"])
-    elif u["role"] not in ("ADMIN", "MANAGER"):
+    elif u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
         sql += " AND bo.showroom_location_id=?"
         params.append(u["location_id"])
     sql += " ORDER BY bo.order_date DESC"
@@ -925,7 +953,7 @@ def update_booked_order(oid):
         return jsonify(error="Not found"), 404
 
     new_status = d.get("status", order["status"])
-    if u["role"] not in ("ADMIN", "MANAGER", "ORDER_TAKER"):
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER", "ORDER_TAKER"):
         # Attendants: can only mark orders at their own showroom as fulfilled.
         if order["showroom_location_id"] != u["location_id"]:
             conn.close()
@@ -1100,7 +1128,7 @@ def _portal_profile(conn, cust):
 # ---- staff side: create / reset / disable a customer's portal login
 
 @app.get("/api/customers/<int:cid>/portal-account")
-@roles_required("ADMIN", "MANAGER")
+@roles_required("ADMIN", "MANAGER", "ACCOUNTING")
 def get_portal_account(cid):
     conn = get_db()
     cust = conn.execute("SELECT id, account_no, name FROM customers WHERE id=?", (cid,)).fetchone()
@@ -1117,7 +1145,7 @@ def get_portal_account(cid):
 
 
 @app.post("/api/customers/<int:cid>/portal-account")
-@roles_required("ADMIN", "MANAGER")
+@roles_required("ADMIN", "MANAGER", "ACCOUNTING")
 def save_portal_account(cid):
     d = request.get_json(force=True) or {}
     username = (d.get("username") or "").strip().lower()
@@ -1163,7 +1191,7 @@ def save_portal_account(cid):
 
 
 @app.delete("/api/customers/<int:cid>/portal-account")
-@roles_required("ADMIN", "MANAGER")
+@roles_required("ADMIN", "MANAGER", "ACCOUNTING")
 def delete_portal_account(cid):
     conn = get_db()
     cur = conn.execute("DELETE FROM customer_accounts WHERE customer_id=?", (cid,))
@@ -1482,7 +1510,7 @@ EXTENSION_MIMETYPES = {
 
 
 def _can_view_incident(u, report_row):
-    if u["role"] in ("ADMIN", "MANAGER"):
+    if u["role"] in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
         return True
     return report_row["location_id"] == u["location_id"] or report_row["reported_by"] == u["id"]
 
@@ -1498,7 +1526,7 @@ def list_incident_reports():
               LEFT JOIN users reporter ON reporter.id=ir.reported_by
               LEFT JOIN users resolver ON resolver.id=ir.resolved_by WHERE 1=1"""
     params = []
-    if u["role"] not in ("ADMIN", "MANAGER"):
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
         sql += " AND (ir.location_id=? OR ir.reported_by=?)"
         params += [u["location_id"], u["id"]]
     sql += " ORDER BY ir.ts DESC"
@@ -1515,7 +1543,7 @@ def create_incident_report():
     description = (d.get("description") or "").strip()
     if not description:
         return jsonify(error="Description is required"), 400
-    location_id = d.get("location_id") if u["role"] in ("ADMIN", "MANAGER") else u["location_id"]
+    location_id = d.get("location_id") if u["role"] in ("ADMIN", "OPERATION_HEAD", "MANAGER") else u["location_id"]
     conn = get_db()
     report_no = next_number(conn, "INC", "incident_reports", "report_no")
     cur = conn.execute(
@@ -1596,7 +1624,7 @@ def upload_incident_attachments(iid):
         conn.close()
         return jsonify(error="Not found"), 404
     # Only the person who filed it, or Admin/Manager, can attach evidence to it.
-    if u["role"] not in ("ADMIN", "MANAGER") and report["reported_by"] != u["id"]:
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER") and report["reported_by"] != u["id"]:
         conn.close()
         return jsonify(error="Forbidden: only the reporter or Admin/Manager can add attachments"), 403
 
@@ -1685,9 +1713,9 @@ def delete_incident_attachment(aid):
 def get_inventory():
     location_id = request.args.get("location_id", type=int)
     u = session["user"]
-    if u["role"] != "ADMIN" and location_id and location_id != u["location_id"]:
+    if not is_admin_like(u["role"]) and location_id and location_id != u["location_id"]:
         return jsonify(error="Forbidden: not your location"), 403
-    if not location_id and u["role"] != "ADMIN":
+    if not location_id and not is_admin_like(u["role"]):
         location_id = u["location_id"]
 
     conn = get_db()
@@ -1737,9 +1765,9 @@ def inventory_movements():
 def get_empty_cylinders():
     u = session["user"]
     location_id = request.args.get("location_id", type=int)
-    if u["role"] not in ("ADMIN", "MANAGER") and location_id and location_id != u["location_id"]:
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER") and location_id and location_id != u["location_id"]:
         return jsonify(error="Forbidden: not your location"), 403
-    if not location_id and u["role"] not in ("ADMIN", "MANAGER"):
+    if not location_id and u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
         location_id = u["location_id"]
     conn = get_db()
     sql = """SELECT l.name location_name, l.id location_id, p.name product_name, p.id product_id,
@@ -1762,9 +1790,9 @@ def get_swapped_empties():
     """Other-brand empties taken in on swap sales, per location / brand / size."""
     u = session["user"]
     location_id = request.args.get("location_id", type=int)
-    if u["role"] not in ("ADMIN", "MANAGER") and location_id and location_id != u["location_id"]:
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER") and location_id and location_id != u["location_id"]:
         return jsonify(error="Forbidden: not your location"), 403
-    if not location_id and u["role"] not in ("ADMIN", "MANAGER"):
+    if not location_id and u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
         location_id = u["location_id"]
     conn = get_db()
     sql = """SELECT l.name location_name, l.id location_id, p.name product_name, p.id product_id,
@@ -1873,8 +1901,28 @@ def adjust_empty_cylinders():
     return jsonify(ok=True)
 
 
+@app.get("/api/inventory/inbound")
+@roles_or_module_required("ADMIN", "DISPATCHER", module="stock_import")
+def list_inbound_stock():
+    """Recent stock imports from suppliers, all locations."""
+    location_id = request.args.get("location_id", type=int)
+    conn = get_db()
+    sql = """SELECT m.id, m.ts, m.qty_change qty, m.reference, m.notes, p.name product_name, l.name location_name,
+                    u.name user_name
+             FROM inventory_movements m JOIN products p ON p.id=m.product_id
+             JOIN locations l ON l.id=m.location_id LEFT JOIN users u ON u.id=m.user_id
+             WHERE m.type='INBOUND'"""
+    params = []
+    if location_id:
+        sql += " AND m.location_id=?"; params.append(location_id)
+    sql += " ORDER BY m.ts DESC, m.id DESC LIMIT 200"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
 @app.post("/api/inventory/inbound")
-@roles_required("ADMIN", "DISPATCHER")
+@roles_or_module_required("ADMIN", "DISPATCHER", module="stock_import")
 def record_inbound_stock():
     """Import stock received from a supplier/plant into a location."""
     d = request.get_json(force=True)
@@ -1895,6 +1943,10 @@ def record_inbound_stock():
         return jsonify(error="Supplier name is required"), 400
 
     conn = get_db()
+    problem = _check_location_product(conn, location_id, product_id)
+    if problem:
+        conn.close()
+        return jsonify(error=problem), 400
     ref = reference or f"SUPPLIER-{supplier}"
     adjust_inventory(conn, location_id, product_id, qty, "INBOUND", ref,
                       notes=f"Received from {supplier}" + (f" (ref: {reference})" if reference else ""))
@@ -1926,7 +1978,7 @@ def return_cylinder_deposit():
     product_id = d.get("product_id")
     qty = d.get("qty")
     u = session["user"]
-    location_id = u["location_id"] if u["role"] != "ADMIN" else d.get("location_id")
+    location_id = u["location_id"] if not is_admin_like(u["role"]) else d.get("location_id")
     if not customer_id or not product_id or not qty or not location_id:
         return jsonify(error="customer_id, product_id, qty and location_id are required"), 400
     try:
@@ -2245,7 +2297,7 @@ def delete_discount(did):
 # Child tables first so foreign keys never block a delete.
 RESET_TRANSACTION_TABLES = [
     "payments", "receivables", "sale_items",
-    "commercial_delivery_cylinders", "commercial_deliveries",
+    "commercial_delivery_cylinders", "commercial_pullouts", "commercial_deliveries",
     "sales",
     "inventory_movements", "empty_cylinder_movements", "swapped_empty_movements", "cylinder_deposits",
     "transfer_items", "transfers",
@@ -2299,7 +2351,7 @@ def _backup_database(dest_path):
 
 
 @app.get("/api/admin/reset-summary")
-@roles_required("ADMIN")
+@admin_only
 def reset_summary():
     conn = get_db()
     counts = _reset_counts(conn)
@@ -2308,7 +2360,7 @@ def reset_summary():
 
 
 @app.get("/api/admin/backup")
-@roles_required("ADMIN")
+@admin_only
 def download_backup():
     import tempfile
     fd, tmp = tempfile.mkstemp(suffix=".db")
@@ -2325,7 +2377,7 @@ def download_backup():
 
 
 @app.post("/api/admin/reset")
-@roles_required("ADMIN")
+@admin_only
 def system_reset():
     from db import DB_PATH
     d = request.get_json(force=True) or {}
@@ -2441,7 +2493,7 @@ def system_reset():
 def create_sale():
     d = request.get_json(force=True)
     u = session["user"]
-    location_id = u["location_id"] if u["role"] != "ADMIN" else d.get("location_id")
+    location_id = u["location_id"] if not is_admin_like(u["role"]) else d.get("location_id")
     if not location_id:
         return jsonify(error="No location specified"), 400
 
@@ -2638,7 +2690,7 @@ def list_sales():
               FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u2 ON u2.id=s.user_id
               LEFT JOIN customers c ON c.id=s.customer_id WHERE s.is_opening_balance=0"""
     params = []
-    if u["role"] not in ("ADMIN", "ACCOUNTING"):
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "ACCOUNTING"):
         sql += " AND s.location_id=?"
         params.append(u["location_id"])
     sql += " ORDER BY s.ts DESC LIMIT 100"
@@ -2866,7 +2918,7 @@ def pay_receivable(rid):
 # sales totals/reports (it isn't a sale made in this system), and on the SOA
 # it rolls into the Beginning Balance instead of showing as a charge.
 
-ARREARS_ROLES = ("ADMIN", "ACCOUNTING")
+ARREARS_ROLES = ("ADMIN", "OPERATION_HEAD", "ACCOUNTING")
 
 
 def _parse_date(value, field):
@@ -3187,7 +3239,7 @@ def dashboard():
     if date_to:
         pay_sql += " AND date(p.ts) <= date(?)"
         pay_params.append(date_to)
-    if u["role"] not in ("ADMIN", "MANAGER"):
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
         pay_sql += " AND s.location_id=?"
         pay_params.append(u["location_id"])
     pay_sql += " GROUP BY p.method ORDER BY total DESC"
@@ -3826,13 +3878,243 @@ def export_customer_kg():
     return customer_kg_xlsx_response(data, subtitle, f"customer-monthly-kg-{stamp}.xlsx")
 
 
+# ---------------------------------------------------------------- sales department: targets
+# Monthly cylinder targets in 4 tiers, set separately for Domestic (11kg and
+# 1.4kg) and Commercial (50kg), for the whole business (OVERALL), per
+# location, or per customer (normally MRTO / ERTO accounts). Actuals are
+# cylinders on completed, non-voided sales in that month:
+#   Domestic   = 11kg and 1.4kg cylinder lines (qty)
+#   Commercial = 50kg cylinder lines, plus 50kg commercial billings, counted
+#                as cylinders delivered (DR), cylinders weighed (WIWO) or
+#                kg / 50 (meter reading)
+
+TARGET_SCOPES = ("OVERALL", "LOCATION", "CUSTOMER")
+TARGET_SEGMENTS = ("DOMESTIC", "COMMERCIAL")
+TARGET_TIERS = (1, 2, 3, 4)
+DOMESTIC_SIZES = (11.0, 1.4)
+COMMERCIAL_SIZES = (50.0,)
+
+
+def _target_segment(size):
+    if size is None:
+        return None
+    if any(abs(size - s) < 0.01 for s in DOMESTIC_SIZES):
+        return "DOMESTIC"
+    if any(abs(size - s) < 0.01 for s in COMMERCIAL_SIZES):
+        return "COMMERCIAL"
+    return None
+
+
+def _target_actuals(conn, month_from, month_to):
+    """{(scope, scope_id, 'YYYY-MM', segment): cylinders} for every scope."""
+    first_day = month_from + "-01"
+    ly, lm = map(int, month_to.split("-"))
+    last_day = (datetime(ly + (lm == 12), 1 if lm == 12 else lm + 1, 1).date() - timedelta(days=1)).isoformat()
+    lines = conn.execute(
+        f"""SELECT s.customer_id, s.location_id, strftime('%Y-%m', s.ts) ym, si.qty, p.name product_name, p.sku,
+                   cd.billing_type cd_type, cd.delivered_qty,
+                   (SELECT COUNT(*) FROM commercial_delivery_cylinders x WHERE x.delivery_id=cd.id) wiwo_cyls
+            FROM sale_items si JOIN sales s ON s.id=si.sale_id JOIN products p ON p.id=si.product_id
+            LEFT JOIN commercial_deliveries cd ON cd.sale_id=s.id
+            WHERE s.status='COMPLETED' AND s.is_opening_balance=0 AND si.qty > 0 AND {LPG_CYLINDER_SQL}
+                  AND date(s.ts) BETWEEN date(?) AND date(?)""",
+        (first_day, last_day),
+    ).fetchall()
+    out = {}
+    for r in lines:
+        size = product_kg_size(r["product_name"], r["sku"])
+        if r["cd_type"]:
+            seg = "COMMERCIAL"
+            if r["cd_type"] == "DR":
+                cyl = r["delivered_qty"] or 0
+            elif r["cd_type"] == "WIWO":
+                cyl = r["wiwo_cyls"] or 0
+            else:
+                cyl = float(r["qty"]) / (size or 50.0)
+        else:
+            seg = _target_segment(size)
+            cyl = r["qty"]
+        if not seg:
+            continue
+        keys = [("OVERALL", 0), ("LOCATION", r["location_id"])]
+        if r["customer_id"]:
+            keys.append(("CUSTOMER", r["customer_id"]))
+        for scope, sid in keys:
+            k = (scope, sid, r["ym"], seg)
+            out[k] = out.get(k, 0) + cyl
+    return {k: round(v, 2) for k, v in out.items()}
+
+
+def _tier_result(tiers, actual):
+    """tiers: {1: qty, ...}. Highest tier reached, and the next one to aim for."""
+    set_tiers = sorted((t, q) for t, q in tiers.items() if q)
+    reached = None
+    for t, q in set_tiers:
+        if actual >= q:
+            reached = t
+    nxt = next(((t, q) for t, q in set_tiers if actual < q), None)
+    return {
+        "tiers": {str(t): tiers.get(t) for t in TARGET_TIERS},
+        "actual": actual,
+        "reached_tier": reached,
+        "next_tier": nxt[0] if nxt else None,
+        "to_next_tier": round(nxt[1] - actual, 2) if nxt else None,
+        "pct": {str(t): (round(actual * 100.0 / q, 1) if q else None) for t, q in tiers.items()},
+    }
+
+
+def _target_scope_args(d):
+    scope = (d.get("scope") or "OVERALL").upper()
+    if scope not in TARGET_SCOPES:
+        raise ValueError("scope must be OVERALL, LOCATION or CUSTOMER")
+    try:
+        scope_id = 0 if scope == "OVERALL" else int(d.get("scope_id"))
+    except (TypeError, ValueError):
+        raise ValueError("Pick a " + scope.lower())
+    return scope, scope_id
+
+
+def _scope_name(conn, scope, scope_id):
+    if scope == "OVERALL":
+        return "Overall business"
+    if scope == "LOCATION":
+        r = conn.execute("SELECT name FROM locations WHERE id=?", (scope_id,)).fetchone()
+        return r["name"] if r else None
+    r = conn.execute("SELECT name, account_no, category FROM customers WHERE id=?", (scope_id,)).fetchone()
+    return f"{r['name']} ({r['account_no']}, {r['category']})" if r else None
+
+
+@app.get("/api/sales-targets")
+@roles_or_module_required("ADMIN", module="sales_targets")
+def get_sales_targets():
+    """Targets and actuals for one scope (overall / a location / a customer)
+    for one year: 12 months x 2 segments x 4 tiers."""
+    try:
+        scope, scope_id = _target_scope_args(request.args)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    year = request.args.get("year", type=int) or datetime.now().year
+    months = [f"{year:04d}-{m:02d}" for m in range(1, 13)]
+    conn = get_db()
+    name = _scope_name(conn, scope, scope_id)
+    if name is None:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    rows = conn.execute(
+        "SELECT month, segment, tier, qty FROM sales_targets WHERE scope=? AND scope_id=? AND month BETWEEN ? AND ?",
+        (scope, scope_id, months[0], months[-1])).fetchall()
+    actuals = _target_actuals(conn, months[0], months[-1])
+    conn.close()
+    grid = {seg: {ym: {t: None for t in TARGET_TIERS} for ym in months} for seg in TARGET_SEGMENTS}
+    for r in rows:
+        grid[r["segment"]][r["month"]][r["tier"]] = r["qty"]
+    result = {seg: {ym: _tier_result(grid[seg][ym], actuals.get((scope, scope_id, ym, seg), 0)) for ym in months}
+              for seg in TARGET_SEGMENTS}
+    return jsonify(scope=scope, scope_id=scope_id, scope_name=name, year=year, months=months,
+                   month_labels=[datetime.strptime(ym, "%Y-%m").strftime("%b %Y") for ym in months],
+                   segments=result)
+
+
+@app.put("/api/sales-targets")
+@roles_or_module_required("ADMIN", module="sales_targets")
+def save_sales_targets():
+    """Save the year's target grid for one scope. A blank / 0 qty clears it."""
+    d = request.get_json(force=True) or {}
+    try:
+        scope, scope_id = _target_scope_args(d)
+        year = int(d.get("year"))
+        if not 2000 <= year <= 2100:
+            raise ValueError
+    except ValueError as e:
+        return jsonify(error=str(e) or "Invalid year"), 400
+    except TypeError:
+        return jsonify(error="Invalid year"), 400
+    cells = d.get("targets") or []
+    conn = get_db()
+    if _scope_name(conn, scope, scope_id) is None:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    try:
+        clean = []
+        for c in cells:
+            ym, seg = str(c.get("month") or ""), (c.get("segment") or "").upper()
+            try:
+                tier = int(c.get("tier"))
+            except (TypeError, ValueError):
+                raise ValueError("tier must be 1 to 4")
+            if not ym.startswith(f"{year:04d}-") or not _parse_ym(ym):
+                raise ValueError(f"Month {ym} is not in {year}")
+            if seg not in TARGET_SEGMENTS or tier not in TARGET_TIERS:
+                raise ValueError("segment must be DOMESTIC or COMMERCIAL and tier 1 to 4")
+            raw = c.get("qty")
+            if raw in (None, ""):
+                qty = 0
+            else:
+                try:
+                    qty = int(float(raw))
+                except (TypeError, ValueError):
+                    raise ValueError("Target quantities must be whole numbers")
+            if qty < 0:
+                raise ValueError("Target quantities can't be negative")
+            clean.append((ym, seg, tier, qty))
+    except ValueError as e:
+        conn.close()
+        return jsonify(error=str(e)), 400
+    u = session["user"]
+    for ym, seg, tier, qty in clean:
+        if qty:
+            conn.execute(
+                """INSERT INTO sales_targets (scope, scope_id, month, segment, tier, qty, updated_by, updated_at)
+                   VALUES (?,?,?,?,?,?,?,datetime('now'))
+                   ON CONFLICT(scope, scope_id, month, segment, tier)
+                   DO UPDATE SET qty=excluded.qty, updated_by=excluded.updated_by, updated_at=excluded.updated_at""",
+                (scope, scope_id, ym, seg, tier, qty, u["id"]))
+        else:
+            conn.execute("DELETE FROM sales_targets WHERE scope=? AND scope_id=? AND month=? AND segment=? AND tier=?",
+                         (scope, scope_id, ym, seg, tier))
+    audit(conn, "UPDATE", "SALES_TARGETS", scope_id, f"{scope} {year}: {sum(1 for c in clean if c[3])} target(s) set")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/sales-targets/achievement")
+@roles_or_module_required("ADMIN", module="sales_targets")
+def sales_target_achievement():
+    """One month: every scope that has a target (overall always shown), with
+    actual cylinders vs each tier, for Domestic and Commercial."""
+    month = request.args.get("month") or datetime.now().strftime("%Y-%m")
+    if not _parse_ym(month):
+        return jsonify(error="month must be YYYY-MM"), 400
+    conn = get_db()
+    rows = conn.execute("SELECT scope, scope_id, segment, tier, qty FROM sales_targets WHERE month=?", (month,)).fetchall()
+    actuals = _target_actuals(conn, month, month)
+    scopes = {("OVERALL", 0): {}}
+    for r in rows:
+        scopes.setdefault((r["scope"], r["scope_id"]), {}).setdefault(r["segment"], {})[r["tier"]] = r["qty"]
+    out = []
+    for (scope, sid), segs in scopes.items():
+        name = _scope_name(conn, scope, sid)
+        if name is None:
+            continue
+        out.append({
+            "scope": scope, "scope_id": sid, "name": name,
+            "segments": {seg: _tier_result({t: segs.get(seg, {}).get(t) for t in TARGET_TIERS},
+                                           actuals.get((scope, sid, month, seg), 0)) for seg in TARGET_SEGMENTS},
+        })
+    conn.close()
+    order = {s: i for i, s in enumerate(TARGET_SCOPES)}
+    out.sort(key=lambda x: (order[x["scope"]], x["name"].lower()))
+    return jsonify(month=month, month_label=datetime.strptime(month, "%Y-%m").strftime("%B %Y"), rows=out)
+
+
 # ---------------------------------------------------------------- end of day report
 # Per-attendant cash-up: everything they collected on a given day, totalled
 # by payment method (Cash, GCash, Bank Transfer, ...), split between POS
 # sales and collections on receivables. Attendants only ever see their own;
 # Admin/Manager/Accounting can pick any staff member (or everyone).
 
-EOD_SUPERVISOR_ROLES = ("ADMIN", "MANAGER", "ACCOUNTING")
+EOD_SUPERVISOR_ROLES = ("ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING")
 
 
 def _build_eod_report(conn, u, report_date, user_id=None, location_id=None):
@@ -3976,6 +4258,31 @@ def export_end_of_day_report():
 
 # ---------------------------------------------------------------- users (admin)
 
+def _role_assign_problem(actor_role, target_role):
+    """Only Admin can give out the ADMIN role, and only Admin / Operation Head
+    can give out OPERATION_HEAD — otherwise a Manager (or an Operation Head)
+    could hand themselves more access, e.g. the Admin-only System Reset."""
+    if target_role == "ADMIN" and actor_role != "ADMIN":
+        return "Only the Admin can assign the ADMIN role"
+    if target_role == "OPERATION_HEAD" and not is_admin_like(actor_role):
+        return "Only the Admin or an Operation Head can assign the OPERATION_HEAD role"
+    return None
+
+
+def _user_manage_problem(conn, uid):
+    """Non-Admins can't change, disable or delete an Admin account (which
+    would let them log in as Admin); Managers can't touch Operation Heads."""
+    actor = session["user"]["role"]
+    row = conn.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
+    if not row:
+        return None
+    if row["role"] == "ADMIN" and actor != "ADMIN":
+        return "Only the Admin can change an Admin account"
+    if row["role"] == "OPERATION_HEAD" and not is_admin_like(actor):
+        return "Only the Admin or an Operation Head can change an Operation Head account"
+    return None
+
+
 @app.get("/api/users")
 @roles_required("ADMIN", "MANAGER")
 def list_users():
@@ -3994,6 +4301,9 @@ def create_user():
     d = request.get_json(force=True)
     u = session["user"]
     role = (d.get("role") or "").strip()
+    problem = _role_assign_problem(u["role"], role)
+    if problem:
+        return jsonify(error=problem), 403
     conn = get_db()
     role_exists = conn.execute("SELECT 1 FROM roles WHERE name=?", (role,)).fetchone()
     if not role_exists:
@@ -4025,6 +4335,10 @@ def update_user(uid):
         conn.close()
         return jsonify(error="Not found"), 404
     new_role = d.get("role", existing["role"])
+    problem = _user_manage_problem(conn, existing["id"]) or _role_assign_problem(u["role"], new_role)
+    if problem:
+        conn.close()
+        return jsonify(error=problem), 403
     if new_role != existing["role"]:
         role_exists = conn.execute("SELECT 1 FROM roles WHERE name=?", (new_role,)).fetchone()
         if not role_exists:
@@ -4052,6 +4366,10 @@ def update_user(uid):
 @roles_required("ADMIN", "MANAGER")
 def disable_user(uid):
     conn = get_db()
+    problem = _user_manage_problem(conn, uid)
+    if problem:
+        conn.close()
+        return jsonify(error=problem), 403
     conn.execute("UPDATE users SET active=0 WHERE id=?", (uid,))
     audit(conn, "DISABLE", "USERS", uid)
     conn.commit()
@@ -4063,6 +4381,10 @@ def disable_user(uid):
 @roles_required("ADMIN", "MANAGER")
 def enable_user(uid):
     conn = get_db()
+    problem = _user_manage_problem(conn, uid)
+    if problem:
+        conn.close()
+        return jsonify(error=problem), 403
     conn.execute("UPDATE users SET active=1 WHERE id=?", (uid,))
     audit(conn, "ENABLE", "USERS", uid)
     conn.commit()
@@ -4076,6 +4398,10 @@ def delete_user(uid):
     if uid == session["user"]["id"]:
         return jsonify(error="You can't delete your own account while logged in as it"), 400
     conn = get_db()
+    problem = _user_manage_problem(conn, uid)
+    if problem:
+        conn.close()
+        return jsonify(error=problem), 403
     sale_count = conn.execute("SELECT COUNT(*) c FROM sales WHERE user_id=?", (uid,)).fetchone()["c"]
     if sale_count > 0:
         conn.close()
@@ -4321,14 +4647,19 @@ def list_commercial_deliveries():
               JOIN locations l ON l.id=cd.location_id JOIN products p ON p.id=cd.product_id
               LEFT JOIN users creator ON creator.id=cd.created_by WHERE 1=1"""
     params = []
-    if u["role"] not in ("ADMIN", "MANAGER"):
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
         sql += " AND cd.location_id=?"
         params.append(u["location_id"])
     sql += " ORDER BY cd.delivery_date DESC"
     rows = conn.execute(sql, params).fetchall()
     out = []
     for r in rows:
-        if r["billing_type"] == "READING":
+        if r["billing_type"] == "DR":
+            total_net_in = round((r["delivered_qty"] or 0) * (r["kg_per_cylinder"] or 0), 2)
+            total_consumption = round(total_net_in - (r["total_residual_kg"] or 0), 2)
+            cyls = [dict(c) for c in conn.execute(
+                "SELECT * FROM commercial_pullouts WHERE delivery_id=? ORDER BY id", (r["id"],)).fetchall()]
+        elif r["billing_type"] == "READING":
             total_net_in = None
             total_consumption = round(r["current_reading"] - r["previous_reading"], 2) \
                 if r["current_reading"] is not None and r["previous_reading"] is not None else None
@@ -4370,12 +4701,15 @@ def last_meter_reading():
 def create_commercial_delivery():
     d = request.get_json(force=True)
     u = session["user"]
-    location_id = u["location_id"] if u["role"] not in ("ADMIN", "MANAGER") else d.get("location_id")
+    location_id = u["location_id"] if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER") else d.get("location_id")
     billing_type = d.get("billing_type", "WIWO")
-    if billing_type not in ("WIWO", "READING"):
-        return jsonify(error="billing_type must be WIWO or READING"), 400
+    if billing_type not in ("WIWO", "READING", "DR"):
+        return jsonify(error="billing_type must be WIWO, READING or DR"), 400
     if not d.get("customer_id") or not d.get("product_id") or not location_id:
         return jsonify(error="customer_id, product_id and location_id are required"), 400
+
+    if billing_type == "DR":
+        return _create_dr_billing(d, location_id)
 
     conn = get_db()
 
@@ -4466,6 +4800,14 @@ def get_commercial_delivery(did):
     if not row:
         conn.close()
         return jsonify(error="Not found"), 404
+    if row["billing_type"] == "DR":
+        pullouts = conn.execute("SELECT * FROM commercial_pullouts WHERE delivery_id=? ORDER BY id", (did,)).fetchall()
+        sale = conn.execute("SELECT sale_no, dr_no FROM sales WHERE id=?", (row["sale_id"],)).fetchone() if row["sale_id"] else None
+        conn.close()
+        delivered_kg = round((row["delivered_qty"] or 0) * (row["kg_per_cylinder"] or 0), 2)
+        return jsonify({**dict(row), "cylinders": [dict(c) for c in pullouts], "delivered_kg": delivered_kg,
+                        "total_consumption_weight": round(delivered_kg - (row["total_residual_kg"] or 0), 2),
+                        "sale_no": sale["sale_no"] if sale else None, "sale_dr_no": sale["dr_no"] if sale else None})
     cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (did,)).fetchall()
     conn.close()
     total_consumption = None
@@ -4490,10 +4832,16 @@ def export_commercial_delivery_pdf(did):
     if not row:
         conn.close()
         return jsonify(error="Not found"), 404
-    cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (did,)).fetchall()
+    data = dict(row)
+    if row["billing_type"] == "DR":
+        cyls = conn.execute("SELECT * FROM commercial_pullouts WHERE delivery_id=? ORDER BY id", (did,)).fetchall()
+        sale = conn.execute("SELECT dr_no FROM sales WHERE id=?", (row["sale_id"],)).fetchone() if row["sale_id"] else None
+        data["sale_dr_no"] = sale["dr_no"] if sale else None
+    else:
+        cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (did,)).fetchall()
     conn.close()
     fname = f"{row['delivery_no']}.pdf"
-    return commercial_billing_pdf(dict(row), [dict(c) for c in cyls], fname)
+    return commercial_billing_pdf(data, [dict(c) for c in cyls], fname)
 
 
 @app.put("/api/commercial-deliveries/<int:did>/pickup")
@@ -4566,6 +4914,154 @@ def record_commercial_pickup(did):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# Roles that may type their own price per kg on a DR billing. Everyone else
+# with the 50kg Commercial Billing module bills at the product's default.
+COMMERCIAL_RATE_ROLES = ("ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING")
+
+
+def _num(v, label, allow_blank=False):
+    if v is None or (isinstance(v, str) and not v.strip()):
+        if allow_blank:
+            return None
+        raise ValueError(f"{label} is required")
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be a number")
+
+
+def _create_dr_billing(d, location_id):
+    """DR (manual) 50kg billing, the way the business actually does it: bill
+    right at delivery, even when the serial numbers of the 50kg cylinders
+    pulled out don't match the ones delivered.
+
+        billable kg = delivered cylinders x kg per cylinder
+                      - residual kg left in the cylinders pulled out
+
+    Creates the credit sale (with its own DR number) and receivable at once,
+    so the record is BILLED immediately."""
+    u = session["user"]
+    conn = get_db()
+    try:
+        product = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (d["product_id"],)).fetchone()
+        customer = conn.execute("SELECT * FROM customers WHERE id=?", (d["customer_id"],)).fetchone()
+        if not product:
+            raise ValueError("That product no longer exists. Refresh the page and pick it again.")
+        if not customer:
+            raise ValueError("Customer not found")
+        if not conn.execute("SELECT 1 FROM locations WHERE id=?", (location_id,)).fetchone():
+            raise ValueError("Location not found")
+        try:
+            delivered_qty = int(d.get("delivered_qty"))
+        except (TypeError, ValueError):
+            raise ValueError("Number of cylinders delivered must be a whole number")
+        if delivered_qty <= 0:
+            raise ValueError("Number of cylinders delivered must be at least 1")
+        kg_per_cyl = _num(d.get("kg_per_cylinder"), "kg per cylinder", allow_blank=True)
+        if kg_per_cyl is None:
+            kg_per_cyl = product_kg_size(product["name"], product["sku"]) or 50.0
+        if kg_per_cyl <= 0:
+            raise ValueError("kg per cylinder must be positive")
+
+        pullouts = []
+        for i, po in enumerate(d.get("pullouts") or [], start=1):
+            serial = (po.get("serial_no") or "").strip()
+            gw = _num(po.get("gross_weight"), f"Pull-out #{i} gross weight", allow_blank=True)
+            tw = _num(po.get("tare_weight"), f"Pull-out #{i} tare weight", allow_blank=True)
+            if gw is not None and tw is not None:
+                residual = round(gw - tw, 2)
+            else:
+                residual = _num(po.get("residual_kg"), f"Pull-out #{i} residual kg", allow_blank=True) or 0.0
+            if residual < 0:
+                raise ValueError(f"Pull-out #{i}{' (' + serial + ')' if serial else ''}: residual can't be negative — "
+                                 "check the gross and tare weights")
+            if residual > kg_per_cyl:
+                raise ValueError(f"Pull-out #{i}{' (' + serial + ')' if serial else ''}: residual {residual} kg is more "
+                                 f"than a full {kg_per_cyl:g} kg cylinder — check the reading")
+            pullouts.append((serial, gw, tw, round(residual, 2)))
+
+        delivered_kg = round(delivered_qty * kg_per_cyl, 2)
+        total_residual = round(sum(p[3] for p in pullouts), 2)
+        billable_kg = round(delivered_kg - total_residual, 2)
+        if billable_kg <= 0:
+            raise ValueError("Residual is equal to or more than what was delivered — nothing to bill")
+
+        rate = d.get("price_per_kg")
+        if rate not in (None, "") and u["role"] in COMMERCIAL_RATE_ROLES:
+            price_per_kg = _num(rate, "Price per kg")
+        else:
+            price_per_kg = float(product["price_per_kg"] or 0)
+        if price_per_kg <= 0:
+            raise ValueError("No price per kg — set a default price per kg on the product"
+                             + (", or enter one now" if u["role"] in COMMERCIAL_RATE_ROLES else ""))
+        billed_amount = round(billable_kg * price_per_kg, 2)
+        dr_ref = (d.get("dr_ref") or "").strip()
+
+        delivery_no = next_number(conn, "CD", "commercial_deliveries", "delivery_no")
+        cur = conn.execute(
+            """INSERT INTO commercial_deliveries (delivery_no, customer_id, location_id, product_id, billing_type, status,
+                   pickup_date, notes, created_by, collected_by, dr_ref, delivered_qty, kg_per_cylinder, total_residual_kg)
+               VALUES (?,?,?,?,'DR','DELIVERED',datetime('now'),?,?,?,?,?,?,?)""",
+            (delivery_no, customer["id"], location_id, product["id"], d.get("notes", ""), u["id"], u["id"],
+             dr_ref, delivered_qty, kg_per_cyl, total_residual),
+        )
+        did = cur.lastrowid
+        for serial, gw, tw, residual in pullouts:
+            conn.execute("INSERT INTO commercial_pullouts (delivery_id, serial_no, gross_weight, tare_weight, residual_kg) "
+                         "VALUES (?,?,?,?,?)", (did, serial, gw, tw, residual))
+        desc = (f"Commercial DR billing {delivery_no}" + (f" (DR {dr_ref})" if dr_ref else "") +
+                f": {delivered_qty} x {kg_per_cyl:g}kg = {delivered_kg}kg delivered - {total_residual}kg residual "
+                f"({len(pullouts)} pulled out) = {billable_kg}kg @ {money_fmt(price_per_kg)}/kg")
+        sale_id, sale_no, dr_no = _bill_delivery_as_credit_sale(
+            conn, did, customer, product, location_id, billable_kg, price_per_kg, desc,
+            f"{product['name']} (DR billing)", with_dr_no=True)
+        audit(conn, "CREATE", "COMMERCIAL_DELIVERIES", did,
+              f"{delivery_no} (DR{' ' + dr_ref if dr_ref else ''}) -> {sale_no}: {delivered_kg}kg - {total_residual}kg residual "
+              f"= {billable_kg}kg @ {price_per_kg}/kg = {billed_amount}")
+        conn.commit()
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(id=did, delivery_no=delivery_no, sale_id=sale_id, sale_no=sale_no, dr_no=dr_no,
+                   delivered_kg=delivered_kg, total_residual_kg=total_residual, billable_kg=billable_kg,
+                   price_per_kg=price_per_kg, billed_amount=billed_amount), 201
+
+
+def _bill_delivery_as_credit_sale(conn, did, customer, product, location_id, qty_kg, price_per_kg, desc, item_label,
+                                  with_dr_no=False):
+    """Turn a commercial delivery into a credit sale + receivable and mark it
+    BILLED. Caller commits."""
+    u = session["user"]
+    billed_amount = round(qty_kg * price_per_kg, 2)
+    sale_no = next_number(conn, "SALE", "sales", "sale_no")
+    dr_no = next_number(conn, "DR", "sales", "dr_no") if with_dr_no else None
+    cur = conn.execute(
+        """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance, notes, dr_no)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (sale_no, location_id, u["id"], customer["id"], "CREDIT",
+         billed_amount, 0, billed_amount, 0, billed_amount, desc, dr_no),
+    )
+    sale_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode) VALUES (?,?,?,?,?,?,?)",
+        (sale_id, product["id"], item_label, qty_kg, price_per_kg, billed_amount, "REFILL"),
+    )
+    invoice_date = datetime.now().date()
+    due_date = invoice_date + timedelta(days=customer["terms_days"] or 0)
+    invoice_no = next_number(conn, "INV", "receivables", "invoice_no")
+    conn.execute(
+        """INSERT INTO receivables (sale_id, customer_id, invoice_no, invoice_date, due_date, amount, paid, balance, status)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (sale_id, customer["id"], invoice_no, str(invoice_date), str(due_date), billed_amount, 0, billed_amount, "CURRENT"),
+    )
+    conn.execute(
+        "UPDATE commercial_deliveries SET status='BILLED', price_per_kg=?, billed_amount=?, sale_id=?, billed_by=? WHERE id=?",
+        (price_per_kg, billed_amount, sale_id, u["id"], did),
+    )
+    return sale_id, sale_no, dr_no
 
 
 @app.post("/api/commercial-deliveries/<int:did>/bill")

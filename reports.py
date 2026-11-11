@@ -138,8 +138,9 @@ def commercial_billing_pdf(delivery, cylinders, filename):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=36, bottomMargin=36, leftMargin=36, rightMargin=36)
     styles = getSampleStyleSheet()
+    type_title = {"WIWO": " — Weight In / Weight Out", "DR": " — DR Billing"}.get(delivery["billing_type"], " — Meter Reading")
     flow = _header_flowables(
-        "Commercial LPG Billing" + (" — Weight In / Weight Out" if delivery["billing_type"] == "WIWO" else " — Meter Reading"),
+        "Commercial LPG Billing" + type_title,
         subtitle=f"{delivery['delivery_no']} — {delivery['delivery_date']}",
     )
 
@@ -149,6 +150,8 @@ def commercial_billing_pdf(delivery, cylinders, filename):
         ["Product", delivery["product_name"]],
         ["Status", delivery["status"]],
     ]
+    if delivery["billing_type"] == "DR":
+        info_rows.insert(0, ["DR No.", (delivery.get("dr_ref") or "—") + (f"  (system {delivery['sale_dr_no']})" if delivery.get("sale_dr_no") else "")])
     info_table = Table(info_rows, colWidths=[100, 380])
     info_table.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
@@ -175,6 +178,35 @@ def commercial_billing_pdf(delivery, cylinders, filename):
         ]))
         flow.append(table)
         total_consumption = round(sum(c["consumption_weight"] or 0 for c in cylinders), 2)
+    elif delivery["billing_type"] == "DR":
+        delivered_kg = round((delivery["delivered_qty"] or 0) * (delivery["kg_per_cylinder"] or 0), 2)
+        dr_rows = [
+            ["Delivered", f"{delivery['delivered_qty']} cylinder(s) x {delivery['kg_per_cylinder']} kg = {delivered_kg} kg"],
+            ["Pulled out", f"{len(cylinders)} cylinder(s), residual {delivery['total_residual_kg'] or 0} kg"],
+        ]
+        dr_table = Table(dr_rows, colWidths=[150, 330])
+        dr_table.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 9.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5), ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
+        ]))
+        flow.append(dr_table)
+        if cylinders:
+            flow.append(Spacer(1, 10))
+            data = [["Pulled-out Serial No.", "Gross Wt", "Tare", "Residual (kg)"]] + [[
+                c["serial_no"] or "—",
+                c["gross_weight"] if c["gross_weight"] is not None else "—",
+                c["tare_weight"] if c["tare_weight"] is not None else "—",
+                c["residual_kg"],
+            ] for c in cylinders]
+            table = Table(data, repeatRows=1, colWidths=[160, 90, 90, 100])
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), BLUE), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
+            ]))
+            flow.append(table)
+        total_consumption = round(delivered_kg - (delivery["total_residual_kg"] or 0), 2)
     else:
         reading_rows = [
             ["Meter / Tank", delivery["meter_label"] or "—"],
@@ -192,13 +224,14 @@ def commercial_billing_pdf(delivery, cylinders, filename):
         total_consumption = round((delivery["current_reading"] or 0) - (delivery["previous_reading"] or 0), 2)
 
     flow.append(Spacer(1, 14))
-    unit = "kg" if delivery["billing_type"] == "WIWO" else "unit(s)"
-    summary_rows = [["Total Consumption", f"{total_consumption} {unit}"]]
+    unit = "kg" if delivery["billing_type"] in ("WIWO", "DR") else "unit(s)"
+    summary_rows = [["Billable (delivered - residual)" if delivery["billing_type"] == "DR" else "Total Consumption",
+                     f"{total_consumption} {unit}"]]
     if delivery["price_per_kg"]:
         summary_rows.append(["Rate", f"PHP {delivery['price_per_kg']:,.2f} per {unit[:-1] if unit.endswith('s') else unit}"])
     if delivery["billed_amount"]:
         summary_rows.append(["Billed Amount", f"PHP {delivery['billed_amount']:,.2f}"])
-    summary_table = Table(summary_rows, colWidths=[150, 200])
+    summary_table = Table(summary_rows, colWidths=[210, 200])
     summary_table.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
         ("FONTNAME", (1, -1), (1, -1), "Helvetica-Bold"),

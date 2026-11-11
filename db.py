@@ -278,7 +278,7 @@ CREATE TABLE IF NOT EXISTS commercial_deliveries (
     customer_id INTEGER NOT NULL REFERENCES customers(id),
     location_id INTEGER NOT NULL REFERENCES locations(id),
     product_id INTEGER NOT NULL REFERENCES products(id),
-    billing_type TEXT NOT NULL DEFAULT 'WIWO' CHECK(billing_type IN ('WIWO','READING')),
+    billing_type TEXT NOT NULL DEFAULT 'WIWO' CHECK(billing_type IN ('WIWO','READING','DR')),
     meter_label TEXT,
     previous_reading REAL,
     current_reading REAL,
@@ -290,7 +290,39 @@ CREATE TABLE IF NOT EXISTS commercial_deliveries (
     notes TEXT,
     created_by INTEGER REFERENCES users(id),
     collected_by INTEGER REFERENCES users(id),
-    billed_by INTEGER REFERENCES users(id)
+    billed_by INTEGER REFERENCES users(id),
+    dr_ref TEXT,
+    delivered_qty INTEGER,
+    kg_per_cylinder REAL,
+    total_residual_kg REAL
+);
+
+-- DR (manual) 50kg billing: the cylinders pulled out at delivery. Serial
+-- numbers don't have to match what was delivered; only the residual LPG
+-- left in each pulled-out cylinder is deducted from the bill.
+CREATE TABLE IF NOT EXISTS commercial_pullouts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id INTEGER NOT NULL REFERENCES commercial_deliveries(id),
+    serial_no TEXT,
+    gross_weight REAL,
+    tare_weight REAL,
+    residual_kg REAL NOT NULL DEFAULT 0
+);
+
+-- Sales Department targets: 4 tiers per month, split Domestic (11kg and
+-- 1.4kg) / Commercial (50kg), for the whole business, a location, or a
+-- customer. qty = cylinders.
+CREATE TABLE IF NOT EXISTS sales_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL CHECK(scope IN ('OVERALL','LOCATION','CUSTOMER')),
+    scope_id INTEGER NOT NULL DEFAULT 0,
+    month TEXT NOT NULL,
+    segment TEXT NOT NULL CHECK(segment IN ('DOMESTIC','COMMERCIAL')),
+    tier INTEGER NOT NULL CHECK(tier BETWEEN 1 AND 4),
+    qty INTEGER NOT NULL,
+    updated_by INTEGER REFERENCES users(id),
+    updated_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(scope, scope_id, month, segment, tier)
 );
 
 CREATE TABLE IF NOT EXISTS commercial_delivery_cylinders (
@@ -429,16 +461,22 @@ MODULE_KEYS = [
     "employees", "staff_schedule", "kpi", "reports", "audit",
     "booked_orders", "incident_reports", "commercial_deliveries",
     "eod_report", "receivables_summary", "customer_growth",
+    "stock_import", "sales_targets",
 ]
+
+# Roles with Admin-level access. OPERATION_HEAD can do everything Admin can
+# EXCEPT the System Reset (Go Live), which stays Admin-only.
+ADMIN_LIKE_ROLES = ("ADMIN", "OPERATION_HEAD")
 
 DEFAULT_ROLE_PERMISSIONS = {
     "ADMIN": MODULE_KEYS,  # ADMIN always has everything regardless of this table
+    "OPERATION_HEAD": MODULE_KEYS,  # also always full access (minus System Reset)
     "MANAGER": [
         "dashboard", "sales", "customers", "receivables", "inventory",
         "inventory_ledger", "cylinder_deposits", "hauling", "vehicles",
         "employees", "staff_schedule", "kpi", "reports", "audit",
         "booked_orders", "incident_reports", "commercial_deliveries", "eod_report",
-        "customer_growth",
+        "customer_growth", "sales_targets",
     ],
     "ACCOUNTING": [
         "dashboard", "sales", "customers", "receivables", "reports", "eod_report",
@@ -451,10 +489,14 @@ DEFAULT_ROLE_PERMISSIONS = {
     ],
     "DISPATCHER": [
         "dashboard", "inventory", "transfers", "staff_schedule", "incident_reports",
-        "commercial_deliveries",
+        "commercial_deliveries", "stock_import",
     ],
     "ORDER_TAKER": [
         "dashboard", "booked_orders", "customers", "incident_reports",
+        "transfers", "stock_import",
+    ],
+    "SUPERVISOR": [
+        "dashboard", "inventory", "stock_import", "staff_schedule", "incident_reports",
     ],
 }
 
@@ -735,6 +777,70 @@ def migrate_schema():
         conn.commit()
     if not _column_exists(conn, "sales", "withholding_tax"):
         conn.execute("ALTER TABLE sales ADD COLUMN withholding_tax REAL NOT NULL DEFAULT 0")
+        conn.commit()
+
+    # 15. New built-in roles OPERATION_HEAD and SUPERVISOR; Import Stock and
+    #     Sales Targets modules; Order Taker gets Dispatch + Import Stock.
+    #     Runs once; custom roles are never touched.
+    MIGRATION_KEY = "operation_head_supervisor_targets"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        for role_name in ("OPERATION_HEAD", "SUPERVISOR"):
+            conn.execute("INSERT OR IGNORE INTO roles (name, is_builtin) VALUES (?, 1)", (role_name,))
+            for m in DEFAULT_ROLE_PERMISSIONS[role_name]:
+                conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES (?,?)", (role_name, m))
+        grants = {"DISPATCHER": ["stock_import"], "ORDER_TAKER": ["transfers", "stock_import"],
+                  "MANAGER": ["sales_targets"]}
+        for role_name, mods in grants.items():
+            if conn.execute("SELECT 1 FROM roles WHERE name=?", (role_name,)).fetchone():
+                for m in mods:
+                    conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES (?,?)", (role_name, m))
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
+        conn.commit()
+
+    # 16. DR (manual) billing for 50kg commercial: new columns, and the
+    #     billing_type CHECK must allow 'DR' (recreate the table if needed).
+    for col, typ in (("dr_ref", "TEXT"), ("delivered_qty", "INTEGER"), ("kg_per_cylinder", "REAL"),
+                     ("total_residual_kg", "REAL")):
+        if not _column_exists(conn, "commercial_deliveries", col):
+            conn.execute(f"ALTER TABLE commercial_deliveries ADD COLUMN {col} {typ}")
+    conn.commit()
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='commercial_deliveries'").fetchone()
+    if row and "CHECK" in row[0] and "'DR'" not in row[0]:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("""
+            CREATE TABLE commercial_deliveries_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                delivery_no TEXT UNIQUE NOT NULL,
+                delivery_date TEXT DEFAULT (datetime('now')),
+                customer_id INTEGER NOT NULL REFERENCES customers(id),
+                location_id INTEGER NOT NULL REFERENCES locations(id),
+                product_id INTEGER NOT NULL REFERENCES products(id),
+                billing_type TEXT NOT NULL DEFAULT 'WIWO' CHECK(billing_type IN ('WIWO','READING','DR')),
+                meter_label TEXT,
+                previous_reading REAL,
+                current_reading REAL,
+                status TEXT NOT NULL DEFAULT 'DELIVERED' CHECK(status IN ('DELIVERED','PICKED_UP','BILLED','CANCELLED')),
+                pickup_date TEXT,
+                price_per_kg REAL,
+                billed_amount REAL,
+                sale_id INTEGER REFERENCES sales(id),
+                notes TEXT,
+                created_by INTEGER REFERENCES users(id),
+                collected_by INTEGER REFERENCES users(id),
+                billed_by INTEGER REFERENCES users(id),
+                dr_ref TEXT,
+                delivered_qty INTEGER,
+                kg_per_cylinder REAL,
+                total_residual_kg REAL
+            )
+        """)
+        cols = ("id, delivery_no, delivery_date, customer_id, location_id, product_id, billing_type, meter_label, "
+                "previous_reading, current_reading, status, pickup_date, price_per_kg, billed_amount, sale_id, notes, "
+                "created_by, collected_by, billed_by, dr_ref, delivered_qty, kg_per_cylinder, total_residual_kg")
+        conn.execute(f"INSERT INTO commercial_deliveries_new ({cols}) SELECT {cols} FROM commercial_deliveries")
+        conn.execute("DROP TABLE commercial_deliveries")
+        conn.execute("ALTER TABLE commercial_deliveries_new RENAME TO commercial_deliveries")
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.commit()
 
     conn.close()

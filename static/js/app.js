@@ -68,11 +68,15 @@ const NAV = [
   { id: "customers", label: "Customers", icon: "\u{1F465}", module: "customers" },
   { id: "receivables", label: "Receivables", icon: "\u{1F4B0}", module: "receivables" },
   { id: "cylinder_deposits", label: "Cylinder Deposits", icon: "\u{1F6E2}\uFE0F", module: "cylinder_deposits" },
+
+  { section: "Sales Department" },
   { id: "customer_growth", label: "Customer Growth", icon: "\u{1F331}", module: "customer_growth" },
+  { id: "sales_targets", label: "Sales Targets", icon: "\u{1F3AF}", module: "sales_targets" },
 
   { section: "Inventory & Dispatch" },
   { id: "inventory", label: "Inventory", icon: "\u{1F4E6}", module: "inventory" },
   { id: "inventory_ledger", label: "Inv. Ledger", icon: "\u{1F4D2}", module: "inventory_ledger" },
+  { id: "stock_import", label: "Import Stock", icon: "\u{1F4E5}", module: "stock_import" },
   { id: "transfers", label: "Dispatch", icon: "\u{1F69A}", module: "transfers" },
   { id: "hauling", label: "Hauling Schedule", icon: "\u{1F69B}", module: "hauling" },
   { id: "commercial_deliveries", label: "50kg Commercial Billing", icon: "\u2696\uFE0F", module: "commercial_deliveries" },
@@ -92,15 +96,25 @@ const NAV = [
   { id: "products", label: "Products", icon: "\u{1F3F7}", roles: ["ADMIN"] },
   { id: "discounts", label: "Discounts & Promos", icon: "\u{1F3AB}", roles: ["ADMIN", "MANAGER"] },
   { id: "locations", label: "Locations", icon: "\u{1F3E2}", roles: ["ADMIN"] },
-  { id: "system_reset", label: "System Reset (Go Live)", icon: "\u{1F9F9}", roles: ["ADMIN"] },
+  // strict: Admin only — Operation Head has every other Admin screen but not this one.
+  { id: "system_reset", label: "System Reset (Go Live)", icon: "\u{1F9F9}", roles: ["ADMIN"], strict: true },
 ];
+
+// ADMIN and OPERATION_HEAD both have Admin-level access; the only thing
+// Operation Head can't do is the System Reset (Go Live).
+const ADMIN_LIKE_ROLES = ["ADMIN", "OPERATION_HEAD"];
+function isAdminLike(role) { return ADMIN_LIKE_ROLES.includes(role === undefined ? state.user.role : role); }
+function hasModule(key) { return isAdminLike() || (state.permittedModules || []).includes(key); }
 
 function navVisible(n) {
   // Users/Products/Locations/Roles are deliberately NOT part of the custom
   // module-permission system — they stay hardcoded to fixed roles as a
   // safety rail (see role_permissions design note).
-  if (n.roles) return n.roles.includes(state.user.role);
-  if (n.module) return state.user.role === "ADMIN" || state.permittedModules.includes(n.module);
+  if (n.roles) {
+    if (n.strict) return n.roles.includes(state.user.role);
+    return n.roles.includes(state.user.role) || (n.roles.includes("ADMIN") && isAdminLike());
+  }
+  if (n.module) return hasModule(n.module);
   return false;
 }
 
@@ -140,7 +154,7 @@ async function boot() {
   const locs = await api("/locations");
   state.locations = locs;
   const myLoc = locs.find(l => l.id === state.user.location_id);
-  document.getElementById("topbarLoc").textContent = state.user.role === "ADMIN"
+  document.getElementById("topbarLoc").textContent = isAdminLike()
     ? "All Locations" : (myLoc ? myLoc.name : "");
   state.products = await api("/products");
   buildNav();
@@ -167,7 +181,7 @@ function render() {
     staff_schedule: renderStaffSchedule, kpi: renderKpi,
     booked_orders: renderBookedOrders, incident_reports: renderIncidentReports, roles: renderRoles,
     commercial_deliveries: renderCommercialDeliveries, eod_report: renderEndOfDay,
-    customer_growth: renderCustomerGrowth,
+    customer_growth: renderCustomerGrowth, sales_targets: renderSalesTargets, stock_import: renderStockImport,
   };
   (views[state.view] || renderDashboard)(c);
 }
@@ -301,7 +315,7 @@ async function renderPOS(c) {
   state.cart = [];
   state.products = await api("/products");
   try { state.discounts = await api("/discounts?live=1"); } catch (e) { state.discounts = []; }
-  const locationId = state.user.role === "ADMIN" ? (state.locations[0] && state.locations[0].id) : state.user.location_id;
+  const locationId = isAdminLike() ? (state.locations[0] && state.locations[0].id) : state.user.location_id;
   const inv = await api(`/inventory?location_id=${locationId}`);
   const stockMap = {};
   inv.forEach(r => stockMap[r.product_id] = r.quantity);
@@ -793,7 +807,7 @@ async function renderSales(c) {
       <td style="display:flex;gap:6px">
         <button class="btn small" onclick="viewSale(${s.id})">View</button>
         ${s.sale_type === 'CREDIT' ? `<button class="btn small green" onclick="printSaleDR(${s.id})" title="Print Delivery Receipt">DR</button>` : ""}
-        ${state.user.role === 'ADMIN' && s.status !== 'VOIDED' ? `<button class="btn small danger" onclick="voidSale(${s.id})">Void</button>` : ""}
+        ${isAdminLike() && s.status !== 'VOIDED' ? `<button class="btn small danger" onclick="voidSale(${s.id})">Void</button>` : ""}
       </td>
     </tr>`).join("")}
   </tbody></table></div>`;
@@ -842,8 +856,8 @@ window.viewSale = async (id) => {
 
 // ================================================================== CUSTOMERS
 async function renderCustomers(c) {
-  const isAdmin = state.user.role === "ADMIN";
-  const canPortal = ["ADMIN", "MANAGER"].includes(state.user.role);
+  const isAdmin = isAdminLike();
+  const canPortal = ["ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING"].includes(state.user.role);
   const categories = await api("/customer-categories");
   c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
     <input type="text" id="custSearch" placeholder="Search customers..." style="flex:1;min-width:180px">
@@ -1100,8 +1114,8 @@ async function renderReceivables(c) {
   c.innerHTML = "Loading...";
   const rows = await api("/receivables");
   const role = state.user.role;
-  const canExport = ["ADMIN", "MANAGER", "ACCOUNTING"].includes(role);
-  const canArrears = ["ADMIN", "ACCOUNTING"].includes(role);
+  const canExport = ["ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING"].includes(role);
+  const canArrears = ["ADMIN", "OPERATION_HEAD", "ACCOUNTING"].includes(role);
   const statusColor = s => ({ PAID: "green", CURRENT: "blue", "DUE SOON": "warn", OVERDUE: "danger", "PARTIALLY PAID": "warn" }[s] || "gray");
   c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
     <button class="btn" id="agingBtn">Aging Report</button>
@@ -1272,7 +1286,7 @@ async function refreshLookups() {
 // ================================================================== INVENTORY
 async function renderInventory(c) {
   c.innerHTML = "Loading...";
-  const isAdmin = state.user.role === "ADMIN";
+  const isAdmin = isAdminLike();
   async function load() {
     const rows = await api("/inventory");
     const empties = await api("/inventory/empties");
@@ -1453,10 +1467,63 @@ async function renderInventoryLedger(c) {
 }
 
 // ================================================================== TRANSFERS / DISPATCH
+// Import stock received from a supplier into ANY location (Admin, Operation
+// Head, Dispatcher, Supervisor, Order Taker — the "Import Stock" module).
+function openImportStockModal(onDone) {
+  const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+  const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  openModal("Import Stock from Supplier", `
+    <div class="field"><label>Receiving Location</label><select id="ibLoc">${locOpts}</select></div>
+    <div class="field"><label>Product</label><select id="ibProd">${prodOpts}</select></div>
+    <div class="field"><label>Quantity Received</label><input type="number" id="ibQty" value="1" min="1"></div>
+    <div class="field"><label>Supplier</label><input id="ibSupplier" placeholder="e.g. Solane Plant"></div>
+    <div class="field"><label>Reference # (delivery receipt, etc.)</label><input id="ibRef"></div>
+    <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="ibSaveBtn">Record Received Stock</button></div>
+  `, () => {
+    if (state.user.location_id) document.getElementById("ibLoc").value = state.user.location_id;
+    document.getElementById("ibSaveBtn").addEventListener("click", async () => {
+      const supplier = document.getElementById("ibSupplier").value.trim();
+      if (!supplier) { toast("Supplier name is required", "error"); return; }
+      try {
+        await api("/inventory/inbound", { method: "POST", body: {
+          location_id: document.getElementById("ibLoc").value, product_id: document.getElementById("ibProd").value,
+          qty: document.getElementById("ibQty").value, supplier, reference: document.getElementById("ibRef").value,
+        }});
+        closeModal(); toast("Stock received and recorded", "success"); if (onDone) onDone();
+      } catch (e) {}
+    });
+  });
+}
+
+async function renderStockImport(c) {
+  const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+  c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <button class="btn green" id="importStockBtn">+ Import Stock from Supplier</button>
+      <select id="ibFilterLoc" style="width:auto"><option value="">All locations</option>${locOpts}</select>
+    </div>
+    <p style="color:var(--muted);font-size:13px;margin-top:0">Full cylinders received from a supplier / plant into any location. Each import adds to that location's stock and appears in the Inventory Ledger as INBOUND.</p>
+    <div id="ibTable">Loading...</div>`;
+  async function load() {
+    const loc = document.getElementById("ibFilterLoc").value;
+    const rows = await api("/inventory/inbound" + (loc ? `?location_id=${loc}` : ""));
+    document.getElementById("ibTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Date</th><th>Location</th><th>Product</th><th>Qty</th><th>Supplier / Notes</th><th>Reference</th><th>Recorded by</th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(r => `<tr><td>${esc(r.ts)}</td><td>${esc(r.location_name)}</td><td>${esc(r.product_name)}</td>
+        <td>${r.qty}</td><td>${esc(r.notes || "")}</td><td>${esc(r.reference || "")}</td><td>${esc(r.user_name || "")}</td></tr>`).join("")
+        : `<tr><td colspan="7" style="color:var(--muted)">No stock imports yet.</td></tr>`}
+    </tbody></table></div>`;
+  }
+  document.getElementById("importStockBtn").addEventListener("click", () => openImportStockModal(load));
+  document.getElementById("ibFilterLoc").addEventListener("change", load);
+  load();
+}
+
 async function renderTransfers(c) {
   c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px">
     <button class="btn green" id="newXferBtn">+ New Transfer / Dispatch</button>
-    <button class="btn" id="importStockBtn">+ Import Stock from Supplier</button>
+    ${hasModule("stock_import") ? `<button class="btn" id="importStockBtn">+ Import Stock from Supplier</button>` : ""}
   </div><div id="xferTable">Loading...</div>`;
   async function load() {
     const rows = await api("/transfers");
@@ -1470,31 +1537,8 @@ async function renderTransfers(c) {
       </tr>`).join("")}
     </tbody></table></div>`;
   }
-  document.getElementById("importStockBtn").addEventListener("click", () => {
-    const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
-    const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
-    openModal("Import Stock from Supplier", `
-      <div class="field"><label>Receiving Location</label><select id="ibLoc">${locOpts}</select></div>
-      <div class="field"><label>Product</label><select id="ibProd">${prodOpts}</select></div>
-      <div class="field"><label>Quantity Received</label><input type="number" id="ibQty" value="1" min="1"></div>
-      <div class="field"><label>Supplier</label><input id="ibSupplier" placeholder="e.g. Solane Plant"></div>
-      <div class="field"><label>Reference # (delivery receipt, etc.)</label><input id="ibRef"></div>
-      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
-        <button class="btn green" id="ibSaveBtn">Record Received Stock</button></div>
-    `, () => {
-      document.getElementById("ibSaveBtn").addEventListener("click", async () => {
-        const supplier = document.getElementById("ibSupplier").value.trim();
-        if (!supplier) { toast("Supplier name is required", "error"); return; }
-        try {
-          await api("/inventory/inbound", { method: "POST", body: {
-            location_id: document.getElementById("ibLoc").value, product_id: document.getElementById("ibProd").value,
-            qty: document.getElementById("ibQty").value, supplier, reference: document.getElementById("ibRef").value,
-          }});
-          closeModal(); toast("Stock received and recorded", "success"); load();
-        } catch (e) {}
-      });
-    });
-  });
+  const importBtn = document.getElementById("importStockBtn");
+  if (importBtn) importBtn.addEventListener("click", () => openImportStockModal(load));
   document.getElementById("newXferBtn").addEventListener("click", () => {
     const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
     const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
@@ -2132,11 +2176,14 @@ async function renderReports(c) {
 
 // ================================================================== ADMIN: USERS
 async function renderUsers(c) {
-  const canManage = state.user.role === "ADMIN" || state.user.role === "MANAGER";
+  const canManage = isAdminLike() || state.user.role === "MANAGER";
   c.innerHTML = `<div style="margin-bottom:12px">${canManage ? `<button class="btn green" id="newUserBtn">+ New User</button>` : ""}</div><div id="usersTable">Loading...</div>`;
   let allRoles = [];
   function roleOptions(selected) {
+    // Only Admin can give out ADMIN; only Admin / Operation Head can give out OPERATION_HEAD.
+    const me = state.user.role;
     return allRoles
+      .filter(r => r.name === selected || (r.name !== "ADMIN" || me === "ADMIN") && (r.name !== "OPERATION_HEAD" || isAdminLike(me)))
       .map(r => `<option value="${esc(r.name)}" ${r.name === selected ? "selected" : ""}>${esc(r.name)}</option>`).join("");
   }
   async function load() {
@@ -2589,14 +2636,14 @@ async function renderCylinderDeposits(c) {
     const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
     openModal(`Return Cylinder — ${custName}`, `
       <p>${esc(prodName)} — currently ${maxQty} on loan</p>
-      ${state.user.role === "ADMIN" ? `<div class="field"><label>Receiving Location</label><select id="retLoc">${locOpts}</select></div>` : ""}
+      ${isAdminLike() ? `<div class="field"><label>Receiving Location</label><select id="retLoc">${locOpts}</select></div>` : ""}
       <div class="field"><label>Quantity Returned</label><input type="number" id="retQty" value="1" min="1" max="${maxQty}"></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
         <button class="btn green" id="retSaveBtn">Confirm Return</button></div>
     `, () => {
       document.getElementById("retSaveBtn").addEventListener("click", async () => {
         const body = { customer_id: customerId, product_id: productId, qty: document.getElementById("retQty").value };
-        if (state.user.role === "ADMIN") body.location_id = document.getElementById("retLoc").value;
+        if (isAdminLike()) body.location_id = document.getElementById("retLoc").value;
         try {
           await api("/cylinder-deposits/return", { method: "POST", body });
           closeModal(); toast("Cylinder return recorded", "success"); load();
@@ -2896,7 +2943,7 @@ async function renderEmployees(c) {
 
 // ================================================================== STAFF SCHEDULE
 async function renderStaffSchedule(c) {
-  const canEdit = state.user.role === "ADMIN" || state.user.role === "MANAGER";
+  const canEdit = isAdminLike() || state.user.role === "MANAGER";
   c.innerHTML = `
     <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
       <input type="date" id="schedFrom"><input type="date" id="schedTo">
@@ -2982,9 +3029,9 @@ async function renderKpi(c) {
 // ================================================================== BOOKED ORDERS
 async function renderBookedOrders(c) {
   const role = state.user.role;
-  const canCreate = ["ADMIN", "MANAGER", "ORDER_TAKER"].includes(role);
+  const canCreate = ["ADMIN", "OPERATION_HEAD", "MANAGER", "ORDER_TAKER"].includes(role);
   const canAssign = canCreate;
-  const isAttendant = !["ADMIN", "MANAGER", "ORDER_TAKER"].includes(role);
+  const isAttendant = !["ADMIN", "OPERATION_HEAD", "MANAGER", "ORDER_TAKER"].includes(role);
   const publicUrl = `${location.origin}/order`;
   c.innerHTML = `
     ${canCreate ? `<div class="card" style="margin-bottom:14px;padding:12px 16px">
@@ -3107,7 +3154,7 @@ async function renderBookedOrders(c) {
 
 // ================================================================== INCIDENT REPORTS
 async function renderIncidentReports(c) {
-  const canResolve = state.user.role === "ADMIN" || state.user.role === "MANAGER";
+  const canResolve = isAdminLike() || state.user.role === "MANAGER";
   c.innerHTML = `<div style="margin-bottom:12px"><button class="btn green" id="newIncBtn">+ Report Incident</button></div>
     <div id="incTable">Loading...</div>`;
   const sevColor = s => ({ LOW: "blue", MEDIUM: "warn", HIGH: "danger", CRITICAL: "danger" }[s] || "gray");
@@ -3131,7 +3178,7 @@ async function renderIncidentReports(c) {
   }
   document.getElementById("newIncBtn").addEventListener("click", () => {
     const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
-    const isAdminOrMgr = state.user.role === "ADMIN" || state.user.role === "MANAGER";
+    const isAdminOrMgr = isAdminLike() || state.user.role === "MANAGER";
     openModal("Report Incident", `
       ${isAdminOrMgr ? `<div class="field"><label>Location</label><select id="iLoc">${locOpts}</select></div>` : ""}
       <div class="field"><label>Category</label><select id="iCat">
@@ -3327,9 +3374,10 @@ async function renderRoles(c) {
       reports: "Reports", audit: "Audit Log", booked_orders: "Booked Orders", incident_reports: "Incident Reports",
       commercial_deliveries: "50kg Commercial Billing", eod_report: "End of Day Report",
       receivables_summary: "Dashboard: Receivables Totals", customer_growth: "Customer Growth",
+      stock_import: "Import Stock from Supplier", sales_targets: "Sales Targets",
     };
     openModal(`${locked ? "View" : "Edit"} Modules — ${name}`, `
-      ${locked ? `<p style="color:var(--muted);font-size:13px">Admin always has full access to every module — this can't be changed.</p>` : ""}
+      ${locked ? `<p style="color:var(--muted);font-size:13px">${name === "OPERATION_HEAD" ? "Operation Head always has full access to every module (everything except the System Reset)" : "Admin always has full access to every module"} — this can't be changed.</p>` : ""}
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
         ${data.all_modules.map(m => `<label style="display:flex;align-items:center;gap:6px;font-size:13.5px;font-weight:400">
           <input type="checkbox" class="modChk" value="${m}" ${data.module_keys.includes(m) ? "checked" : ""} ${locked ? "disabled" : ""} style="width:auto">
@@ -3354,8 +3402,11 @@ async function renderRoles(c) {
 // ================================================================== COMMERCIAL 50kg BILLING
 async function renderCommercialDeliveries(c) {
   const role = state.user.role;
-  const canCreate = ["ADMIN", "MANAGER", "DISPATCHER"].includes(role);
-  const canBill = role === "ADMIN" || role === "MANAGER";
+  const canCreate = hasModule("commercial_deliveries");
+  const canBill = isAdminLike(role) || role === "MANAGER";
+  // Who may type their own price per kg on a DR billing (others use the product's default).
+  const canRate = ["ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING"].includes(role);
+  const typeBadge = t => ({ WIWO: "blue", DR: "green" }[t] || "warn");
   c.innerHTML = `<div style="margin-bottom:12px">${canCreate ? `<button class="btn green" id="newDeliveryBtn">+ New Commercial Billing</button>` : ""}</div>
     <div id="cdTable">Loading...</div>`;
   const statusColor = s => ({ DELIVERED: "warn", PICKED_UP: "blue", BILLED: "green", CANCELLED: "danger" }[s] || "gray");
@@ -3368,17 +3419,19 @@ async function renderCommercialDeliveries(c) {
       ${rows.length ? rows.map(d => `<tr>
         <td>${d.delivery_no}</td><td>${d.delivery_date}</td>
         <td>${esc(d.customer_name)} (${d.account_no})</td><td>${esc(d.location_name)}</td>
-        <td><span class="badge ${d.billing_type === 'WIWO' ? 'blue' : 'warn'}">${d.billing_type}</span></td>
+        <td><span class="badge ${typeBadge(d.billing_type)}">${d.billing_type}</span></td>
         <td>${esc(d.product_name)}</td>
         <td>${d.billing_type === 'WIWO' ? `${d.cylinders.length} cylinder(s), ${d.total_net_weight_in}kg in`
+              : d.billing_type === 'DR' ? `${d.dr_ref ? 'DR ' + esc(d.dr_ref) + ': ' : ''}${d.delivered_qty} delivered, ${d.cylinders.length} pulled out (${d.total_residual_kg || 0}kg residual)`
               : `${esc(d.meter_label || 'meter')}: ${d.previous_reading} \u2192 ${d.current_reading}`}</td>
-        <td>${d.total_consumption_weight !== null ? d.total_consumption_weight + (d.billing_type === 'WIWO' ? ' kg' : '') : '—'}</td>
+        <td>${d.total_consumption_weight !== null ? d.total_consumption_weight + (d.billing_type !== 'READING' ? ' kg' : '') : '—'}</td>
         <td>${d.billed_amount ? money(d.billed_amount) : '—'}</td>
         <td><span class="badge ${statusColor(d.status)}">${d.status}</span></td>
         <td style="display:flex;gap:6px;flex-wrap:wrap">
           <button class="btn small" onclick="viewCommercialDelivery(${d.id})">View</button>
           <button class="btn small" onclick="printCommercialDelivery(${d.id})">Print</button>
           <a class="btn small" href="/api/commercial-deliveries/${d.id}/export/pdf">PDF</a>
+          ${d.billing_type === 'DR' && d.sale_id ? `<button class="btn small" onclick="printSaleDR(${d.sale_id})">DR</button>` : ""}
           ${d.status === 'DELIVERED' && d.billing_type === 'WIWO' && canCreate ? `<button class="btn small" onclick="openRecordPickup(${d.id})">Record Pickup</button>` : ""}
           ${d.status === 'PICKED_UP' && canBill ? `<button class="btn small green" onclick="openBillDelivery(${d.id}, ${d.total_consumption_weight})">Generate Invoice</button>` : ""}
           ${d.status !== 'BILLED' && d.status !== 'CANCELLED' && canCreate ? `<button class="btn small danger" onclick="cancelCommercialDelivery(${d.id})">Cancel</button>` : ""}
@@ -3393,9 +3446,10 @@ async function renderCommercialDeliveries(c) {
       const custOpts = customers.map(cu => `<option value="${cu.id}">${esc(cu.name)} (${cu.account_no})</option>`).join("");
       const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
       const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
-      const isAdminOrMgr = role === "ADMIN" || role === "MANAGER";
+      const isAdminOrMgr = isAdminLike(role) || role === "MANAGER";
       openModal("New Commercial Billing", `
         <div class="field"><label>Billing Type</label><select id="cdType">
+          <option value="DR">DR — Manual billing on delivery (delivered less residual of pull-outs)</option>
           <option value="WIWO">WIWO — Weight In / Weight Out (cylinders)</option>
           <option value="READING">READING — Meter Reading</option>
         </select></div>
@@ -3403,7 +3457,27 @@ async function renderCommercialDeliveries(c) {
         ${isAdminOrMgr ? `<div class="field"><label>Location</label><select id="cdLoc">${locOpts}</select></div>` : ""}
         <div class="field"><label>Product</label><select id="cdProd">${prodOpts}</select></div>
 
-        <div id="wiwoFields">
+        <div id="drFields">
+          <div class="field"><label>DR No. (from the printed Delivery Receipt)</label><input id="drRef" placeholder="e.g. 012345"></div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap">
+            <div class="field" style="flex:1;min-width:140px"><label>50kg cylinders delivered</label><input type="number" id="drQty" min="1" value="1"></div>
+            <div class="field" style="flex:1;min-width:140px"><label>kg per cylinder</label><input type="number" step="0.01" id="drKg" value="50"></div>
+          </div>
+          <div class="field"><label>Cylinders pulled out (serial numbers don't need to match)</label>
+            <p style="font-size:12px;color:var(--muted);margin:0 0 6px">Enter gross and tare weight, or type the residual kg directly. The residual is deducted from the bill.</p>
+            <div style="display:flex;gap:8px;font-size:11.5px;color:var(--muted);font-weight:600">
+              <span style="flex:1">Serial no.</span><span style="flex:1">Gross (kg)</span><span style="flex:1">Tare (kg)</span><span style="flex:1">Residual (kg)</span><span style="width:30px"></span></div>
+            <div id="drPullRows"></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button class="btn small" id="drAddPullBtn" type="button">+ Add Pull-out</button>
+              <button class="btn small" id="drMatchBtn" type="button">Same count as delivered</button>
+            </div>
+          </div>
+          ${canRate ? `<div class="field"><label>Price per kg</label><input type="number" step="0.01" id="drRate"></div>` : ""}
+          <div class="field" id="drSummary" style="background:var(--bg);padding:10px;border-radius:8px;font-size:13.5px"></div>
+          <p style="font-size:12px;color:var(--muted);margin:0">Saving bills the customer right away: a credit sale, invoice and DR are created.</p>
+        </div>
+        <div id="wiwoFields" class="hidden">
           <div class="field"><label>Cylinders</label>
             <div id="cdCylRows"></div>
             <button class="btn small" id="cdAddCylBtn" type="button">+ Add Cylinder</button>
@@ -3420,6 +3494,69 @@ async function renderCommercialDeliveries(c) {
         <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
           <button class="btn green" id="cdSaveBtn">Save</button></div>
       `, () => {
+        // ---- DR (manual) billing
+        const pullRows = document.getElementById("drPullRows");
+        const prodById = id => state.products.find(p => String(p.id) === String(id));
+        function kgFromName(p) { const m = /(\d+(?:\.\d+)?)\s*-?\s*kg\b/i.exec((p && (p.name + " " + (p.sku || ""))) || ""); return m ? parseFloat(m[1]) : 50; }
+        function syncProductDefaults() {
+          const p = prodById(document.getElementById("cdProd").value);
+          document.getElementById("drKg").value = kgFromName(p);
+          const rateEl = document.getElementById("drRate");
+          if (rateEl) rateEl.value = p ? (p.price_per_kg || "") : "";
+          drRecalc();
+        }
+        function rowResidual(row) {
+          const gw = parseFloat(row.querySelector(".poGW").value), tw = parseFloat(row.querySelector(".poTW").value);
+          if (!isNaN(gw) && !isNaN(tw)) return gw - tw;
+          return parseFloat(row.querySelector(".poRes").value) || 0;
+        }
+        function drRecalc() {
+          const qty = parseInt(document.getElementById("drQty").value) || 0;
+          const kg = parseFloat(document.getElementById("drKg").value) || 0;
+          const rows = [...pullRows.querySelectorAll(".pay-row")];
+          rows.forEach(r => {
+            const gw = parseFloat(r.querySelector(".poGW").value), tw = parseFloat(r.querySelector(".poTW").value);
+            if (!isNaN(gw) && !isNaN(tw)) r.querySelector(".poRes").value = (gw - tw).toFixed(2);
+          });
+          const delivered = qty * kg;
+          const residual = rows.reduce((t, r) => t + rowResidual(r), 0);
+          const billable = delivered - residual;
+          const p = prodById(document.getElementById("cdProd").value);
+          const rateEl = document.getElementById("drRate");
+          const rate = rateEl ? (parseFloat(rateEl.value) || 0) : (p ? p.price_per_kg || 0 : 0);
+          document.getElementById("drSummary").innerHTML = `
+            Delivered: <b>${qty} x ${kg} kg = ${delivered.toFixed(2)} kg</b><br>
+            Less residual of ${rows.length} pulled-out cylinder(s): <b>${residual.toFixed(2)} kg</b><br>
+            Billable: <b>${billable.toFixed(2)} kg</b> @ ${money(rate)}/kg = <b style="color:var(--green-dark)">${money(billable * rate)}</b>
+            ${!rate ? `<br><span style="color:var(--danger)">No price per kg set on this product${canRate ? " — enter one above" : " — ask Admin/Accounting to set it"}.</span>` : ""}
+            ${rows.length !== qty ? `<br><span style="color:var(--muted)">Note: ${rows.length} pulled out vs ${qty} delivered.</span>` : ""}`;
+        }
+        function addPullRow() {
+          const row = document.createElement("div");
+          row.className = "pay-row";
+          row.innerHTML = `
+            <input type="text" class="poSerial" placeholder="Serial no." style="flex:1;min-width:0">
+            <input type="number" step="0.01" class="poGW" placeholder="Gross Wt" style="flex:1;min-width:0">
+            <input type="number" step="0.01" class="poTW" placeholder="Tare Wt" style="flex:1;min-width:0">
+            <input type="number" step="0.01" class="poRes" placeholder="Residual" style="flex:1;min-width:0">
+            <button class="btn small danger" type="button">&times;</button>`;
+          row.querySelectorAll("input").forEach(i => i.addEventListener("input", drRecalc));
+          row.querySelector("button").addEventListener("click", () => { row.remove(); drRecalc(); });
+          pullRows.appendChild(row);
+        }
+        document.getElementById("drAddPullBtn").addEventListener("click", () => { addPullRow(); drRecalc(); });
+        document.getElementById("drMatchBtn").addEventListener("click", () => {
+          const qty = parseInt(document.getElementById("drQty").value) || 0;
+          while (pullRows.children.length < qty) addPullRow();
+          while (pullRows.children.length > qty) pullRows.lastElementChild.remove();
+          drRecalc();
+        });
+        ["drQty", "drKg", "drRate"].forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener("input", drRecalc); });
+        document.getElementById("cdProd").addEventListener("change", syncProductDefaults);
+        const p50 = state.products.find(p => kgFromName(p) === 50 && /50\s*-?\s*kg/i.test(p.name + " " + (p.sku || "")));
+        if (p50) document.getElementById("cdProd").value = p50.id;
+        syncProductDefaults();
+
         const cylRows = document.getElementById("cdCylRows");
         function addCylRow() {
           const row = document.createElement("div");
@@ -3467,7 +3604,8 @@ async function renderCommercialDeliveries(c) {
 
         document.getElementById("cdType").addEventListener("change", (e) => {
           const isReading = e.target.value === "READING";
-          document.getElementById("wiwoFields").classList.toggle("hidden", isReading);
+          document.getElementById("drFields").classList.toggle("hidden", e.target.value !== "DR");
+          document.getElementById("wiwoFields").classList.toggle("hidden", e.target.value !== "WIWO");
           document.getElementById("readingFields").classList.toggle("hidden", !isReading);
           if (isReading) suggestPreviousReading();
         });
@@ -3484,6 +3622,27 @@ async function renderCommercialDeliveries(c) {
             billing_type: billingType,
             notes: document.getElementById("cdNotes").value,
           };
+          if (billingType === "DR") {
+            base.dr_ref = document.getElementById("drRef").value.trim();
+            base.delivered_qty = document.getElementById("drQty").value;
+            base.kg_per_cylinder = document.getElementById("drKg").value;
+            const rateEl = document.getElementById("drRate");
+            if (rateEl && rateEl.value) base.price_per_kg = rateEl.value;
+            base.pullouts = [...pullRows.querySelectorAll(".pay-row")].map(r => ({
+              serial_no: r.querySelector(".poSerial").value,
+              gross_weight: r.querySelector(".poGW").value,
+              tare_weight: r.querySelector(".poTW").value,
+              residual_kg: r.querySelector(".poRes").value,
+            })).filter(po => po.serial_no || po.gross_weight || po.tare_weight || po.residual_kg);
+            if (!base.delivered_qty || parseInt(base.delivered_qty) < 1) { toast("Enter the number of cylinders delivered", "error"); return; }
+            try {
+              const r = await api("/commercial-deliveries", { method: "POST", body: base });
+              closeModal(); load();
+              toast(`Billed ${r.billable_kg} kg = ${money(r.billed_amount)} (${r.sale_no}, ${r.dr_no})`, "success");
+              if (confirm("Billing saved. Print the Delivery Receipt now?")) printSaleDR(r.sale_id);
+            } catch (e) {}
+            return;
+          }
           if (billingType === "WIWO") {
             const cylinders = [...cylRows.querySelectorAll(".pay-row")].map(r => ({
               cylinder_label: r.querySelector(".cdLabel").value,
@@ -3511,7 +3670,15 @@ async function renderCommercialDeliveries(c) {
 
   window.viewCommercialDelivery = async (id) => {
     const d = await api(`/commercial-deliveries/${id}`);
-    const detailHtml = d.billing_type === "WIWO" ? `
+    const drHtml = d.billing_type === "DR" ? `
+      <div class="field"><b>DR No.:</b> ${esc(d.dr_ref || '—')} ${d.sale_dr_no ? `&nbsp; <b>System DR:</b> ${esc(d.sale_dr_no)}` : ""} ${d.sale_no ? `&nbsp; <b>Sale:</b> ${esc(d.sale_no)}` : ""}</div>
+      <div class="field"><b>Delivered:</b> ${d.delivered_qty} x ${d.kg_per_cylinder} kg = ${d.delivered_kg} kg</div>
+      <div class="table-wrap"><table><thead><tr><th>Pulled-out Serial</th><th>Gross Wt</th><th>Tare</th><th>Residual (kg)</th></tr></thead><tbody>
+        ${d.cylinders.length ? d.cylinders.map(po => `<tr><td>${esc(po.serial_no || '—')}</td><td>${po.gross_weight ?? '—'}</td><td>${po.tare_weight ?? '—'}</td><td>${po.residual_kg}</td></tr>`).join("")
+          : `<tr><td colspan="4" style="color:var(--muted)">No pull-outs</td></tr>`}
+      </tbody></table></div>
+      <div class="field"><b>Total residual:</b> ${d.total_residual_kg || 0} kg &nbsp; <b>Billable:</b> ${d.total_consumption_weight} kg</div>` : "";
+    const detailHtml = d.billing_type === "DR" ? drHtml : d.billing_type === "WIWO" ? `
       <div class="table-wrap"><table><thead><tr>
         <th>Cylinder</th><th>GW In</th><th>Tare</th><th>NW In</th><th>GW Out</th><th>NW Out</th><th>Consumed</th>
       </tr></thead><tbody>
@@ -3525,7 +3692,7 @@ async function renderCommercialDeliveries(c) {
       <div class="field"><b>Consumption:</b> ${d.total_consumption_weight}</div>
     `;
     openModal(`${d.delivery_no}`, `
-      <div class="field"><b>Type:</b> <span class="badge ${d.billing_type === 'WIWO' ? 'blue' : 'warn'}">${d.billing_type}</span></div>
+      <div class="field"><b>Type:</b> <span class="badge ${typeBadge(d.billing_type)}">${d.billing_type}</span></div>
       <div class="field"><b>Customer:</b> ${esc(d.customer_name)} (${d.account_no})</div>
       <div class="field"><b>Location:</b> ${esc(d.location_name)} &nbsp; <b>Product:</b> ${esc(d.product_name)}</div>
       <div class="field"><b>Status:</b> <span class="badge ${statusColor(d.status)}">${d.status}</span></div>
@@ -3534,6 +3701,7 @@ async function renderCommercialDeliveries(c) {
       <div class="modal-actions">
         <button class="btn" onclick="closeModal()">Close</button>
         <button class="btn" onclick="printCommercialDelivery(${id})">Print</button>
+        ${d.billing_type === "DR" && d.sale_id ? `<button class="btn" onclick="printSaleDR(${d.sale_id})">Print DR</button>` : ""}
         <a class="btn green" href="/api/commercial-deliveries/${id}/export/pdf">Export PDF</a>
       </div>
     `);
@@ -3614,7 +3782,15 @@ async function renderCommercialDeliveries(c) {
 
   window.printCommercialDelivery = async (id) => {
     const d = await api(`/commercial-deliveries/${id}`);
-    const detailRows = d.billing_type === "WIWO"
+    const detailRows = d.billing_type === "DR"
+      ? `<div style="margin:10px 0">DR No.: ${esc(d.dr_ref || '—')}${d.sale_dr_no ? ` (system ${esc(d.sale_dr_no)})` : ""}<br>
+          Delivered: ${d.delivered_qty} x ${d.kg_per_cylinder} kg = ${d.delivered_kg} kg</div>
+        <table style="width:100%;border-collapse:collapse;font-size:12px;margin:10px 0">
+          <tr style="border-bottom:1px solid #ccc"><th style="text-align:left">Pulled-out Serial</th><th>Gross Wt</th><th>Tare</th><th>Residual (kg)</th></tr>
+          ${d.cylinders.map(po => `<tr><td>${esc(po.serial_no || '—')}</td><td>${po.gross_weight ?? '—'}</td><td>${po.tare_weight ?? '—'}</td><td>${po.residual_kg}</td></tr>`).join("")}
+        </table>
+        <div>Total residual deducted: ${d.total_residual_kg || 0} kg</div>`
+      : d.billing_type === "WIWO"
       ? `<table style="width:100%;border-collapse:collapse;font-size:12px;margin:10px 0">
           <tr style="border-bottom:1px solid #ccc"><th style="text-align:left">Cylinder</th><th>GW In</th><th>Tare</th><th>NW In</th><th>GW Out</th><th>NW Out</th><th>Consumed</th></tr>
           ${d.cylinders.map(cy => `<tr><td>${esc(cy.cylinder_label || '—')}</td><td>${cy.gross_weight_in}</td>
@@ -3628,7 +3804,7 @@ async function renderCommercialDeliveries(c) {
         <div style="text-align:center;margin-bottom:14px">
           <img src="/images/logo.png" alt="GUFC" style="width:56px;height:56px;object-fit:contain">
           <div style="font-weight:800;font-size:16px;margin-top:4px">GREAT UNLI FOOD CORP.</div>
-          <div style="color:#6b7785">Commercial LPG Billing — ${d.billing_type === 'WIWO' ? 'Weight In / Weight Out' : 'Meter Reading'}</div>
+          <div style="color:#6b7785">Commercial LPG Billing — ${d.billing_type === 'WIWO' ? 'Weight In / Weight Out' : d.billing_type === 'DR' ? 'DR Billing (delivered less residual)' : 'Meter Reading'}</div>
         </div>
         <table style="width:100%;border-collapse:collapse;margin-bottom:10px">
           <tr><td style="padding:4px 0;width:140px"><b>Delivery #</b></td><td>${d.delivery_no}</td></tr>
@@ -3640,7 +3816,7 @@ async function renderCommercialDeliveries(c) {
         </table>
         ${detailRows}
         <div style="margin-top:14px;font-size:14px">
-          <b>Total Consumption:</b> ${d.total_consumption_weight ?? '—'} ${d.billing_type === 'WIWO' ? 'kg' : ''}<br>
+          <b>${d.billing_type === 'DR' ? 'Billable' : 'Total Consumption'}:</b> ${d.total_consumption_weight ?? '—'} ${d.billing_type !== 'READING' ? 'kg' : ''}<br>
           ${d.price_per_kg ? `<b>Rate:</b> ${money(d.price_per_kg)}<br>` : ""}
           ${d.billed_amount ? `<b style="color:#1e9e5a">Billed Amount: ${money(d.billed_amount)}</b>` : ""}
         </div>
@@ -3650,4 +3826,159 @@ async function renderCommercialDeliveries(c) {
   };
 
   load();
+}
+
+// ================================================================== SALES DEPARTMENT: TARGETS
+// 4 tiers per month, Domestic (11kg & 1.4kg) and Commercial (50kg), for the
+// whole business, a location, or a customer (MRTO / ERTO). Quantities are
+// cylinders.
+async function renderSalesTargets(c) {
+  const SEGMENTS = [["DOMESTIC", "Domestic (11kg & 1.4kg)"], ["COMMERCIAL", "Commercial (50kg)"]];
+  const TIERS = [1, 2, 3, 4];
+  const now = new Date();
+  const thisMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const customers = await api("/customers?q=");
+  const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+  c.innerHTML = `
+    <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+      <button class="btn green" data-tab="ach">Achievement</button>
+      <button class="btn" data-tab="set">Set Targets</button>
+    </div>
+    <div id="stAch">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <label style="margin:0">Month</label><input type="month" id="stMonth" value="${thisMonth}" style="width:auto">
+      </div>
+      <p style="color:var(--muted);font-size:13px;margin-top:0">Actual = cylinders on completed sales in the month (voided sales excluded). Domestic counts 11kg and 1.4kg cylinders; Commercial counts 50kg cylinders and 50kg commercial billings (cylinders delivered). Green = tier reached.</p>
+      <div id="stAchTable">Loading...</div>
+    </div>
+    <div id="stSet" class="hidden">
+      <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px">
+        <div class="field" style="margin:0"><label>Target for</label><select id="stScope" style="width:auto">
+          <option value="OVERALL">Overall business</option><option value="LOCATION">A location</option><option value="CUSTOMER">A customer</option>
+        </select></div>
+        <div class="field hidden" id="stLocWrap" style="margin:0"><label>Location</label><select id="stLoc" style="width:auto">${locOpts}</select></div>
+        <div class="field hidden" id="stCustWrap" style="margin:0;min-width:240px"><label>Customer</label>
+          <select id="stCust"></select>
+          <label style="display:flex;align-items:center;gap:6px;font-weight:400;font-size:12.5px;margin-top:4px">
+            <input type="checkbox" id="stCustAll" style="width:auto"> Show all categories (default: MRTO &amp; ERTO only)</label>
+        </div>
+        <div class="field" style="margin:0"><label>Year</label><input type="number" id="stYear" value="${now.getFullYear()}" style="width:100px"></div>
+        <button class="btn" id="stLoadBtn">Load</button>
+      </div>
+      <div id="stGrid"></div>
+    </div>`;
+
+  c.querySelectorAll("[data-tab]").forEach(b => b.addEventListener("click", () => {
+    c.querySelectorAll("[data-tab]").forEach(x => x.classList.toggle("green", x === b));
+    document.getElementById("stAch").classList.toggle("hidden", b.dataset.tab !== "ach");
+    document.getElementById("stSet").classList.toggle("hidden", b.dataset.tab !== "set");
+    if (b.dataset.tab === "ach") loadAch(); else loadGrid();
+  }));
+
+  const fmt = n => (n === null || n === undefined) ? "" : Number(n).toLocaleString("en-PH", { maximumFractionDigits: 2 });
+  function tierCells(r) {
+    return TIERS.map(t => {
+      const q = r.tiers[String(t)];
+      if (!q) return `<td style="color:var(--muted)">—</td>`;
+      const hit = r.actual >= q;
+      return `<td style="${hit ? "background:#e3f6ec;color:var(--green-dark);font-weight:700" : ""}">${fmt(q)}<div style="font-size:11px;color:var(--muted);font-weight:400">${r.pct[String(t)]}%</div></td>`;
+    }).join("");
+  }
+  function reachedCell(r) {
+    const any = TIERS.some(t => r.tiers[String(t)]);
+    if (!any) return `<td style="color:var(--muted)">No target</td>`;
+    return `<td>${r.reached_tier ? `<span class="badge green">Tier ${r.reached_tier}</span>` : `<span class="badge gray">None yet</span>`}
+      ${r.next_tier ? `<div style="font-size:11.5px;color:var(--muted);margin-top:2px">${fmt(r.to_next_tier)} more to Tier ${r.next_tier}</div>` : ""}</td>`;
+  }
+
+  async function loadAch() {
+    const month = document.getElementById("stMonth").value || thisMonth;
+    const el = document.getElementById("stAchTable");
+    el.textContent = "Loading...";
+    let data;
+    try { data = await api(`/sales-targets/achievement?month=${month}`); } catch (e) { el.textContent = ""; return; }
+    const scopeLabel = { OVERALL: "Overall", LOCATION: "Location", CUSTOMER: "Customer" };
+    el.innerHTML = `<h3 style="margin:4px 0 8px">${esc(data.month_label)}</h3>
+      <div class="table-wrap"><table><thead>
+        <tr><th rowspan="2">Target for</th>${SEGMENTS.map(([, l]) => `<th colspan="6" style="text-align:center">${l}</th>`).join("")}</tr>
+        <tr>${SEGMENTS.map(() => `<th>Actual</th>${TIERS.map(t => `<th>Tier ${t}</th>`).join("")}<th>Reached</th>`).join("")}</tr>
+      </thead><tbody>
+        ${data.rows.map(r => `<tr>
+          <td><span class="badge ${r.scope === 'OVERALL' ? 'blue' : r.scope === 'LOCATION' ? 'warn' : 'gray'}">${scopeLabel[r.scope]}</span> ${esc(r.name)}</td>
+          ${SEGMENTS.map(([k]) => { const sg = r.segments[k]; return `<td style="font-weight:700">${fmt(sg.actual)}</td>${tierCells(sg)}${reachedCell(sg)}`; }).join("")}
+        </tr>`).join("")}
+      </tbody></table></div>
+      ${data.rows.length <= 1 ? `<p style="color:var(--muted);font-size:13px">No location or customer targets for this month yet — add them under Set Targets.</p>` : ""}`;
+  }
+  document.getElementById("stMonth").addEventListener("change", loadAch);
+
+  function fillCustomers() {
+    const all = document.getElementById("stCustAll").checked;
+    const list = customers.filter(cu => all || ["MRTO", "ERTO"].includes((cu.category || "").toUpperCase()));
+    document.getElementById("stCust").innerHTML = list.length
+      ? list.map(cu => `<option value="${cu.id}">${esc(cu.name)} (${esc(cu.account_no)}) — ${esc(cu.category || "")}</option>`).join("")
+      : `<option value="">No ${all ? "" : "MRTO / ERTO "}customers</option>`;
+  }
+  fillCustomers();
+  document.getElementById("stCustAll").addEventListener("change", () => { fillCustomers(); loadGrid(); });
+  document.getElementById("stScope").addEventListener("change", e => {
+    document.getElementById("stLocWrap").classList.toggle("hidden", e.target.value !== "LOCATION");
+    document.getElementById("stCustWrap").classList.toggle("hidden", e.target.value !== "CUSTOMER");
+    loadGrid();
+  });
+  ["stLoc", "stCust"].forEach(id => document.getElementById(id).addEventListener("change", loadGrid));
+  document.getElementById("stLoadBtn").addEventListener("click", loadGrid);
+
+  function scopeParams() {
+    const scope = document.getElementById("stScope").value;
+    const scope_id = scope === "LOCATION" ? document.getElementById("stLoc").value
+      : scope === "CUSTOMER" ? document.getElementById("stCust").value : 0;
+    return { scope, scope_id, year: parseInt(document.getElementById("stYear").value) || now.getFullYear() };
+  }
+
+  async function loadGrid() {
+    const el = document.getElementById("stGrid");
+    const p = scopeParams();
+    if (p.scope !== "OVERALL" && !p.scope_id) { el.innerHTML = `<p style="color:var(--muted)">Pick a ${p.scope.toLowerCase()}.</p>`; return; }
+    el.textContent = "Loading...";
+    let data;
+    try { data = await api(`/sales-targets?scope=${p.scope}&scope_id=${p.scope_id}&year=${p.year}`); } catch (e) { el.textContent = ""; return; }
+    const shortMonth = data.month_labels.map(l => l.split(" ")[0]);
+    el.innerHTML = `<h3 style="margin:4px 0 8px">${esc(data.scope_name)} — ${data.year}</h3>
+      <p style="color:var(--muted);font-size:13px;margin-top:0">Cylinders per month. Each month can have different quantities. Leave a cell blank for no target.</p>
+      <div class="table-wrap"><table class="st-grid"><thead><tr><th style="min-width:150px"></th>${shortMonth.map(m => `<th>${m} ${data.year}</th>`).join("")}</tr></thead><tbody>
+        ${SEGMENTS.map(([seg, label]) => `
+          <tr><td colspan="13" style="background:var(--bg);font-weight:800">${label}</td></tr>
+          ${TIERS.map(t => `<tr><td>Tier ${t}</td>${data.months.map(ym => {
+            const q = data.segments[seg][ym].tiers[String(t)];
+            return `<td><input type="number" min="0" step="1" class="stCell" data-seg="${seg}" data-month="${ym}" data-tier="${t}" value="${q ?? ""}" style="width:78px"></td>`;
+          }).join("")}</tr>`).join("")}
+          <tr style="font-weight:700"><td>Actual</td>${data.months.map(ym => {
+            const r = data.segments[seg][ym];
+            return `<td>${fmt(r.actual)}${r.reached_tier ? `<div><span class="badge green">T${r.reached_tier}</span></div>` : ""}</td>`;
+          }).join("")}</tr>`).join("")}
+      </tbody></table></div>
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn green" id="stSaveBtn">Save Targets</button>
+        <button class="btn" id="stCopyBtn" title="Copy each tier's January value to every blank month">Fill blank months from January</button>
+      </div>`;
+    document.getElementById("stCopyBtn").addEventListener("click", () => {
+      SEGMENTS.forEach(([seg]) => TIERS.forEach(t => {
+        const cells = [...el.querySelectorAll(`.stCell[data-seg="${seg}"][data-tier="${t}"]`)];
+        const jan = cells[0] && cells[0].value;
+        if (jan) cells.slice(1).forEach(ci => { if (!ci.value) ci.value = jan; });
+      }));
+    });
+    document.getElementById("stSaveBtn").addEventListener("click", async () => {
+      const targets = [...el.querySelectorAll(".stCell")].map(i => ({
+        segment: i.dataset.seg, month: i.dataset.month, tier: parseInt(i.dataset.tier), qty: i.value,
+      }));
+      try {
+        await api("/sales-targets", { method: "PUT", body: { ...p, targets } });
+        toast("Targets saved", "success"); loadGrid();
+      } catch (e) {}
+    });
+  }
+
+  loadAch();
 }
