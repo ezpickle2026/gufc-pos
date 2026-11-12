@@ -916,7 +916,7 @@ async function loadSalesPage() {
         ${s.sale_type === 'CREDIT' ? `<button class="btn small green" onclick="printSaleDR(${s.id})" title="Print Delivery Receipt">DR</button>` : ""}
         ${s.billing_id ? `<span class="badge green" title="Billed ${money(Number((s.billing_ref || "|0").split("|")[1]))}">Billed ${esc((s.billing_ref || "").split("|")[0])}</span>`
           : canGenBill && s.bill_later_qty > 0 && s.status === 'COMPLETED' ? `<button class="btn small blue" onclick="openSaleBilling(${s.id})" title="50kg commercial delivery — bill the gas">Generate Billing</button>` : ""}
-        ${canEditSale() && s.status === 'COMPLETED' && !s.billing_id ? `<button class="btn small" onclick="openEditSale(${s.id})" title="Adjust items, prices or customer">Edit</button>` : ""}
+        ${canEditSale() && s.status === 'COMPLETED' && !s.billing_id ? `<button class="btn small" onclick="openEditSale(${s.id})" title="Adjust items, prices, payment or customer">Edit</button>` : ""}
         ${(isAdminLike() || state.user.role === 'SUPERVISOR') && s.status !== 'VOIDED' ? `<button class="btn small danger" onclick="voidSale(${s.id})">Void</button>` : ""}
       </td>
     </tr>`).join("") : `<tr><td colspan="10" style="color:var(--muted)">No sales found.</td></tr>`}
@@ -944,6 +944,10 @@ window.openEditSale = async (saleId) => {
   try { [detail, customers] = await Promise.all([api(`/sales/${saleId}`), api("/customers")]); } catch (e) { return; }
   const { sale, items } = detail;
   const isCredit = sale.sale_type === "CREDIT";
+  // POS payments can be corrected here; later AR collections stay as they are.
+  const posPays = (detail.payments || []).filter(p => (p.payment_source || "SALE") === "SALE");
+  const arPaid = (detail.payments || []).filter(p => p.payment_source === "AR_COLLECTION").reduce((t, p) => t + p.amount, 0);
+  const payMethods = ["Cash", "GCash", "Bank Transfer", "Maya", "Cheque", "Other"];
   const prodOpts = (sel, selName) => {
     const list = state.products.filter(p => p.active !== 0 || p.id === sel);
     const missing = sel && !list.some(p => p.id === sel) ? `<option value="${sel}" selected>${esc(selName || "Product #" + sel)}</option>` : "";
@@ -960,7 +964,7 @@ window.openEditSale = async (saleId) => {
     .map(cu => `<option value="${cu.id}" ${cu.id === sale.customer_id ? "selected" : ""}>${esc(cu.name)} (${esc(cu.account_no)})</option>`).join("");
   openModal(`Edit Sale ${esc(sale.sale_no)}`, `
     <p style="font-size:12.5px;color:var(--muted);margin-top:0">${esc(sale.ts)} &middot; ${esc(sale.location_name)} &middot; ${sale.sale_type}
-      &middot; paid so far <b>${money(sale.paid)}</b>. Changing items or quantities moves stock (and empties) for you; payments are not changed.</p>
+      &middot; paid so far <b>${money(sale.paid)}</b>. Changing items or quantities moves stock (and empties) for you.</p>
     <div class="field"><label>Customer</label><select id="esCust">${custOpts}</select></div>
     <div class="field" id="esWalkinWrap"><label>Walk-in name (optional)</label><input id="esWalkin" value="${esc(sale.walkin_name || "")}"></div>
     <div class="field"><label>Items</label>
@@ -969,6 +973,13 @@ window.openEditSale = async (saleId) => {
         <span style="flex:1">Unit price</span><span style="flex:1">Discount</span><span style="flex:1.2">Swap brand</span><span style="width:30px"></span></div>
       <div id="esRows"></div>
       <button class="btn small" id="esAdd" type="button">+ Add Item</button>
+    </div>
+    <div class="field"><label>Payments at the POS</label>
+      <div style="display:flex;gap:6px;font-size:11.5px;color:var(--muted);font-weight:600">
+        <span style="flex:1.4">Method</span><span style="flex:1">Amount</span><span style="flex:1.4">Ref #</span><span style="width:30px"></span></div>
+      <div id="esPays"></div>
+      <button class="btn small" id="esAddPay" type="button">+ Add Payment</button>
+      ${arPaid > 0 ? `<p style="font-size:12px;color:var(--muted);margin:6px 0 0">Plus ${money(arPaid)} collected later in Receivables (not changed here).</p>` : ""}
     </div>
     <label style="font-size:13px;display:flex;gap:6px;align-items:center;margin-bottom:10px"><input type="checkbox" id="esWht" ${sale.withholding_tax > 0 ? "checked" : ""}> Less 1% withholding tax</label>
     <div class="field"><label>Notes</label><input id="esNotes" value="${esc(sale.notes || "")}"></div>
@@ -979,6 +990,7 @@ window.openEditSale = async (saleId) => {
   `, () => {
     document.querySelector("#modalRoot .modal").style.width = "900px";
     const rowsEl = document.getElementById("esRows");
+    const paysEl = document.getElementById("esPays");
     const custSel = document.getElementById("esCust");
     const syncWalkin = () => { document.getElementById("esWalkinWrap").style.display = custSel.value ? "none" : ""; };
     custSel.addEventListener("change", syncWalkin); syncWalkin();
@@ -990,11 +1002,15 @@ window.openEditSale = async (saleId) => {
       });
       const total = sub - disc;
       const wht = document.getElementById("esWht").checked ? Math.round(total / 1.12 * 0.01 * 100) / 100 : 0;
-      const due = total - wht, bal = due - sale.paid;
+      let posPaid = 0;
+      paysEl.querySelectorAll(".esPayAmt").forEach(i => posPaid += parseFloat(i.value) || 0);
+      const paid = posPaid + arPaid;
+      const due = total - wht, bal = due - paid;
       document.getElementById("esSummary").innerHTML = `
         Total: <b>${money(total)}</b> <span style="color:var(--muted)">(was ${money(sale.total)})</span>${wht ? ` &middot; less WHT ${money(wht)} = due <b>${money(due)}</b>` : ""}<br>
-        Paid: ${money(sale.paid)} &middot; New balance: <b style="color:${bal > 0.009 && !isCredit ? "var(--danger)" : "inherit"}">${money(bal)}</b>
-        ${!isCredit && bal > 0.009 ? `<br><span style="color:var(--danger)">A cash sale can't be left unpaid — lower the amount or ring up the difference as a new sale.</span>` : ""}
+        Paid: ${money(paid)} <span style="color:var(--muted)">(was ${money(sale.paid)})</span> &middot; New balance: <b style="color:${bal > 0.009 && !isCredit ? "var(--danger)" : "inherit"}">${money(bal)}</b>
+        ${!isCredit && bal > 0.009 ? `<br><span style="color:var(--danger)">A cash sale can't be left unpaid — raise the payment, lower the amount or ring up the difference as a new sale.</span>` : ""}
+        ${isCredit && bal < -0.009 ? `<br><span style="color:var(--danger)">Payment is more than the amount due on this credit sale.</span>` : ""}
         ${!isCredit && bal < -0.009 ? `<br><span style="color:var(--muted)">Refund / change due to the customer: ${money(-bal)}</span>` : ""}`;
     };
     const addRow = (it = {}) => {
@@ -1022,6 +1038,22 @@ window.openEditSale = async (saleId) => {
       row.querySelector("button").addEventListener("click", () => { row.remove(); recalc(); });
       rowsEl.appendChild(row);
     };
+    const addPay = (p = {}) => {
+      const row = document.createElement("div");
+      row.className = "pay-row";
+      row.dataset.payId = p.id || "";
+      const opts = (p.method && !payMethods.includes(p.method) ? [p.method] : []).concat(payMethods);
+      row.innerHTML = `<select class="esPayMethod" style="flex:1.4;min-width:0;width:auto">
+          ${opts.map(m => `<option ${m === (p.method || "Cash") ? "selected" : ""}>${esc(m)}</option>`).join("")}</select>
+        <input type="number" class="esPayAmt" min="0" step="0.01" value="${p.amount ?? ""}" placeholder="Amount" style="flex:1;min-width:0">
+        <input type="text" class="esPayRef" placeholder="Ref #" value="${esc(p.reference || "")}" style="flex:1.4;min-width:0">
+        <button class="btn small danger" type="button">&times;</button>`;
+      row.querySelector(".esPayAmt").addEventListener("input", recalc);
+      row.querySelector("button").addEventListener("click", () => { row.remove(); recalc(); });
+      paysEl.appendChild(row);
+    };
+    posPays.forEach(addPay);
+    document.getElementById("esAddPay").addEventListener("click", () => { addPay(); recalc(); });
     items.forEach(addRow);
     document.getElementById("esAdd").addEventListener("click", () => { addRow(); recalc(); });
     document.getElementById("esWht").addEventListener("change", recalc);
@@ -1033,6 +1065,10 @@ window.openEditSale = async (saleId) => {
         notes: document.getElementById("esNotes").value,
         reason: document.getElementById("esReason").value.trim(),
         withholding_tax: document.getElementById("esWht").checked,
+        payments: [...paysEl.querySelectorAll(".pay-row")].map(r => ({
+          id: r.dataset.payId ? parseInt(r.dataset.payId) : null, method: r.querySelector(".esPayMethod").value,
+          amount: r.querySelector(".esPayAmt").value, reference: r.querySelector(".esPayRef").value,
+        })),
         items: [...rowsEl.querySelectorAll(".pay-row")].map(r => ({
           product_id: parseInt(r.querySelector(".esProd").value), sale_mode: r.querySelector(".esMode").value,
           qty: r.querySelector(".esQty").value, price: r.querySelector(".esPrice").value,
