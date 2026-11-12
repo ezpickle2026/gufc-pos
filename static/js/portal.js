@@ -1,4 +1,4 @@
-// GUFC Customer Portal: login, place orders, order status, purchases, billing & SOA.
+// GUFC Customer Portal: login, place orders, order status, purchases, billing & SOA, rate per kg.
 const P = { me: null, view: "home", products: [] };
 
 async function api(path, opts = {}) {
@@ -62,6 +62,7 @@ async function start() {
   document.getElementById("custSub").textContent =
     `${P.me.account_no}${P.me.business_name ? " · " + P.me.name : ""}${P.me.terms_days ? ` · ${P.me.terms_days}-day terms` : ""}`;
   const tabs = [["home", "Home"], ["order", "Place Order"], ["orders", "My Orders"], ["purchases", "Purchases"]];
+  if (P.me.has_rate) tabs.push(["rate", "My Rate"]);
   if (P.me.is_credit) tabs.push(["billing", "Billing & SOA"]);
   tabs.push(["account", "Account"]);
   document.getElementById("tabs").innerHTML = tabs.map(([id, l]) => `<button data-v="${id}">${l}</button>`).join("");
@@ -78,7 +79,7 @@ function go(view) {
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.v === view));
   const main = document.getElementById("main");
   main.innerHTML = `<p class="muted">Loading...</p>`;
-  ({ home: viewHome, order: viewOrder, orders: viewOrders, purchases: viewPurchases, billing: viewBilling, account: viewAccount }[view])(main)
+  ({ home: viewHome, order: viewOrder, orders: viewOrders, purchases: viewPurchases, rate: viewRate, billing: viewBilling, account: viewAccount }[view])(main)
     .catch(e => { if (e.message !== "logged out") main.innerHTML = `<div class="msg err">${esc(e.message)}</div>`; });
 }
 
@@ -109,7 +110,9 @@ function wireCancel(root, after) {
 
 // ---------------------------------------------------------------- home
 async function viewHome(main) {
-  const [orders, billing] = await Promise.all([api("/orders"), P.me.is_credit ? api("/billing") : Promise.resolve(null)]);
+  const [orders, billing, rates] = await Promise.all([api("/orders"), P.me.is_credit ? api("/billing") : Promise.resolve(null),
+    P.me.has_rate ? api("/rates").catch(() => null) : Promise.resolve(null)]);
+  const rc = rates && rates.current;
   const open = orders.filter(o => o.status === "PENDING");
   main.innerHTML = `
     <div class="grid">
@@ -124,6 +127,11 @@ async function viewHome(main) {
         : `<div class="stat" style="grid-column:span 3"><div class="l">Account</div><div class="v" style="font-size:16px">${esc(P.me.name)}</div>
           <div class="s">${esc(P.me.address || "")}</div></div>`}
     </div>
+    ${rc && rc.rate ? `<div class="card rate-home">
+      <div><div class="muted small">Your current rate${rc.product_name ? " · " + esc(rc.product_name) : ""}</div>
+        <div class="rate-big">${rateFmt(rc.rate)}<span>/kg</span></div>
+        <div class="small">${rc.change ? `${moveBadge(rc.change, rc.change_pct)} from ${rateFmt(rc.previous_rate)} since ${day(rc.since)}` : rc.since ? `since ${day(rc.since)}` : ""}</div></div>
+      <button class="btn small" id="homeRate">See rate movement</button></div>` : ""}
     <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
       <div><h2 style="margin:0">Need LPG?</h2><div class="muted small">Order online and we'll confirm it shortly.</div></div>
       <button class="btn green" id="homeOrder">Place an Order</button>
@@ -132,6 +140,7 @@ async function viewHome(main) {
       <div id="homeOrders">${orders.length ? orders.slice(0, 3).map(orderCard).join("") : `<p class="muted">No orders yet.</p>`}</div>
       ${orders.length > 3 ? `<button class="btn small" id="allOrders">See all orders</button>` : ""}</div>`;
   document.getElementById("homeOrder").addEventListener("click", () => go("order"));
+  const hr = document.getElementById("homeRate"); if (hr) hr.addEventListener("click", () => go("rate"));
   const all = document.getElementById("allOrders"); if (all) all.addEventListener("click", () => go("orders"));
   wireCancel(main, () => go("home"));
 }
@@ -230,6 +239,84 @@ async function viewPurchases(main) {
   }
   document.getElementById("pRun").addEventListener("click", () => load().catch(e => toast(e.message, "err")));
   await load();
+}
+
+// ---------------------------------------------------------------- rate per kg & rate movement
+const rateFmt = n => n === null || n === undefined ? "—"
+  : "₱" + Number(n).toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+function moveBadge(change, pct) {
+  if (!change) return `<span class="badge b-gray">no change</span>`;
+  const up = change > 0;
+  return `<span class="badge ${up ? "b-danger" : "b-green"}">${up ? "▲" : "▼"} ${rateFmt(Math.abs(change))}${pct !== null && pct !== undefined ? ` (${up ? "+" : "−"}${Math.abs(pct).toFixed(2)}%)` : ""}</span>`;
+}
+
+// Step chart of the rate in effect over time, with the rate on each billing as a dot.
+function rateChart(movements, billings) {
+  const asc = [...movements].reverse();
+  if (!asc.length) return "";
+  const t = s => new Date((s || "").replace(" ", "T")).getTime();
+  const now = Date.now(), yearAgo = now - 365 * 864e5;
+  let start = Math.max(t(asc[0].date), yearAgo);
+  // Rate in effect at the start of the window.
+  let startRate = asc[0].new_rate;
+  asc.forEach(m => { if (t(m.date) <= start) startRate = m.new_rate; });
+  const pts = [[start, startRate], ...asc.filter(m => t(m.date) > start).map(m => [t(m.date), m.new_rate])];
+  const dots = billings.filter(b => t(b.delivery_date) >= start).map(b => [t(b.delivery_date), b.price_per_kg]);
+  if (now - start < 864e5) start = now - 30 * 864e5;
+  const ys = [...pts.map(p => p[1]), ...dots.map(d => d[1])];
+  let lo = Math.min(...ys), hi = Math.max(...ys);
+  const pad = (hi - lo) * 0.15 || Math.max(hi * 0.05, 1); lo -= pad; hi += pad;
+  // Draw at the card's real width so labels stay readable on phones.
+  const W = Math.max(300, Math.min(920, (document.getElementById("main").clientWidth || 640) - 66)), H = 200, L = 52, R = 12, T = 12, B = 26;
+  const x = v => L + (v - start) / (now - start) * (W - L - R), y = v => T + (hi - v) / (hi - lo) * (H - T - B);
+  let d = `M${x(pts[0][0]).toFixed(1)},${y(pts[0][1]).toFixed(1)}`;
+  for (let i = 1; i < pts.length; i++) d += ` H${x(pts[i][0]).toFixed(1)} V${y(pts[i][1]).toFixed(1)}`;
+  d += ` H${x(now).toFixed(1)}`;
+  const ticks = [0, 0.5, 1].map(f => lo + (hi - lo) * f);
+  const fmtD = v => new Date(v).toLocaleDateString("en-PH", { month: "short", day: "numeric", year: "2-digit" });
+  return `<div class="chart" role="img" aria-label="Rate per kg over time">
+    <svg viewBox="0 0 ${W} ${H}">
+      ${ticks.map(v => `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" class="grid-l"/>
+        <text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${Number(v).toFixed(2)}</text>`).join("")}
+      <path d="${d}" class="line"/>
+      ${pts.slice(1).map(p => `<circle cx="${x(p[0])}" cy="${y(p[1])}" r="3.5" class="chg"><title>${fmtD(p[0])}: ${rateFmt(p[1])}/kg</title></circle>`).join("")}
+      ${dots.map(p => `<circle cx="${x(p[0])}" cy="${y(p[1])}" r="3" class="bill"><title>Billed ${fmtD(p[0])}: ${rateFmt(p[1])}/kg</title></circle>`).join("")}
+      <text x="${L}" y="${H - 6}">${fmtD(start)}</text><text x="${W - R}" y="${H - 6}" text-anchor="end">Today</text>
+    </svg>
+    <div class="legend small muted"><span><i class="k-line"></i>Rate in effect</span>${dots.length ? `<span><i class="k-bill"></i>Rate on your billings</span>` : ""}</div>
+  </div>`;
+}
+
+async function viewRate(main) {
+  const r = await api("/rates");
+  const c = r.current, s = r.summary;
+  const monthName = ym => ym ? new Date(ym + "-01T00:00").toLocaleDateString("en-PH", { month: "long", year: "numeric" }) : "";
+  main.innerHTML = `
+    <div class="grid">
+      <div class="stat"><div class="l">Current Rate</div><div class="v">${c.rate ? rateFmt(c.rate) + `<span class="small muted">/kg</span>` : "—"}</div>
+        <div class="s">${c.source === "ACCOUNT" ? "your account rate" : c.source === "STANDARD" ? "standard rate" : "not set yet"}${c.since ? " · since " + day(c.since) : ""}</div></div>
+      <div class="stat"><div class="l">Last Change</div><div class="v" style="font-size:16px">${c.change ? moveBadge(c.change, c.change_pct) : "—"}</div>
+        <div class="s">${c.change ? "from " + rateFmt(c.previous_rate) : "no change recorded"}</div></div>
+      <div class="stat"><div class="l">12-Month Range</div><div class="v" style="font-size:16px">${s.low_12m ? `${rateFmt(s.low_12m)} – ${rateFmt(s.high_12m)}` : "—"}</div>
+        <div class="s">${s.changes_12m} change(s) in 12 months</div></div>
+      <div class="stat"><div class="l">Avg. Billed This Month</div><div class="v" style="font-size:16px">${rateFmt(s.avg_billed_this_month)}</div>
+        <div class="s">${s.avg_billed_last_month ? `last month ${rateFmt(s.avg_billed_last_month)}` : "no billing last month"}</div></div>
+    </div>
+    ${c.rate ? "" : `<div class="msg err">Your rate per kg hasn't been set yet. Please contact GUFC.</div>`}
+    <div class="card"><h2>Rate Movement</h2>
+      ${r.movements.length ? rateChart(r.movements, r.billings) : `<p class="muted">No rate history yet.</p>`}
+      ${r.movements.length ? `<div class="table-wrap" style="margin-top:12px"><table><thead><tr><th>Effective</th><th class="right">Old Rate</th><th class="right">New Rate</th><th>Movement</th></tr></thead><tbody>
+        ${r.movements.map(m => `<tr><td>${day(m.date)}</td><td class="right">${m.old_rate ? rateFmt(m.old_rate) : "—"}</td>
+          <td class="right"><b>${rateFmt(m.new_rate)}</b></td>
+          <td>${m.old_rate ? moveBadge(m.change, m.change_pct) : `<span class="badge b-blue">starting rate</span>`}</td></tr>`).join("")}
+      </tbody></table></div>` : ""}
+      <p class="muted small" style="margin:10px 0 0">Rates are per kg of LPG${c.product_name ? ` (${esc(c.product_name)})` : ""}. A new rate applies to billings made from its effective date.</p></div>
+    <div class="card"><h2>Rate on Your Billings</h2>
+      ${r.billings.length ? `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Billing #</th><th class="right">kg</th><th class="right">Rate / kg</th><th class="right">Amount</th></tr></thead><tbody>
+        ${r.billings.map(b => `<tr><td>${day(b.delivery_date)}</td><td>${esc(b.delivery_no)}${b.invoice_no ? `<br><span class="muted small">${esc(b.invoice_no)}</span>` : ""}</td>
+          <td class="right">${Number(b.kg).toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+          <td class="right">${rateFmt(b.price_per_kg)}</td><td class="right">${money(b.billed_amount)}</td></tr>`).join("")}
+      </tbody></table></div>` : `<p class="muted">No billings yet.</p>`}</div>`;
 }
 
 // ---------------------------------------------------------------- billing & SOA

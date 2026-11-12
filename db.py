@@ -905,6 +905,61 @@ def migrate_schema():
         conn.execute("ALTER TABLE sales ADD COLUMN edited_by INTEGER REFERENCES users(id)")
     conn.commit()
 
+    # 21. Rate movement: every change to a Commercial account's rate per kg
+    #     (customer_id set) or to a product's default price per kg
+    #     (product_id set, customer_id NULL) is kept, so the customer portal
+    #     can show the latest rate and how it moved over time.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rate_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER REFERENCES customers(id),
+            product_id INTEGER REFERENCES products(id),
+            old_rate REAL,
+            new_rate REAL,
+            changed_at TEXT DEFAULT (datetime('now')),
+            changed_by INTEGER REFERENCES users(id),
+            username TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rate_history_customer ON rate_history(customer_id, changed_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rate_history_product ON rate_history(product_id, changed_at)")
+    conn.commit()
+    MIGRATION_KEY = "rate_history_backfill"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        import re
+        pat = re.compile(r"commercial rate (\S+) -> (\S+) per kg")
+        num = lambda s: None if s in ("-", "None", "") else float(s)
+        # Account rate changes made before this update are in the Audit Log.
+        for a in conn.execute("""SELECT ts, user_id, username, record_id, details FROM audit_logs
+                                 WHERE module='CUSTOMERS' AND details LIKE '%commercial rate % -> % per kg%'
+                                 ORDER BY id""").fetchall():
+            m = pat.search(a["details"] or "")
+            if not m or not (a["record_id"] or "").isdigit():
+                continue
+            try:
+                old, new = num(m.group(1)), num(m.group(2))
+            except ValueError:
+                continue
+            if old == new:
+                continue
+            conn.execute("INSERT INTO rate_history (customer_id, old_rate, new_rate, changed_at, changed_by, username) "
+                         "VALUES (?,?,?,?,?,?)", (int(a["record_id"]), old, new, a["ts"], a["user_id"], a["username"]))
+        # A rate set with no logged change: start its history at the account's creation.
+        for c in conn.execute("""SELECT id, commercial_rate, created_at FROM customers
+                                 WHERE commercial_rate > 0 AND id NOT IN
+                                   (SELECT customer_id FROM rate_history WHERE customer_id IS NOT NULL)""").fetchall():
+            conn.execute("INSERT INTO rate_history (customer_id, old_rate, new_rate, changed_at, username) VALUES (?,?,?,?,?)",
+                         (c["id"], None, c["commercial_rate"], c["created_at"], "system"))
+        # Product default price per kg: earlier changes weren't logged, so each
+        # product's history starts at its first billing (or now).
+        conn.execute("""INSERT INTO rate_history (product_id, old_rate, new_rate, changed_at, username)
+                        SELECT p.id, NULL, p.price_per_kg,
+                               COALESCE((SELECT MIN(cd.delivery_date) FROM commercial_deliveries cd
+                                         WHERE cd.product_id = p.id), datetime('now')), 'system'
+                        FROM products p WHERE p.price_per_kg > 0""")
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
+        conn.commit()
+
     conn.close()
 
 

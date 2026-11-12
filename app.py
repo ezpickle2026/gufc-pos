@@ -4,9 +4,9 @@ import csv
 import io
 import re
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from flask import Flask, request, jsonify, session, send_from_directory, Response, g
+from flask import Flask, request, jsonify, session, send_from_directory, Response, g, has_request_context
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from db import get_db, init_db, close_request_connections, ADMIN_LIKE_ROLES
@@ -81,6 +81,22 @@ def audit(conn, action, module, record_id=None, details=None):
         "INSERT INTO audit_logs (user_id, username, action, module, record_id, details) VALUES (?,?,?,?,?,?)",
         (user["id"] if user else None, user["username"] if user else "system",
          action, module, str(record_id) if record_id is not None else None, details),
+    )
+
+
+def record_rate_change(conn, old, new, customer_id=None, product_id=None):
+    """Keep a Commercial account's rate per kg (customer_id) or a product's
+    default price per kg (product_id) in rate_history when it changes, for
+    the rate movement shown in the customer portal."""
+    old = float(old) if old not in (None, "") and float(old) > 0 else None
+    new = float(new) if new not in (None, "") and float(new) > 0 else None
+    if old == new or (old is not None and new is not None and abs(old - new) < 0.0001):
+        return
+    user = session.get("user") if has_request_context() else None
+    conn.execute(
+        "INSERT INTO rate_history (customer_id, product_id, old_rate, new_rate, changed_by, username) VALUES (?,?,?,?,?,?)",
+        (customer_id, None if customer_id else product_id, old, new,
+         user["id"] if user else None, user["username"] if user else "system"),
     )
 
 
@@ -456,8 +472,9 @@ def create_product():
     d = request.get_json(force=True)
     conn = get_db()
     # Re-adding the SKU of a product that was deleted (archived) brings it back.
-    old = conn.execute("SELECT id FROM products WHERE sku=? AND active=0", (d.get("sku"),)).fetchone()
+    old = conn.execute("SELECT id, price_per_kg FROM products WHERE sku=? AND active=0", (d.get("sku"),)).fetchone()
     if old:
+        record_rate_change(conn, old["price_per_kg"], d.get("price_per_kg"), product_id=old["id"])
         conn.execute(
             "UPDATE products SET name=?, category=?, unit=?, price=?, cost=?, deposit_price=?, price_per_kg=?, min_stock=?, active=1 WHERE id=?",
             (d["name"], d.get("category", ""), d.get("unit", "cylinder"), float(d["price"]),
@@ -475,6 +492,7 @@ def create_product():
              float(d["price"]), float(d.get("cost") or 0), float(d.get("deposit_price") or 0),
              float(d.get("price_per_kg") or 0), int(d.get("min_stock") or 0)),
         )
+        record_rate_change(conn, None, d.get("price_per_kg"), product_id=cur.lastrowid)
     except Exception as e:
         conn.close()
         return jsonify(error=f"Could not create product: {e}"), 400
@@ -516,17 +534,19 @@ def products_csv_import():
             vals = (name, (row.get("category") or "").strip(), (row.get("unit") or "cylinder").strip(),
                     price, float(row.get("cost") or 0), float(row.get("deposit_price") or 0),
                     float(row.get("price_per_kg") or 0), int(row.get("min_stock") or 0))
-            old = conn.execute("SELECT id FROM products WHERE sku=? AND active=0", (sku,)).fetchone()
+            old = conn.execute("SELECT id, price_per_kg FROM products WHERE sku=? AND active=0", (sku,)).fetchone()
             if old:  # bring back a deleted (archived) product with the same SKU
                 conn.execute(
                     "UPDATE products SET name=?, category=?, unit=?, price=?, cost=?, deposit_price=?, price_per_kg=?, min_stock=?, active=1 WHERE id=?",
                     vals + (old["id"],),
                 )
+                record_rate_change(conn, old["price_per_kg"], vals[6], product_id=old["id"])
             else:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO products (sku, name, category, unit, price, cost, deposit_price, price_per_kg, min_stock) VALUES (?,?,?,?,?,?,?,?,?)",
                     (sku,) + vals,
                 )
+                record_rate_change(conn, None, vals[6], product_id=cur.lastrowid)
             created += 1
         except Exception as e:
             errors.append(f"Row {i}: {e}")
@@ -542,6 +562,9 @@ def products_csv_import():
 def update_product(pid):
     d = request.get_json(force=True)
     conn = get_db()
+    prev = conn.execute("SELECT price_per_kg FROM products WHERE id=?", (pid,)).fetchone()
+    if prev:
+        record_rate_change(conn, prev["price_per_kg"], d.get("price_per_kg"), product_id=pid)
     conn.execute(
         "UPDATE products SET name=?, category=?, unit=?, price=?, cost=?, deposit_price=?, price_per_kg=?, min_stock=? WHERE id=?",
         (d["name"], d.get("category", ""), d.get("unit", "cylinder"), float(d["price"]),
@@ -1169,6 +1192,9 @@ def _portal_profile(conn, cust):
     out = {k: cust[k] for k in keys}
     out["username"] = cust["username"]
     out["is_credit"] = _portal_is_credit(conn, cust)
+    out["has_rate"] = is_commercial_account(cust) or conn.execute(
+        "SELECT 1 FROM commercial_deliveries WHERE customer_id=? AND status!='CANCELLED' LIMIT 1",
+        (cust["id"],)).fetchone() is not None
     return out
 
 
@@ -1505,6 +1531,107 @@ def portal_billing():
         next_due={"invoice_no": next_due["invoice_no"], "due_date": next_due["due_date"], "balance": next_due["balance"]}
         if next_due else None,
         invoices=invoices, payments=payments)
+
+
+# ---- portal: latest rate per kg and rate movement
+#
+# A Commercial account is billed per kg at the rate Accounting set on the
+# account; without one, at the 50kg product's default price per kg (see
+# _commercial_rate). The customer's "effective rate" timeline merges both
+# histories from rate_history, so a change in either shows as a movement.
+
+def _portal_rate_product(conn, cid):
+    row = conn.execute(
+        """SELECT p.* FROM commercial_deliveries cd JOIN products p ON p.id = cd.product_id
+           WHERE cd.customer_id=? AND cd.status!='CANCELLED'
+           GROUP BY p.id ORDER BY COUNT(*) DESC, MAX(cd.id) DESC LIMIT 1""", (cid,)).fetchone()
+    if row:
+        return row
+    for p in conn.execute("SELECT * FROM products WHERE active=1 ORDER BY price_per_kg > 0 DESC, id").fetchall():
+        if is_commercial_cylinder(p):
+            return p
+    return None
+
+
+def _rate_movements(conn, cid, product_id):
+    rows = conn.execute(
+        """SELECT id, customer_id, product_id, new_rate, changed_at FROM rate_history
+           WHERE customer_id=? OR (customer_id IS NULL AND product_id=?)
+           ORDER BY changed_at, id""", (cid, product_id or -1)).fetchall()
+    cust_rate = prod_rate = last = None
+    out = []
+    for r in rows:
+        if r["customer_id"]:
+            cust_rate = r["new_rate"]
+        else:
+            prod_rate = r["new_rate"]
+        eff = cust_rate or prod_rate
+        src = "ACCOUNT" if cust_rate else "STANDARD"
+        if eff is None or (last is not None and abs(eff - last) < 0.0001):
+            if out and eff is not None:
+                out[-1]["source"] = src  # same rate, now from the other source
+            continue
+        out.append({"date": _local_ts(r["changed_at"]), "old_rate": last, "new_rate": round(eff, 4), "source": src,
+                    "change": round(eff - last, 4) if last is not None else None,
+                    "change_pct": round((eff - last) / last * 100, 2) if last else None})
+        last = eff
+    return out
+
+
+@app.get("/api/portal/rates")
+@portal_required
+def portal_rates():
+    cid = g.portal["id"]
+    conn = get_db()
+    product = _portal_rate_product(conn, cid)
+    acct_rate = g.portal["commercial_rate"] if (g.portal.get("commercial_rate") or 0) > 0 else None
+    std_rate = float(product["price_per_kg"]) if product and (product["price_per_kg"] or 0) > 0 else None
+    current = acct_rate or std_rate
+    movements = _rate_movements(conn, cid, product["id"] if product else None)
+    billings = [dict(r) for r in conn.execute(
+        """SELECT cd.delivery_no, cd.delivery_date, cd.billing_type, cd.price_per_kg, cd.billed_amount,
+                  p.name product_name, r.invoice_no
+           FROM commercial_deliveries cd JOIN products p ON p.id = cd.product_id
+           LEFT JOIN receivables r ON r.sale_id = cd.sale_id
+           WHERE cd.customer_id=? AND cd.status='BILLED' AND cd.price_per_kg > 0
+           ORDER BY cd.delivery_date DESC, cd.id DESC LIMIT 100""", (cid,)).fetchall()]
+    conn.close()
+    for b in billings:
+        b["delivery_date"] = _local_ts(b["delivery_date"])
+        b["kg"] = round((b["billed_amount"] or 0) / b["price_per_kg"], 2)
+
+    last = movements[-1] if movements else None
+    if current and last and abs(last["new_rate"] - current) > 0.0001:
+        last = None  # history doesn't reach the current rate; don't show a stale change
+    now_local = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=APP_TZ_OFFSET_HOURS)
+    year_ago = (now_local - timedelta(days=365)).strftime("%Y-%m-%d")
+    recent = [m for m in movements if (m["date"] or "") >= year_ago]
+    # The rate in effect at the start of the 12 months counts toward high / low.
+    before = [m for m in movements if (m["date"] or "") < year_ago]
+    span = ([before[-1]["new_rate"]] if before else []) + [m["new_rate"] for m in recent]
+    if current:
+        span.append(current)
+    month = now_local.strftime("%Y-%m")
+
+    def avg_billed(prefix):
+        rows = [b for b in billings if (b["delivery_date"] or "").startswith(prefix)]
+        kg = sum(b["kg"] for b in rows)
+        return round(sum(b["billed_amount"] or 0 for b in rows) / kg, 4) if kg else None
+
+    first_of_month = datetime.strptime(month + "-01", "%Y-%m-%d")
+    prev_month = (first_of_month - timedelta(days=1)).strftime("%Y-%m")
+    return jsonify(
+        current={"rate": current, "source": "ACCOUNT" if acct_rate else ("STANDARD" if std_rate else None),
+                 "product_name": product["name"] if product else None,
+                 "since": last["date"] if last else None,
+                 "previous_rate": last["old_rate"] if last else None,
+                 "change": last["change"] if last else None,
+                 "change_pct": last["change_pct"] if last else None},
+        summary={"changes_12m": sum(1 for m in recent if m["old_rate"] is not None),
+                 "high_12m": max(span) if span else None, "low_12m": min(span) if span else None,
+                 "avg_billed_this_month": avg_billed(month), "avg_billed_last_month": avg_billed(prev_month),
+                 "this_month": month, "last_month": prev_month},
+        movements=list(reversed(movements)), billings=billings)
 
 
 def _portal_soa_args():
@@ -5930,6 +6057,7 @@ def set_customer_commercial_rate(cid):
     if rate is not None and rate <= 0:
         conn.close(); return jsonify(error="The rate per kg must be more than zero"), 400
     conn.execute("UPDATE customers SET commercial_rate=? WHERE id=?", (rate, cid))
+    record_rate_change(conn, cust["commercial_rate"], rate, customer_id=cid)
     audit(conn, "UPDATE", "CUSTOMERS", cid,
           f"{cust['name']}: commercial rate {cust['commercial_rate'] or '-'} -> {rate if rate is not None else '-'} per kg")
     conn.commit()
