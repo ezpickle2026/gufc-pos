@@ -32,6 +32,28 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Commercial billing is no longer recorded as a sale.** Every 50kg Commercial Billing
+  (DR, WIWO, Reading, and Generate Billing below) creates only the customer's **invoice**
+  (Receivables, SOA, aging, portal billing). It no longer appears in the Sales list, Sales
+  report, End of Day, dashboard sales or staff sales totals. Billings made before this update
+  are moved out of Sales automatically.
+- **Generate Billing beside the sale (Accounting only).** In **Sales**, a Commercial account's
+  POS credit sale with 50kg cylinders shows a **Generate Billing** button (Accounting, Admin,
+  Operation Head). Type the residual kg of the cylinders pulled out; billable kg = delivered kg
+  less residual, at the account's rate. Once billed the row shows *Billed CD-…*. A wrong billing
+  can be undone with **Void Billing** in 50kg Commercial Billing while it is unpaid; the POS sale
+  can't be voided while its billing stands.
+- **Rate per kg on Commercial accounts.** Customers → **Rate** (Accounting / Admin) sets a
+  Commercial account's price per kg. Every billing for that account uses it automatically.
+- **Reading billing needs a beginning reading.** The first time a meter / tank is billed,
+  enter its **beginning reading** first. The previous reading is then always filled in by the
+  system (last bill's current reading, or the beginning reading) and can't be typed over;
+  only the current reading is entered. Changing a beginning reading is for Admin / Manager /
+  Accounting.
+- **Monthly LPG per Customer (kg) lists every account.** The screen, Excel and PDF now include
+  all active customers (those with no purchases in the range show "-" / 0), not only those who
+  bought.
+
 - **Commercial accounts: SOA shows only what was billed.** On a **Credit / Terms** POS sale
   to a customer in the **Commercial** category, 50kg cylinders are **delivered only**: stock
   moves, the empty comes back and the Delivery Receipt prints (marked "For billing"), but the

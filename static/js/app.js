@@ -829,9 +829,12 @@ function printDeliveryReceipt(result) {
 }
 
 // ================================================================== SALES
+// Generate Billing (Commercial 50kg deliveries) is for Accounting only (+ Admin).
+const canCommercialBilling = () => isAdminLike() || state.user.role === "ACCOUNTING";
 async function renderSales(c) {
   c.innerHTML = "Loading...";
   const sales = await api("/sales");
+  const canGenBill = canCommercialBilling();
   c.innerHTML = `<div class="table-wrap"><table><thead><tr>
     <th>Sale #</th><th>Date</th><th>Location</th><th>Cashier</th><th>Customer</th><th>Type</th><th>Total</th><th>Balance</th><th>Status</th><th></th>
   </tr></thead><tbody>
@@ -844,11 +847,85 @@ async function renderSales(c) {
       <td style="display:flex;gap:6px">
         <button class="btn small" onclick="viewSale(${s.id})">View</button>
         ${s.sale_type === 'CREDIT' ? `<button class="btn small green" onclick="printSaleDR(${s.id})" title="Print Delivery Receipt">DR</button>` : ""}
+        ${s.billing_id ? `<span class="badge green" title="Billed ${money(Number((s.billing_ref || "|0").split("|")[1]))}">Billed ${esc((s.billing_ref || "").split("|")[0])}</span>`
+          : canGenBill && s.bill_later_qty > 0 && s.status === 'COMPLETED' ? `<button class="btn small blue" onclick="openSaleBilling(${s.id})" title="50kg commercial delivery — bill the gas">Generate Billing</button>` : ""}
         ${(isAdminLike() || state.user.role === 'SUPERVISOR') && s.status !== 'VOIDED' ? `<button class="btn small danger" onclick="voidSale(${s.id})">Void</button>` : ""}
       </td>
     </tr>`).join("")}
   </tbody></table></div>`;
 }
+// Accounting: bill a Commercial account's 50kg delivery from its POS sale.
+// Delivered kg (from the sale) less the residual of the cylinders pulled
+// out, at the account's rate. This is a receivable, not a new sale.
+window.openSaleBilling = async (saleId) => {
+  let d;
+  try { d = await api(`/sales/${saleId}/commercial-billing`); } catch (e) { return; }
+  if (d.billing) { toast(`Already billed in ${d.billing.delivery_no}`, "error"); return; }
+  const rate = d.rate || 0;
+  const rateNote = d.rate_source === "CUSTOMER" ? "account rate"
+    : rate ? "product default — no rate set on this account yet" : "";
+  openModal(`Generate Billing — ${esc(d.sale.sale_no)}`, `
+    <div class="field" style="font-size:13.5px;line-height:1.7">
+      <b>Customer:</b> ${esc(d.customer ? d.customer.name + " (" + d.customer.account_no + ")" : "—")}<br>
+      <b>Sale:</b> ${esc(d.sale.sale_no)}${d.sale.dr_no ? ` &nbsp; <b>DR:</b> ${esc(d.sale.dr_no)}` : ""} &nbsp; <b>Date:</b> ${esc(d.sale.ts)}<br>
+      <b>Delivered:</b> ${d.lines.map(l => `${l.qty} x ${esc(l.product_name)} (${l.kg_per_cylinder} kg)`).join(", ")} = <b>${d.delivered_kg} kg</b><br>
+      <b>Rate:</b> ${rate ? `${money(rate)}/kg <span style="color:var(--muted)">(${rateNote})</span>` : `<span style="color:var(--danger)">No rate — set this account's rate in Customers first.</span>`}
+    </div>
+    ${d.possible_duplicates.length ? `<div class="field" style="background:#fff4e5;padding:8px 10px;border-radius:8px;font-size:12.5px">
+      ⚠ This customer already has 50kg Commercial Billing record(s) since this sale that aren't linked to a sale:
+      ${d.possible_duplicates.map(x => `${esc(x.delivery_no)}${x.dr_ref ? " (DR " + esc(x.dr_ref) + ")" : ""} ${money(x.billed_amount)}`).join(", ")}.
+      Make sure this delivery wasn't billed there already.</div>` : ""}
+    <div class="field"><label>Residual of the cylinders pulled out (kg)</label>
+      <p style="font-size:12px;color:var(--muted);margin:0 0 6px">Type the residual kg of each pulled-out cylinder (serial optional). It is deducted from the delivered kg.</p>
+      <div style="display:flex;gap:8px;font-size:11.5px;color:var(--muted);font-weight:600">
+        <span style="flex:1">Serial no.</span><span style="flex:1">Residual (kg)</span><span style="width:30px"></span></div>
+      <div id="sbRows"></div>
+      <button class="btn small" id="sbAdd" type="button">+ Add Pull-out</button>
+    </div>
+    <div class="field"><label>Notes</label><input id="sbNotes"></div>
+    <div class="field" id="sbSummary" style="background:var(--bg);padding:10px;border-radius:8px;font-size:13.5px"></div>
+    <p style="font-size:12px;color:var(--muted);margin:0">This creates the customer's invoice (Receivables / SOA). It is not recorded as a new sale.</p>
+    <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="sbSave" ${rate ? "" : "disabled"}>Generate Billing</button></div>
+  `, () => {
+    const rowsEl = document.getElementById("sbRows");
+    const recalc = () => {
+      const rows = [...rowsEl.querySelectorAll(".pay-row")];
+      const residual = rows.reduce((t, r) => t + (parseFloat(r.querySelector(".sbRes").value) || 0), 0);
+      const billable = d.delivered_kg - residual;
+      document.getElementById("sbSummary").innerHTML = `
+        Delivered: <b>${d.delivered_kg.toFixed(2)} kg</b><br>
+        Less residual (${rows.length} pulled out): <b>${residual.toFixed(2)} kg</b><br>
+        Billable: <b>${billable.toFixed(2)} kg</b> @ ${money(rate)}/kg = <b style="color:var(--green-dark)">${money(billable * rate)}</b>`;
+    };
+    const addRow = () => {
+      const row = document.createElement("div");
+      row.className = "pay-row";
+      row.innerHTML = `<input type="text" class="sbSerial" placeholder="Serial no." style="flex:1;min-width:0">
+        <input type="number" step="0.01" min="0" class="sbRes" placeholder="Residual kg" style="flex:1;min-width:0">
+        <button class="btn small danger" type="button">&times;</button>`;
+      row.querySelector(".sbRes").addEventListener("input", recalc);
+      row.querySelector("button").addEventListener("click", () => { row.remove(); recalc(); });
+      rowsEl.appendChild(row);
+    };
+    for (let i = 0; i < d.delivered_qty; i++) addRow();
+    document.getElementById("sbAdd").addEventListener("click", () => { addRow(); recalc(); });
+    recalc();
+    document.getElementById("sbSave").addEventListener("click", async (ev) => {
+      const pullouts = [...rowsEl.querySelectorAll(".pay-row")].map(r => ({
+        serial_no: r.querySelector(".sbSerial").value, residual_kg: r.querySelector(".sbRes").value,
+      })).filter(p => p.serial_no || p.residual_kg);
+      ev.target.disabled = true;
+      try {
+        const r = await api(`/sales/${saleId}/commercial-billing`, { method: "POST",
+          body: { pullouts, notes: document.getElementById("sbNotes").value } });
+        closeModal();
+        toast(`Billed ${r.billable_kg} kg = ${money(r.billed_amount)} (${r.delivery_no})`, "success");
+        renderSales(document.getElementById("content"));
+      } catch (e) { ev.target.disabled = false; }
+    });
+  });
+};
 window.printSaleDR = async (id) => {
   try { printDeliveryReceipt(await api(`/sales/${id}`)); } catch (e) {}
 };
@@ -935,6 +1012,8 @@ async function openCommercialSoaFix() {
 async function renderCustomers(c) {
   const isAdmin = isAdminLike();
   const canPortal = ["ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING"].includes(state.user.role);
+  const canRate = canCommercialBilling();
+  const isCommercialCat = cat => (cat || "").trim().toLowerCase() === "commercial";
   const categories = await api("/customer-categories");
   c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
     <input type="text" id="custSearch" placeholder="Search customers..." style="flex:1;min-width:180px">
@@ -951,24 +1030,47 @@ async function renderCustomers(c) {
     return categories.map(cat => `<option value="${esc(cat.name)}" ${cat.name === selected ? "selected" : ""}>${esc(cat.name)}</option>`).join("");
   }
 
+  let custList = [];
   async function load(q = "") {
-    const list = await api("/customers?q=" + encodeURIComponent(q));
+    const list = custList = await api("/customers?q=" + encodeURIComponent(q));
     document.getElementById("custTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
       <th>Account #</th><th>Name</th><th>Category</th><th>Phone</th><th>Terms</th><th>Credit Limit</th><th>Status</th><th></th>
     </tr></thead><tbody>
       ${list.map(cu => `<tr><td>${cu.account_no}</td><td>${esc(cu.name)}</td>
-        <td><span class="badge blue">${esc(cu.category)}</span></td><td>${esc(cu.phone || "")}</td>
+        <td><span class="badge blue">${esc(cu.category)}</span>
+          ${isCommercialCat(cu.category) ? `<br><span style="font-size:12px;color:${cu.commercial_rate ? "var(--muted)" : "var(--danger)"}">Rate: ${cu.commercial_rate ? money(cu.commercial_rate) + "/kg" : "not set"}</span>` : ""}</td>
+        <td>${esc(cu.phone || "")}</td>
         <td>${cu.terms_days} days</td><td>${money(cu.credit_limit)}</td>
         <td><span class="badge ${cu.status === 'ACTIVE' ? 'green' : 'gray'}">${cu.status}</span>
           ${cu.portal_username ? `<br><span class="badge ${cu.portal_active ? 'blue' : 'gray'}" title="Portal username: ${esc(cu.portal_username)}">Portal${cu.portal_active ? "" : " (off)"}</span>` : ""}</td>
         <td style="display:flex;gap:6px">
           <button class="btn small" onclick="openCustomerLedger(${cu.id})">Ledger / SOA</button>
           ${canPortal ? `<button class="btn small" onclick="openPortalLogin(${cu.id})">Portal Login</button>` : ""}
+          ${canRate && isCommercialCat(cu.category) ? `<button class="btn small" onclick="openCommercialRate(${cu.id})">Rate</button>` : ""}
           ${isAdmin ? `<button class="btn small" onclick="editCustomer(${cu.id})">Edit</button>
             <button class="btn small danger" onclick="deleteCustomer(${cu.id})">Delete</button>` : ""}
         </td></tr>`).join("")}
     </tbody></table></div>`;
   }
+
+  // Accounting: the Commercial account's rate per kg, used automatically on every billing.
+  window.openCommercialRate = (cid) => {
+    const cu = custList.find(x => x.id === cid) || {};
+    const rate = cu.commercial_rate;
+    openModal(`Commercial Rate — ${esc(cu.name || "")}`, `
+      <p style="font-size:13px;color:var(--muted);margin-top:0">Price per kg used automatically when this account is billed
+        (Generate Billing, DR / WIWO / Reading billing). Leave blank to use the product's default price per kg.</p>
+      <div class="field"><label>Rate per kg</label><input type="number" step="0.01" min="0" id="crRate" value="${rate || ""}"></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="crSave">Save</button></div>
+    `, () => {
+      document.getElementById("crSave").addEventListener("click", async () => {
+        try { await api(`/customers/${cid}/commercial-rate`, { method: "PUT", body: { rate: document.getElementById("crRate").value } }); }
+        catch (e) { return; }
+        closeModal(); toast("Rate saved", "success"); load(document.getElementById("custSearch").value);
+      });
+    });
+  };
 
   window.openPortalLogin = async (cid) => {
     let d;
@@ -3482,7 +3584,9 @@ async function renderRoles(c) {
 async function renderCommercialDeliveries(c) {
   const role = state.user.role;
   const canCreate = hasModule("commercial_deliveries");
-  const canBill = isAdminLike(role) || role === "MANAGER";
+  const canBill = isAdminLike(role) || role === "MANAGER" || role === "ACCOUNTING";
+  const canVoidBilling = canCommercialBilling();
+  let customersById = {};
   // Who may type their own price per kg on a DR billing (others use the product's default).
   const canRate = ["ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING"].includes(role);
   const typeBadge = t => ({ WIWO: "blue", DR: "green" }[t] || "warn");
@@ -3500,7 +3604,7 @@ async function renderCommercialDeliveries(c) {
         <td>${esc(d.customer_name)} (${d.account_no})</td><td>${esc(d.location_name)}</td>
         <td><span class="badge ${typeBadge(d.billing_type)}">${d.billing_type}</span></td>
         <td>${esc(d.product_name)}</td>
-        <td>${d.billing_type === 'WIWO' ? `${d.cylinders.length} cylinder(s), ${d.total_net_weight_in}kg in`
+        <td>${d.source_sale_no ? `<span class="badge gray" title="Generated from this POS sale">${esc(d.source_sale_no)}</span><br>` : ""}${d.billing_type === 'WIWO' ? `${d.cylinders.length} cylinder(s), ${d.total_net_weight_in}kg in`
               : d.billing_type === 'DR' ? `${d.dr_ref ? 'DR ' + esc(d.dr_ref) + ': ' : ''}${d.delivered_qty} delivered, ${d.cylinders.length} pulled out (${d.total_residual_kg || 0}kg residual)`
               : `${esc(d.meter_label || 'meter')}: ${d.previous_reading} \u2192 ${d.current_reading}`}</td>
         <td>${d.total_consumption_weight !== null ? d.total_consumption_weight + (d.billing_type !== 'READING' ? ' kg' : '') : '—'}</td>
@@ -3510,7 +3614,8 @@ async function renderCommercialDeliveries(c) {
           <button class="btn small" onclick="viewCommercialDelivery(${d.id})">View</button>
           <button class="btn small" onclick="printCommercialDelivery(${d.id})">Print</button>
           <a class="btn small" href="/api/commercial-deliveries/${d.id}/export/pdf">PDF</a>
-          ${d.billing_type === 'DR' && d.sale_id ? `<button class="btn small" onclick="printSaleDR(${d.sale_id})">DR</button>` : ""}
+          ${d.billing_type === 'DR' && d.sale_id ? `<button class="btn small" onclick="printSaleDR(${d.source_sale_id || d.sale_id})">DR</button>` : ""}
+          ${d.status === 'BILLED' && canVoidBilling ? `<button class="btn small danger" onclick="voidCommercialBilling(${d.id})" title="Undo a wrong billing (only if unpaid)">Void Billing</button>` : ""}
           ${d.status === 'DELIVERED' && d.billing_type === 'WIWO' && canCreate ? `<button class="btn small" onclick="openRecordPickup(${d.id})">Record Pickup</button>` : ""}
           ${d.status === 'PICKED_UP' && canBill ? `<button class="btn small green" onclick="openBillDelivery(${d.id}, ${d.total_consumption_weight})">Generate Invoice</button>` : ""}
           ${d.status !== 'BILLED' && d.status !== 'CANCELLED' && canCreate ? `<button class="btn small danger" onclick="cancelCommercialDelivery(${d.id})">Cancel</button>` : ""}
@@ -3522,6 +3627,7 @@ async function renderCommercialDeliveries(c) {
   if (canCreate) {
     document.getElementById("newDeliveryBtn").addEventListener("click", async () => {
       const customers = await api("/customers?q=");
+      customersById = Object.fromEntries(customers.map(cu => [String(cu.id), cu]));
       const custOpts = customers.map(cu => `<option value="${cu.id}">${esc(cu.name)} (${cu.account_no})</option>`).join("");
       const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
       const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
@@ -3554,9 +3660,9 @@ async function renderCommercialDeliveries(c) {
               <button class="btn small" id="drMatchBtn" type="button">Same count as delivered</button>
             </div>
           </div>
-          ${canRate ? `<div class="field"><label>Price per kg</label><input type="number" step="0.01" id="drRate"></div>` : ""}
+          ${canRate ? `<div class="field"><label>Price per kg <span id="drRateNote" style="font-weight:400;color:var(--muted)"></span></label><input type="number" step="0.01" id="drRate"></div>` : ""}
           <div class="field" id="drSummary" style="background:var(--bg);padding:10px;border-radius:8px;font-size:13.5px"></div>
-          <p style="font-size:12px;color:var(--muted);margin:0">Saving bills the customer right away: a credit sale, invoice and DR are created.</p>
+          <p style="font-size:12px;color:var(--muted);margin:0">Saving bills the customer right away: an invoice and DR are created (Receivables / SOA). It is not recorded as a sale.</p>
         </div>
         <div id="wiwoFields" class="hidden">
           <div class="field"><label>Cylinders</label>
@@ -3565,8 +3671,16 @@ async function renderCommercialDeliveries(c) {
           </div>
         </div>
         <div id="readingFields" class="hidden">
-          <div class="field"><label>Meter / Tank Label</label><input id="cdMeterLabel" placeholder="e.g. Bulk Tank A"></div>
-          <div class="field"><label>Previous Reading</label><input type="number" step="0.01" id="cdPrevReading" placeholder="Auto-filled from last bill if available"></div>
+          <div class="field"><label>Meter / Tank Label</label><input id="cdMeterLabel" placeholder="e.g. Bulk Tank A" list="cdMeterList">
+            <datalist id="cdMeterList"></datalist></div>
+          <div class="field" id="cdBeginBox" style="display:none;background:#fff4e5;padding:10px;border-radius:8px">
+            <label>Beginning Reading</label>
+            <p style="font-size:12px;margin:0 0 6px">No reading on record for this meter yet. Enter its beginning reading first — it becomes the previous reading of the first bill.</p>
+            <div style="display:flex;gap:6px"><input type="number" step="0.01" min="0" id="cdBeginReading" style="flex:1">
+              <button class="btn small green" type="button" id="cdBeginSave">Save Beginning Reading</button></div>
+          </div>
+          <div class="field"><label>Previous Reading <span id="cdPrevSrc" style="font-weight:400;color:var(--muted)"></span></label>
+            <input type="number" step="0.01" id="cdPrevReading" readonly placeholder="Set the beginning reading first" style="background:var(--bg)"></div>
           <div class="field"><label>Current Reading</label><input type="number" step="0.01" id="cdCurrReading"></div>
           <div class="field"><b>Consumption:</b> <span id="cdConsumptionPreview">—</span></div>
         </div>
@@ -3579,11 +3693,21 @@ async function renderCommercialDeliveries(c) {
         const pullRows = document.getElementById("drPullRows");
         const prodById = id => state.products.find(p => String(p.id) === String(id));
         function kgFromName(p) { const m = /(\d+(?:\.\d+)?)\s*-?\s*kg\b/i.exec((p && (p.name + " " + (p.sku || ""))) || ""); return m ? parseFloat(m[1]) : 50; }
+        // The rate Accounting set on the Commercial account wins; else the product default.
+        const custRate = () => { const cu = customersById[document.getElementById("cdCust").value]; return cu && cu.commercial_rate > 0 ? cu.commercial_rate : 0; };
+        function syncRate() {
+          const p = prodById(document.getElementById("cdProd").value);
+          const rateEl = document.getElementById("drRate"), cr = custRate();
+          if (rateEl) {
+            rateEl.value = cr || (p ? (p.price_per_kg || "") : "");
+            rateEl.readOnly = !!cr;
+            document.getElementById("drRateNote").textContent = cr ? "(account rate)" : "";
+          }
+        }
         function syncProductDefaults() {
           const p = prodById(document.getElementById("cdProd").value);
           document.getElementById("drKg").value = kgFromName(p);
-          const rateEl = document.getElementById("drRate");
-          if (rateEl) rateEl.value = p ? (p.price_per_kg || "") : "";
+          syncRate();
           drRecalc();
         }
         function rowResidual(row) {
@@ -3604,7 +3728,7 @@ async function renderCommercialDeliveries(c) {
           const billable = delivered - residual;
           const p = prodById(document.getElementById("cdProd").value);
           const rateEl = document.getElementById("drRate");
-          const rate = rateEl ? (parseFloat(rateEl.value) || 0) : (p ? p.price_per_kg || 0 : 0);
+          const rate = rateEl ? (parseFloat(rateEl.value) || 0) : (custRate() || (p ? p.price_per_kg || 0 : 0));
           document.getElementById("drSummary").innerHTML = `
             Delivered: <b>${qty} x ${kg} kg = ${delivered.toFixed(2)} kg</b><br>
             Less residual of ${rows.length} pulled-out cylinder(s): <b>${residual.toFixed(2)} kg</b><br>
@@ -3671,17 +3795,34 @@ async function renderCommercialDeliveries(c) {
         document.getElementById("cdPrevReading").addEventListener("input", updateConsumptionPreview);
         document.getElementById("cdCurrReading").addEventListener("input", updateConsumptionPreview);
 
+        // Previous reading always comes from the system: the last bill's
+        // current reading, or the meter's beginning reading for its first bill.
         async function suggestPreviousReading() {
           const custId = document.getElementById("cdCust").value;
           if (!custId) return;
+          const label = document.getElementById("cdMeterLabel").value.trim();
           try {
-            const r = await api(`/commercial-deliveries/last-reading?customer_id=${custId}`);
-            if (r.previous_reading !== null) {
-              document.getElementById("cdPrevReading").value = r.previous_reading;
-              updateConsumptionPreview();
-            }
+            const r = await api(`/commercial-deliveries/last-reading?customer_id=${custId}&meter_label=${encodeURIComponent(label)}`);
+            document.getElementById("cdMeterList").innerHTML = r.meters.filter(m => m).map(m => `<option value="${esc(m)}">`).join("");
+            const has = r.previous_reading !== null;
+            document.getElementById("cdPrevReading").value = has ? r.previous_reading : "";
+            document.getElementById("cdPrevSrc").textContent = !has ? "" : r.source === "BEGINNING" ? "(beginning reading)" : "(from the last bill)";
+            document.getElementById("cdBeginBox").style.display = has ? "none" : "";
+            updateConsumptionPreview();
           } catch (e) {}
         }
+        document.getElementById("cdMeterLabel").addEventListener("change", suggestPreviousReading);
+        document.getElementById("cdBeginSave").addEventListener("click", async () => {
+          const v = document.getElementById("cdBeginReading").value;
+          if (v === "") { toast("Enter the beginning reading", "error"); return; }
+          try {
+            await api("/commercial-meters", { method: "POST", body: {
+              customer_id: document.getElementById("cdCust").value,
+              meter_label: document.getElementById("cdMeterLabel").value.trim(), beginning_reading: v } });
+            toast("Beginning reading saved", "success");
+            suggestPreviousReading();
+          } catch (e) {}
+        });
 
         document.getElementById("cdType").addEventListener("change", (e) => {
           const isReading = e.target.value === "READING";
@@ -3691,6 +3832,7 @@ async function renderCommercialDeliveries(c) {
           if (isReading) suggestPreviousReading();
         });
         document.getElementById("cdCust").addEventListener("change", () => {
+          syncRate(); drRecalc();
           if (document.getElementById("cdType").value === "READING") suggestPreviousReading();
         });
 
@@ -3719,7 +3861,7 @@ async function renderCommercialDeliveries(c) {
             try {
               const r = await api("/commercial-deliveries", { method: "POST", body: base });
               closeModal(); load();
-              toast(`Billed ${r.billable_kg} kg = ${money(r.billed_amount)} (${r.sale_no}, ${r.dr_no})`, "success");
+              toast(`Billed ${r.billable_kg} kg = ${money(r.billed_amount)} (${r.delivery_no}, ${r.dr_no})`, "success");
               if (confirm("Billing saved. Print the Delivery Receipt now?")) printSaleDR(r.sale_id);
             } catch (e) {}
             return;
@@ -3735,9 +3877,9 @@ async function renderCommercialDeliveries(c) {
           } else {
             const prev = document.getElementById("cdPrevReading").value;
             const curr = document.getElementById("cdCurrReading").value;
-            if (!prev || !curr) { toast("Enter both previous and current readings", "error"); return; }
-            base.meter_label = document.getElementById("cdMeterLabel").value;
-            base.previous_reading = prev;
+            if (prev === "") { toast("Save the beginning reading of this meter first", "error"); return; }
+            if (!curr) { toast("Enter the current reading", "error"); return; }
+            base.meter_label = document.getElementById("cdMeterLabel").value.trim();
             base.current_reading = curr;
           }
           try {
@@ -3830,11 +3972,14 @@ async function renderCommercialDeliveries(c) {
     const products = state.products;
     const d = await api(`/commercial-deliveries/${id}`);
     const prod = products.find(p => p.id === d.product_id);
-    const defaultRate = prod ? prod.price_per_kg : 0;
+    let acctRate = 0;
+    try { const cu = (await api("/customers?q=" + encodeURIComponent(d.account_no))).find(x => x.id === d.customer_id); acctRate = cu && cu.commercial_rate > 0 ? cu.commercial_rate : 0; } catch (e) {}
+    const defaultRate = acctRate || (prod ? prod.price_per_kg : 0);
     const unitLabel = d.billing_type === "WIWO" ? "kg" : "unit(s)";
     openModal("Generate Invoice", `
       <div class="field"><b>Total Consumption:</b> ${totalConsumption} ${unitLabel}</div>
-      <div class="field"><label>Price per ${d.billing_type === 'WIWO' ? 'KG' : 'Unit'}</label><input type="number" step="0.01" id="billRate" value="${defaultRate}"></div>
+      <div class="field"><label>Price per ${d.billing_type === 'WIWO' ? 'KG' : 'Unit'} ${acctRate ? `<span style="font-weight:400;color:var(--muted)">(account rate)</span>` : ""}</label>
+        <input type="number" step="0.01" id="billRate" value="${defaultRate}" ${acctRate ? "readonly" : ""}></div>
       <div class="field"><b>Estimated Total:</b> <span id="billTotal">${money(totalConsumption * defaultRate)}</span></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
         <button class="btn green" id="billSaveBtn">Generate Invoice</button></div>
@@ -3848,11 +3993,17 @@ async function renderCommercialDeliveries(c) {
         try {
           const result = await api(`/commercial-deliveries/${id}/bill`, { method: "POST", body: { price_per_kg: rate } });
           closeModal();
-          toast(`Invoice ${result.sale_no} created for ${money(result.billed_amount)}`, "success");
+          toast(`Invoice created for ${money(result.billed_amount)}`, "success");
           load();
         } catch (e) {}
       });
     });
+  };
+
+  window.voidCommercialBilling = async (id) => {
+    if (!confirm("Void this billing? Its invoice is cancelled (only allowed while nothing is paid). A billing generated from a sale can then be generated again.")) return;
+    try { await api(`/commercial-deliveries/${id}/void-billing`, { method: "POST" }); toast("Billing voided", "success"); load(); }
+    catch (e) {}
   };
 
   window.cancelCommercialDelivery = async (id) => {
