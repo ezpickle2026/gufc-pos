@@ -3107,15 +3107,41 @@ def edit_sale(sale_id):
         apply_wht = bool(d["withholding_tax"]) if "withholding_tax" in d else (sale["withholding_tax"] or 0) > 0
         wht = compute_withholding_tax(total) if apply_wht else 0.0
         amount_due = round(total - wht, 2)
-        paid = round(sale["paid"] or 0, 2)
+        # Payments taken at the POS (not later AR collections) can be corrected
+        # too: method, amount and reference. AR collections stay as they are.
+        old_pays = conn.execute("SELECT * FROM payments WHERE sale_id=? AND payment_source='SALE' ORDER BY id",
+                                (sale_id,)).fetchall()
+        pay_changes = None
+        if "payments" in d:
+            old_by_id = {p["id"]: p for p in old_pays}
+            pay_changes = []
+            for n, p in enumerate(d.get("payments") or [], start=1):
+                method = (p.get("method") or "").strip()[:40]
+                if not method:
+                    raise ValueError(f"Payment {n}: choose the payment method")
+                amt = round(_num(p.get("amount"), f"Payment {n} amount", allow_blank=True) or 0, 2)
+                if amt < 0:
+                    raise ValueError(f"Payment {n}: amount cannot be negative")
+                pid = p.get("id")
+                pid = int(pid) if pid not in (None, "", 0, "0") else None
+                if pid is not None and pid not in old_by_id:
+                    raise ValueError(f"Payment {n} is not a POS payment of this sale")
+                if amt <= 0:
+                    continue  # a zeroed row is dropped
+                pay_changes.append({"id": pid, "method": method, "amount": amt,
+                                    "reference": (p.get("reference") or "").strip()[:120]})
+        old_pay_sum = round(sum(p["amount"] for p in old_pays), 2)
+        new_pay_sum = round(sum(p["amount"] for p in pay_changes), 2) if pay_changes is not None else old_pay_sum
+        pay_delta = round(new_pay_sum - old_pay_sum, 2)
+        paid = round((sale["paid"] or 0) + pay_delta, 2)
         balance = round(amount_due - paid, 2)
         recv = conn.execute("SELECT * FROM receivables WHERE sale_id=?", (sale_id,)).fetchone()
         if sale["sale_type"] == "CASH" and balance > 0.009:
             raise ValueError(f"The new amount due ({amount_due:,.2f}) is more than what was paid ({paid:,.2f}) on this "
-                             "cash sale. Lower the amount, or ring up the difference as a new sale.")
+                             "cash sale. Raise the payment, lower the amount, or ring up the difference as a new sale.")
         if sale["sale_type"] == "CREDIT" and balance < -0.009:
-            raise ValueError(f"The customer already paid {paid:,.2f}, more than the new amount due {amount_due:,.2f}. "
-                             "Fix the payment first, then adjust the sale.")
+            raise ValueError(f"The customer paid {paid:,.2f}, more than the new amount due {amount_due:,.2f}. "
+                             "Lower the payment or the amount paid.")
 
         old_items = conn.execute("SELECT * FROM sale_items WHERE sale_id=? ORDER BY id", (sale_id,)).fetchall()
         sig = lambda rows: sorted((r[0], r[1], r[2], r[3] or "") for r in rows)
@@ -3139,15 +3165,36 @@ def edit_sale(sale_id):
                 (sale_id, r["prod"]["id"], r["prod"]["name"], r["qty"], r["price"], r["line_total"], r["sale_mode"],
                  r["discount_id"], r["discount_name"], r["discount_amount"], r["swap_brand"], r["swap_fee"],
                  1 if r["bill_later"] else 0, r["srp_price"]))
+        pay_note = ""
+        if pay_changes is not None:
+            fmt_pays = lambda rows: ", ".join(f"{p['method']} {p['amount']:.2f}" for p in rows) or "none"
+            before_p, after_p = fmt_pays(old_pays), fmt_pays(pay_changes)
+            keep = {p["id"] for p in pay_changes if p["id"]}
+            for p in old_pays:
+                if p["id"] not in keep:
+                    conn.execute("DELETE FROM payments WHERE id=?", (p["id"],))
+            for p in pay_changes:
+                if p["id"]:
+                    conn.execute("UPDATE payments SET method=?, amount=?, reference=? WHERE id=?",
+                                 (p["method"], p["amount"], p["reference"], p["id"]))
+                else:  # dated with the sale, so it stays in that day's collections
+                    conn.execute("INSERT INTO payments (sale_id, method, amount, reference, ts, user_id) "
+                                 "VALUES (?,?,?,?,?,?)",
+                                 (sale_id, p["method"], p["amount"], p["reference"], sale["ts"], u["id"]))
+            if before_p != after_p or any(
+                    p["id"] and (old_by_id[p["id"]]["reference"] or "") != p["reference"] for p in pay_changes):
+                pay_note = f" | payments {before_p} -> {after_p}"
+
         notes = d["notes"] if "notes" in d else sale["notes"]
         conn.execute(
             """UPDATE sales SET customer_id=?, walkin_name=?, subtotal=?, discount=?, total=?, withholding_tax=?,
-                   balance=?, notes=?, edited_at=datetime('now'), edited_by=? WHERE id=?""",
-            (customer_id, walkin_name, subtotal, discount, total, wht, balance, notes, u["id"], sale_id))
+                   paid=?, balance=?, notes=?, edited_at=datetime('now'), edited_by=? WHERE id=?""",
+            (customer_id, walkin_name, subtotal, discount, total, wht, paid, balance, notes, u["id"], sale_id))
 
         if recv:
-            conn.execute("UPDATE receivables SET customer_id=?, amount=?, balance=? WHERE id=?",
-                         (customer_id or recv["customer_id"], amount_due, round(amount_due - (recv["paid"] or 0), 2),
+            recv_paid = round((recv["paid"] or 0) + pay_delta, 2)
+            conn.execute("UPDATE receivables SET customer_id=?, amount=?, paid=?, balance=? WHERE id=?",
+                         (customer_id or recv["customer_id"], amount_due, recv_paid, round(amount_due - recv_paid, 2),
                           recv["id"]))
             recompute_receivable_status(conn, recv["id"])
         elif sale["sale_type"] == "CREDIT" and balance > 0.009:
@@ -3168,7 +3215,7 @@ def edit_sale(sale_id):
                          f"{customer['name'] if customer else (walkin_name or 'Walk-in')}")
         audit(conn, "ADJUST", "SALES", sale_id,
               f"{sale['sale_no']} adjusted: total {sale['total']:.2f} -> {total:.2f}, balance {sale['balance']:.2f} -> "
-              f"{balance:.2f}{cust_note} | before: {before} | after: {after} | reason: {reason}")
+              f"{balance:.2f}{cust_note}{pay_note} | before: {before} | after: {after} | reason: {reason}")
         conn.commit()
     except ValueError as e:
         conn.rollback(); conn.close()
