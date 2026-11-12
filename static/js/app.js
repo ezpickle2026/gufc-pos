@@ -828,6 +828,25 @@ function printDeliveryReceipt(result) {
   </div>`);
 }
 
+// End of Day: how "Cash sales" ties to the POS Sales received in
+// Collections by Payment Method, so a difference is explained line by line.
+function eodReconcileHtml(s, print = false) {
+  if (s.paid_at_sale === undefined) return "";
+  const diff = Math.round((s.paid_at_sale - s.cash_sales) * 100) / 100;
+  const line = (label, v, strong) => `<div class="cart-total-row" style="${strong ? "font-weight:700;" : ""}${print ? "display:flex;justify-content:space-between;font-size:11px" : ""}"><span>${label}</span><span>${v}</span></div>`;
+  const parts = [line("Cash sales", money(s.cash_sales))];
+  if (s.credit_paid_at_sale) parts.push(line("&nbsp;&nbsp;+ Paid at the counter on credit / terms sales", money(s.credit_paid_at_sale)));
+  if (s.cash_wht) parts.push(line("&nbsp;&nbsp;&minus; 1% withholding tax on cash sales (Form 2307)", money(s.cash_wht)));
+  if (Math.abs(s.cash_overpaid) > 0.009) parts.push(line("&nbsp;&nbsp;+ Paid above the amount due on cash sales", money(s.cash_overpaid)));
+  parts.push(line("= POS Sales received (Collections table)", money(s.paid_at_sale), true));
+  const over = (s.overpaid_sales || []).map(x => `${esc(x.sale_no)} paid ${money(x.paid)} for ${money(x.total - x.withholding_tax)} (+${money(x.over)})${x.edited_at ? " — adjusted after the sale" : ""}`);
+  return `<div style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--border, #ccc)">
+    <div style="font-size:12px;color:var(--muted, #666);margin-bottom:4px"><b>Why POS Sales received ${Math.abs(diff) > 0.009 ? `differs from Cash sales by ${money(diff)}` : "matches Cash sales"}</b></div>
+    ${parts.join("")}
+    ${over.length ? `<div style="font-size:11.5px;color:var(--muted, #666);margin-top:4px">Overpaid cash sales (change typed in as payment, or price lowered later): ${over.join("; ")}</div>` : ""}
+  </div>`;
+}
+
 // ================================================================== SALES
 // Generate Billing (Commercial 50kg deliveries) is for Accounting only (+ Admin).
 const canCommercialBilling = () => isAdminLike() || state.user.role === "ACCOUNTING";
@@ -2068,6 +2087,7 @@ async function renderEndOfDay(c) {
           <div class="cart-total-row"><span>&nbsp;&nbsp;Charged to accounts (unpaid)</span><span>${money(s.charged_to_accounts)}</span></div>
           <div class="cart-total-row"><span>Discounts given</span><span>${money(s.discount)}</span></div>
           <div class="cart-total-row"><span>Voided sales (${s.voided_count})</span><span>${money(s.voided_total)}</span></div>
+          ${eodReconcileHtml(s)}
         </div>
       </div>
       <div class="card" style="margin-top:16px">
@@ -2128,6 +2148,7 @@ function printEndOfDay(d) {
       ${row("Discounts given", money(s.discount))}
       ${row(`Voided sales (${s.voided_count})`, money(s.voided_total))}
     </table>
+    ${eodReconcileHtml(s, true)}
     <h4>Products Sold</h4>
     <table style="width:100%;border-collapse:collapse" border="1" cellpadding="4">
       <tr><th align="left">Product</th><th align="left">Type</th><th align="right">Qty</th><th align="right">Amount</th></tr>

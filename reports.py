@@ -310,6 +310,15 @@ def eod_pdf_response(data, filename):
                ["  Charged to accounts (unpaid)", m(s["charged_to_accounts"])],
                ["Discounts given", m(s["discount"])],
                [f"Voided sales ({s['voided_count']})", m(s["voided_total"])]]
+    if "paid_at_sale" in s:
+        summary.append(["Cash sales", m(s["cash_sales"])])
+        if s["credit_paid_at_sale"]:
+            summary.append(["  + Paid at the counter on credit / terms sales", m(s["credit_paid_at_sale"])])
+        if s["cash_wht"]:
+            summary.append(["  - 1% withholding tax on cash sales", m(s["cash_wht"])])
+        if abs(s["cash_overpaid"]) > 0.009:
+            summary.append(["  + Paid above the amount due on cash sales", m(s["cash_overpaid"])])
+        summary.append(["= POS Sales received (Collections)", m(s["paid_at_sale"])])
     flow.append(styled(summary, [300, 120]))
 
     if data["items"]:
