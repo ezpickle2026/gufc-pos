@@ -4935,7 +4935,7 @@ def set_meter_beginning_reading():
     existing = conn.execute("SELECT * FROM commercial_meters WHERE customer_id=? AND meter_label=?",
                             (customer_id, meter_label)).fetchone()
     if existing:
-        if u["role"] not in COMMERCIAL_RATE_ROLES:
+        if not can_commercial_rate(u):
             conn.close()
             return jsonify(error="This meter already has a beginning reading. Ask Admin / Accounting to change it."), 403
         conn.execute("UPDATE commercial_meters SET beginning_reading=?, set_by=?, set_at=datetime('now') WHERE id=?",
@@ -5187,6 +5187,20 @@ def record_commercial_pickup(did):
 # Roles that may type their own price per kg on a DR billing. Everyone else
 # with the 50kg Commercial Billing module bills at the product's default.
 COMMERCIAL_RATE_ROLES = ("ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING")
+# Module that gives any role (e.g. a custom accounting role) Accounting's
+# billing powers: Generate Billing, Void Billing, account rates, invoices.
+COMMERCIAL_BILLING_MODULE = "commercial_billing_accounting"
+
+
+def can_commercial_rate(user):
+    """Rate roles, or any role granted the Accounting billing module."""
+    if user["role"] in COMMERCIAL_RATE_ROLES:
+        return True
+    conn = get_db()
+    try:
+        return has_module_access(conn, user["role"], COMMERCIAL_BILLING_MODULE)
+    finally:
+        conn.close()
 
 
 def _num(v, label, allow_blank=False):
@@ -5207,7 +5221,7 @@ def _commercial_rate(customer, product, typed=None):
     rate = customer["commercial_rate"] if "commercial_rate" in customer.keys() else None
     if rate and rate > 0:
         return float(rate), "CUSTOMER"
-    if typed not in (None, "") and session["user"]["role"] in COMMERCIAL_RATE_ROLES:
+    if typed not in (None, "") and can_commercial_rate(session["user"]):
         return _num(typed, "Price per kg"), "TYPED"
     return float(product["price_per_kg"] or 0), "PRODUCT"
 
@@ -5273,7 +5287,7 @@ def _create_dr_billing(d, location_id, source_sale=None):
         price_per_kg, _src = _commercial_rate(customer, product, d.get("price_per_kg"))
         if price_per_kg <= 0:
             raise ValueError("No rate per kg — Accounting can set this Commercial account's rate (Customers > Rate)"
-                             + (", or enter one now" if u["role"] in COMMERCIAL_RATE_ROLES else ""))
+                             + (", or enter one now" if can_commercial_rate(u) else ""))
         billed_amount = round(billable_kg * price_per_kg, 2)
         dr_ref = (d.get("dr_ref") or "").strip()
         if source_sale is not None and not dr_ref:
@@ -5350,7 +5364,7 @@ def _bill_delivery_as_credit_sale(conn, did, customer, product, location_id, qty
 
 
 @app.post("/api/commercial-deliveries/<int:did>/bill")
-@roles_required("ADMIN", "MANAGER", "ACCOUNTING")
+@roles_or_module_required("ADMIN", "MANAGER", "ACCOUNTING", module=COMMERCIAL_BILLING_MODULE)
 def bill_commercial_delivery(did):
     """The accountant's step: convert consumed weight into a credit sale +
     receivable at a price per kg. Deliberately restricted to Admin/Manager
@@ -5482,7 +5496,7 @@ def _sale_billing_context(conn, sale_id):
 
 
 @app.get("/api/sales/<int:sale_id>/commercial-billing")
-@roles_required(*COMMERCIAL_BILLING_ROLES)
+@roles_or_module_required(*COMMERCIAL_BILLING_ROLES, module=COMMERCIAL_BILLING_MODULE)
 def sale_commercial_billing_preview(sale_id):
     conn = get_db()
     try:
@@ -5521,7 +5535,7 @@ def sale_commercial_billing_preview(sale_id):
 
 
 @app.post("/api/sales/<int:sale_id>/commercial-billing")
-@roles_required(*COMMERCIAL_BILLING_ROLES)
+@roles_or_module_required(*COMMERCIAL_BILLING_ROLES, module=COMMERCIAL_BILLING_MODULE)
 def sale_generate_commercial_billing(sale_id):
     """Accounting's Generate Billing: delivered kg (from the sale's 50kg
     lines) less the residual typed in, at the customer's rate."""
@@ -5556,7 +5570,7 @@ def sale_generate_commercial_billing(sale_id):
 
 
 @app.post("/api/commercial-deliveries/<int:did>/void-billing")
-@roles_required(*COMMERCIAL_BILLING_ROLES)
+@roles_or_module_required(*COMMERCIAL_BILLING_ROLES, module=COMMERCIAL_BILLING_MODULE)
 def void_commercial_billing(did):
     """Undo a billing made by mistake (wrong residual or rate) while nothing
     has been paid on it: the invoice is voided and, for one generated from a
@@ -5583,7 +5597,7 @@ def void_commercial_billing(did):
 
 
 @app.put("/api/customers/<int:cid>/commercial-rate")
-@roles_required(*COMMERCIAL_BILLING_ROLES)
+@roles_or_module_required(*COMMERCIAL_BILLING_ROLES, module=COMMERCIAL_BILLING_MODULE)
 def set_customer_commercial_rate(cid):
     """Accounting sets a Commercial account's rate per kg; every billing for
     that account then uses it automatically. Blank clears it."""

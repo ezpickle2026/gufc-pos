@@ -474,7 +474,7 @@ MODULE_KEYS = [
     "employees", "staff_schedule", "kpi", "reports", "audit",
     "booked_orders", "incident_reports", "commercial_deliveries",
     "eod_report", "receivables_summary", "customer_growth",
-    "stock_import", "sales_targets",
+    "stock_import", "sales_targets", "commercial_billing_accounting",
 ]
 
 # Roles with Admin-level access. OPERATION_HEAD can do everything Admin can
@@ -494,6 +494,7 @@ DEFAULT_ROLE_PERMISSIONS = {
     "ACCOUNTING": [
         "dashboard", "sales", "customers", "receivables", "reports", "eod_report",
         "receivables_summary", "customer_growth", "commercial_deliveries",
+        "commercial_billing_accounting",
     ],
     "ATTENDANT": [
         "dashboard", "pos", "sales", "customers", "receivables", "inventory",
@@ -894,6 +895,20 @@ def migrate_schema():
         if conn.execute("SELECT 1 FROM roles WHERE name='ACCOUNTING'").fetchone():
             conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) "
                          "VALUES ('ACCOUNTING', 'commercial_deliveries')")
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
+        conn.commit()
+
+    # 20. Generate Billing / account rates as its own module, so it can be
+    #     given to any role (e.g. a custom accounting role) in Manage Roles.
+    #     Built-in ACCOUNTING gets it, plus every role that already has the
+    #     Receivables module and the 50kg Commercial Billing module is left
+    #     alone (Admin decides). Runs once.
+    MIGRATION_KEY = "commercial_billing_accounting_module"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        for role_name in ("ACCOUNTING",):
+            if conn.execute("SELECT 1 FROM roles WHERE name=?", (role_name,)).fetchone():
+                for m in ("commercial_billing_accounting", "commercial_deliveries"):
+                    conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES (?,?)", (role_name, m))
         conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 

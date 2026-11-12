@@ -830,7 +830,8 @@ function printDeliveryReceipt(result) {
 
 // ================================================================== SALES
 // Generate Billing (Commercial 50kg deliveries) is for Accounting only (+ Admin).
-const canCommercialBilling = () => isAdminLike() || state.user.role === "ACCOUNTING";
+// Any role can be given it in Manage Roles ("Commercial Billing: Generate Billing & Account Rates").
+const canCommercialBilling = () => isAdminLike() || state.user.role === "ACCOUNTING" || hasModule("commercial_billing_accounting");
 async function renderSales(c) {
   c.innerHTML = "Loading...";
   const sales = await api("/sales");
@@ -3556,6 +3557,7 @@ async function renderRoles(c) {
       commercial_deliveries: "50kg Commercial Billing", eod_report: "End of Day Report",
       receivables_summary: "Dashboard: Receivables Totals", customer_growth: "Customer Growth",
       stock_import: "Import Stock from Supplier", sales_targets: "Sales Targets",
+      commercial_billing_accounting: "Commercial Billing: Generate Billing & Account Rates",
     };
     openModal(`${locked ? "View" : "Edit"} Modules — ${name}`, `
       ${locked ? `<p style="color:var(--muted);font-size:13px">${name === "OPERATION_HEAD" ? "Operation Head always has full access to every module (everything except the System Reset)" : "Admin always has full access to every module"} — this can't be changed.</p>` : ""}
@@ -3584,11 +3586,11 @@ async function renderRoles(c) {
 async function renderCommercialDeliveries(c) {
   const role = state.user.role;
   const canCreate = hasModule("commercial_deliveries");
-  const canBill = isAdminLike(role) || role === "MANAGER" || role === "ACCOUNTING";
+  const canBill = isAdminLike(role) || role === "MANAGER" || canCommercialBilling();
   const canVoidBilling = canCommercialBilling();
   let customersById = {};
   // Who may type their own price per kg on a DR billing (others use the product's default).
-  const canRate = ["ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING"].includes(role);
+  const canRate = ["ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING"].includes(role) || canCommercialBilling();
   const typeBadge = t => ({ WIWO: "blue", DR: "green" }[t] || "warn");
   c.innerHTML = `<div style="margin-bottom:12px">${canCreate ? `<button class="btn green" id="newDeliveryBtn">+ New Commercial Billing</button>` : ""}</div>
     <div id="cdTable">Loading...</div>`;
