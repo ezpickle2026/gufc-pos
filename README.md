@@ -32,6 +32,24 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Sales: search and full history.** Sales has a search bar (sale #, DR #, customer name / business /
+  account #, walk-in name), date and status filters, and pages through **every** sale back to the first one
+  (Newest first or Oldest first, 50–500 per page). It no longer stops at the latest 100.
+- **Edit a completed sale (Operation Head / Admin).** **Edit** beside a completed sale changes its items,
+  mode, quantities, unit prices, discounts, withholding tax, customer (e.g. link a walk-in sale to its account)
+  and notes. A reason is required and the before/after is saved in the Audit Log; the sale shows *ADJUSTED*.
+  Stock, empties, swapped empties and cylinder deposits are reversed and re-applied; the receivable follows the
+  new amount. Payments aren't changed, so a cash sale can't be raised above what was paid, and a credit sale
+  can't be lowered below what was already paid. A delivery with a 50kg billing must have its billing voided first.
+- **Customer Growth counts every customer purchase.** 50kg Commercial Billings (no longer sales) count for
+  their customer again, a product with a cylinder size in its name/SKU (e.g. "11kg") counts even if its
+  category isn't "Cylinder", and a 50kg Commercial delivery not yet billed counts in Monthly kg / Sales Targets
+  until its billing is made. **New Customers** and **Lapsed** lists are short boxes with their own scroll bar.
+- **SOA: billings go to Charges; previous arrears stay in the Beginning Balance.** Dates on the SOA are now in
+  Philippine time (`APP_TZ_OFFSET_HOURS`, default 8). Before, a billing made before 8 AM was dated the day
+  before and, with a From date of today, was folded into the Beginning Balance instead of showing as a charge.
+  The Beginning Balance now shows its parts (previous arrears, balance forward) and billings show as *BILLING*.
+
 - **Commercial billing is no longer recorded as a sale.** Every 50kg Commercial Billing
   (DR, WIWO, Reading, and Generate Billing below) creates only the customer's **invoice**
   (Receivables, SOA, aging, portal billing). It no longer appears in the Sales list, Sales

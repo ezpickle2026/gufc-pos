@@ -809,11 +809,29 @@ def get_customer(cid):
     return jsonify(customer=dict(cust), receivables=[dict(r) for r in recv], sales=[dict(s) for s in sales])
 
 
-def build_customer_ledger(conn, cid, date_from=None, date_to=None):
+# Sale / payment times are stored in UTC (SQLite datetime('now')), but the
+# business runs on Philippine time. The SOA compares and shows dates in local
+# time; otherwise a billing made before 8 AM landed on the previous day — and,
+# with a From date of today, went into the Beginning Balance instead of
+# Charges.
+APP_TZ_OFFSET_HOURS = float(os.environ.get("APP_TZ_OFFSET_HOURS", "8"))
+
+
+def _local_ts(ts):
+    if not ts:
+        return ts
+    try:
+        dt = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ts
+    return (dt + timedelta(hours=APP_TZ_OFFSET_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_customer_ledger(conn, cid, date_from=None, date_to=None, breakdown=False):
     """Chronological charges (sales) + payments for a customer, with running balance.
     Used for both the on-screen Account Ledger and the printable Statement of Account."""
     sales = conn.execute(
-        """SELECT s.id, s.sale_no, s.ts, s.total, s.status, s.is_opening_balance, r.invoice_no
+        """SELECT s.id, s.sale_no, s.ts, s.total, s.status, s.is_opening_balance, s.is_billing, r.invoice_no
            FROM sales s LEFT JOIN receivables r ON r.sale_id = s.id
            WHERE s.customer_id=? AND s.status='COMPLETED' ORDER BY s.ts""",
         (cid,),
@@ -828,6 +846,7 @@ def build_customer_ledger(conn, cid, date_from=None, date_to=None):
     events = []
     for s in sales:
         if s["is_opening_balance"]:
+            # Arrears are stored on their as-of date (already local time).
             events.append({"date": s["ts"], "type": "PREVIOUS ARREARS", "ref": s["invoice_no"] or s["sale_no"],
                            "debit": s["total"], "credit": 0, "opening": True})
         elif abs(s["total"] or 0) < 0.005:
@@ -835,33 +854,43 @@ def build_customer_ledger(conn, cid, date_from=None, date_to=None):
             # billed separately) — keep it off the SOA.
             continue
         else:
-            events.append({"date": s["ts"], "type": "SALE", "ref": s["sale_no"], "debit": s["total"], "credit": 0})
+            events.append({"date": _local_ts(s["ts"]), "type": "BILLING" if s["is_billing"] else "SALE",
+                           "ref": s["invoice_no"] if s["is_billing"] and s["invoice_no"] else s["sale_no"],
+                           "debit": s["total"], "credit": 0})
     for p in payments:
-        events.append({"date": p["ts"], "type": "PAYMENT", "ref": f"{p['sale_no']} ({p['method']})", "debit": 0, "credit": p["amount"]})
+        events.append({"date": _local_ts(p["ts"]), "type": "PAYMENT", "ref": f"{p['sale_no']} ({p['method']})", "debit": 0, "credit": p["amount"]})
     events.sort(key=lambda e: e["date"])
 
-    beginning_balance = 0.0
+    previous_arrears = 0.0   # uploaded arrears: always the Beginning Balance
+    balance_forward = 0.0    # charges less payments dated before the From date
     in_range_events = []
     for e in events:
         before_range = date_from and e["date"] < date_from
         after_range = date_to and e["date"] > date_to + " 23:59:59"
         # Uploaded previous arrears always roll into the Beginning Balance
         # (as long as they're dated within the statement period or earlier),
-        # rather than appearing as a charge line on the statement.
-        if e.get("opening") and not after_range:
-            beginning_balance += e["debit"]
+        # rather than appearing as a charge line on the statement. New
+        # billings and sales are never folded into it: in the period they
+        # are Charges.
+        if e.get("opening"):
+            if not after_range:
+                previous_arrears += e["debit"]
             continue
         if before_range:
-            beginning_balance += e["debit"] - e["credit"]
+            balance_forward += e["debit"] - e["credit"]
         elif not after_range:
             in_range_events.append(e)
 
-    running = round(beginning_balance, 2)
+    beginning_balance = round(previous_arrears + balance_forward, 2)
+    running = beginning_balance
     out = []
     for e in in_range_events:
         running = round(running + e["debit"] - e["credit"], 2)
         out.append({**{k: v for k, v in e.items() if k != "opening"}, "balance": running})
-    return out, round(beginning_balance, 2), running
+    if breakdown:
+        return out, beginning_balance, running, {"previous_arrears": round(previous_arrears, 2),
+                                                 "balance_forward": round(balance_forward, 2)}
+    return out, beginning_balance, running
 
 
 @app.get("/api/customers/<int:cid>/ledger")
@@ -874,9 +903,9 @@ def customer_ledger(cid):
         return jsonify(error="Not found"), 404
     date_from = request.args.get("from")
     date_to = request.args.get("to")
-    entries, beginning, ending = build_customer_ledger(conn, cid, date_from, date_to)
+    entries, beginning, ending, parts = build_customer_ledger(conn, cid, date_from, date_to, breakdown=True)
     conn.close()
-    return jsonify(customer=dict(cust), entries=entries, beginning_balance=beginning, ending_balance=ending)
+    return jsonify(customer=dict(cust), entries=entries, beginning_balance=beginning, ending_balance=ending, **parts)
 
 
 @app.get("/api/customers/<int:cid>/statement/export")
@@ -889,10 +918,10 @@ def customer_statement_export(cid):
         return jsonify(error="Not found"), 404
     date_from = request.args.get("from")
     date_to = request.args.get("to")
-    entries, beginning, ending = build_customer_ledger(conn, cid, date_from, date_to)
+    entries, beginning, ending, parts = build_customer_ledger(conn, cid, date_from, date_to, breakdown=True)
     conn.close()
     fname = f"SOA-{cust['account_no']}-{datetime.now().strftime('%Y%m%d')}.pdf"
-    return soa_pdf_response(dict(cust), entries, beginning, ending, fname)
+    return soa_pdf_response(dict(cust), entries, beginning, ending, fname, **parts)
 
 
 # ---------------------------------------------------------------- booked orders
@@ -1486,22 +1515,22 @@ def _portal_soa_args():
 @portal_required
 def portal_soa():
     conn = get_db()
-    entries, beginning, ending = build_customer_ledger(conn, g.portal["id"], *_portal_soa_args())
+    entries, beginning, ending, parts = build_customer_ledger(conn, g.portal["id"], *_portal_soa_args(), breakdown=True)
     conn.close()
-    return jsonify(entries=entries, beginning_balance=beginning, ending_balance=ending)
+    return jsonify(entries=entries, beginning_balance=beginning, ending_balance=ending, **parts)
 
 
 @app.get("/api/portal/soa/export")
 @portal_required
 def portal_soa_export():
     conn = get_db()
-    entries, beginning, ending = build_customer_ledger(conn, g.portal["id"], *_portal_soa_args())
+    entries, beginning, ending, parts = build_customer_ledger(conn, g.portal["id"], *_portal_soa_args(), breakdown=True)
     cust = dict(conn.execute("SELECT * FROM customers WHERE id=?", (g.portal["id"],)).fetchone())
     _portal_audit(conn, "DOWNLOAD_SOA", g.portal["id"])
     conn.commit()
     conn.close()
     fname = f"SOA-{cust['account_no']}-{datetime.now().strftime('%Y%m%d')}.pdf"
-    return soa_pdf_response(cust, entries, beginning, ending, fname)
+    return soa_pdf_response(cust, entries, beginning, ending, fname, **parts)
 
 
 # ---------------------------------------------------------------- incident reports
@@ -2702,9 +2731,9 @@ def get_sale_detail(sale_id):
         """SELECT s.*, l.name location_name, l.address location_address, u.name cashier_name,
                   COALESCE(c.name, s.walkin_name) customer_name, c.account_no, c.business_name customer_business_name,
                   c.address customer_address, c.phone customer_phone, c.terms_days customer_terms_days, c.category customer_category,
-                  r.invoice_no, r.due_date
+                  r.invoice_no, r.due_date, eu.name edited_by_name
            FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u ON u.id=s.user_id
-           LEFT JOIN customers c ON c.id=s.customer_id
+           LEFT JOIN customers c ON c.id=s.customer_id LEFT JOIN users eu ON eu.id=s.edited_by
            LEFT JOIN receivables r ON r.sale_id=s.id WHERE s.id=?""", (sale_id,)
     ).fetchone()
     items = conn.execute("SELECT * FROM sale_items WHERE sale_id=?", (sale_id,)).fetchall()
@@ -2713,28 +2742,60 @@ def get_sale_detail(sale_id):
     return {"sale": dict(sale), "items": [dict(i) for i in items], "payments": [dict(p) for p in pays]}
 
 
+SALES_PAGE_SIZE_MAX = 500
+
+
 @app.get("/api/sales")
 @roles_or_module_required("ADMIN", "MANAGER", "ATTENDANT", module="sales")
 def list_sales():
+    """Every sale from the very first one, a page at a time. ?q= searches the
+    sale #, DR #, customer name / business / account # and walk-in name;
+    ?from= / ?to= limit the date; ?order=oldest lists from the first sale."""
     u = session["user"]
     conn = get_db()
-    sql = """SELECT s.*, l.name location_name, u2.name cashier_name, COALESCE(c.name, s.walkin_name) customer_name,
+    where = ["s.is_opening_balance=0", "s.is_billing=0"]
+    params = []
+    # Supervisor sees (and can void) sales at every location.
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "ACCOUNTING", "SUPERVISOR"):
+        where.append("s.location_id=?")
+        params.append(u["location_id"])
+    q = (request.args.get("q") or "").strip()
+    if q:
+        like = f"%{q}%"
+        where.append("(s.sale_no LIKE ? OR COALESCE(s.dr_no,'') LIKE ? OR COALESCE(c.name,'') LIKE ? "
+                     "OR COALESCE(c.business_name,'') LIKE ? OR COALESCE(c.account_no,'') LIKE ? "
+                     "OR COALESCE(s.walkin_name,'') LIKE ?)")
+        params += [like] * 6
+    for arg, op in (("from", ">="), ("to", "<=")):
+        v = (request.args.get(arg) or "").strip()
+        if v:
+            where.append(f"date(s.ts) {op} date(?)")
+            params.append(v)
+    status = (request.args.get("status") or "").strip().upper()
+    if status in ("COMPLETED", "VOIDED"):
+        where.append("s.status=?"); params.append(status)
+    page_size = max(1, min(request.args.get("page_size", type=int) or 100, SALES_PAGE_SIZE_MAX))
+    page = max(1, request.args.get("page", type=int) or 1)
+    order = "ASC" if (request.args.get("order") or "").lower() == "oldest" else "DESC"
+    joins = """FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u2 ON u2.id=s.user_id
+              LEFT JOIN customers c ON c.id=s.customer_id LEFT JOIN users eu ON eu.id=s.edited_by"""
+    cond = "WHERE " + " AND ".join(where)
+    total = conn.execute(f"SELECT COUNT(*) n, COALESCE(SUM(CASE WHEN s.status='COMPLETED' THEN s.total END),0) amt "
+                         f"{joins} {cond}", params).fetchone()
+    sql = f"""SELECT s.*, l.name location_name, u2.name cashier_name, COALESCE(c.name, s.walkin_name) customer_name,
+                     c.account_no customer_account_no, s.customer_id IS NULL is_walkin,
                      (SELECT COALESCE(SUM(x.qty),0) FROM sale_items x WHERE x.sale_id=s.id AND x.bill_later=1) bill_later_qty,
                      (SELECT cd.id FROM commercial_deliveries cd WHERE cd.source_sale_id=s.id AND cd.status!='CANCELLED'
                        ORDER BY cd.id DESC LIMIT 1) billing_id,
                      (SELECT cd.delivery_no || '|' || COALESCE(cd.billed_amount,0) FROM commercial_deliveries cd
-                       WHERE cd.source_sale_id=s.id AND cd.status!='CANCELLED' ORDER BY cd.id DESC LIMIT 1) billing_ref
-              FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u2 ON u2.id=s.user_id
-              LEFT JOIN customers c ON c.id=s.customer_id WHERE s.is_opening_balance=0 AND s.is_billing=0"""
-    params = []
-    # Supervisor sees (and can void) sales at every location.
-    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "ACCOUNTING", "SUPERVISOR"):
-        sql += " AND s.location_id=?"
-        params.append(u["location_id"])
-    sql += " ORDER BY s.ts DESC LIMIT 100"
-    rows = conn.execute(sql, params).fetchall()
+                       WHERE cd.source_sale_id=s.id AND cd.status!='CANCELLED' ORDER BY cd.id DESC LIMIT 1) billing_ref,
+                     eu.name edited_by_name
+              {joins} {cond}
+              ORDER BY s.ts {order}, s.id {order} LIMIT ? OFFSET ?"""
+    rows = conn.execute(sql, params + [page_size, (page - 1) * page_size]).fetchall()
     conn.close()
-    return jsonify([dict(r) for r in rows])
+    return jsonify(rows=[dict(r) for r in rows], total=total["n"], total_amount=round(total["amt"], 2),
+                   page=page, page_size=page_size, pages=max(1, -(-total["n"] // page_size)))
 
 
 @app.get("/api/sales/<int:sale_id>")
@@ -2788,6 +2849,205 @@ def void_sale(sale_id):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- adjust a completed sale
+# The Operation Head (and Admin) can correct a completed sale: change items,
+# quantities, unit prices, discounts, the customer (e.g. a sale rung up as
+# walk-in by mistake) and notes. Stock, empties, swapped empties and cylinder
+# deposits are reversed for the old lines and applied for the new ones; the
+# sale totals and its receivable follow. Payments are not touched, so a
+# change can't leave the customer having paid more than the new amount due.
+
+SALE_EDIT_ROLES = ("ADMIN", "OPERATION_HEAD")
+
+
+def _reverse_sale_line_stock(conn, sale, it, ref, customer_id):
+    adjust_inventory(conn, sale["location_id"], it["product_id"], it["qty"], "ADJUSTMENT", ref,
+                     notes=f"Sale edit: old line reversed ({sale['sale_no']})", allow_negative=True)
+    if it["sale_mode"] == "REFILL":
+        remove_empty_cylinders(conn, sale["location_id"], it["product_id"], it["qty"], "SALE EDIT", ref,
+                               notes=f"Sale edit {sale['sale_no']}: old refill line reversed", allow_negative=True)
+    elif it["sale_mode"] == "SWAP" and it["swap_brand"]:
+        remove_swapped_empties(conn, sale["location_id"], it["product_id"], it["swap_brand"], it["qty"], "SALE EDIT",
+                               ref, notes=f"Sale edit {sale['sale_no']}: old swap line reversed", allow_negative=True)
+    elif it["sale_mode"] == "DEPOSIT" and customer_id:
+        conn.execute("UPDATE cylinder_deposits SET qty_on_loan = MAX(qty_on_loan - ?, 0) WHERE customer_id=? AND product_id=?",
+                     (it["qty"], customer_id, it["product_id"]))
+
+
+def _apply_sale_line_stock(conn, sale, prod, qty, sale_mode, swap_brand, ref, customer_id):
+    have = conn.execute("SELECT quantity FROM inventory WHERE location_id=? AND product_id=?",
+                        (sale["location_id"], prod["id"])).fetchone()
+    if (have["quantity"] if have else 0) < qty:
+        raise ValueError(f"Not enough {prod['name']} in stock at this location for {qty} "
+                         f"(on hand {have['quantity'] if have else 0})")
+    adjust_inventory(conn, sale["location_id"], prod["id"], -qty, "SALE", ref,
+                     notes=f"Sale edit {sale['sale_no']}: new line ({sale_mode})")
+    if sale_mode == "REFILL":
+        add_empty_cylinders(conn, sale["location_id"], prod["id"], qty, "SALE EDIT", reference=ref,
+                            notes=f"Empty returned on edited sale {sale['sale_no']}")
+    elif sale_mode == "SWAP":
+        add_swapped_empties(conn, sale["location_id"], prod["id"], swap_brand, qty, "SALE EDIT", reference=ref,
+                            notes=f"{swap_brand} empty on edited sale {sale['sale_no']}")
+    elif customer_id:
+        record_cylinder_deposit(conn, customer_id, prod["id"], qty)
+
+
+@app.put("/api/sales/<int:sale_id>")
+@roles_required(*SALE_EDIT_ROLES)
+def edit_sale(sale_id):
+    d = request.get_json(force=True) or {}
+    u = session["user"]
+    conn = get_db()
+    try:
+        sale = conn.execute("SELECT * FROM sales WHERE id=?", (sale_id,)).fetchone()
+        if not sale:
+            conn.close(); return jsonify(error="Not found"), 404
+        if sale["status"] != "COMPLETED":
+            raise ValueError(f"This sale is {sale['status']} — only completed sales can be adjusted")
+        if sale["is_billing"] or sale["is_opening_balance"]:
+            raise ValueError("Billings and previous arrears are not sales — adjust them in their own screens")
+        billed = conn.execute("SELECT delivery_no FROM commercial_deliveries WHERE source_sale_id=? AND status!='CANCELLED'",
+                              (sale_id,)).fetchone()
+        if billed:
+            raise ValueError(f"This delivery is billed in {billed['delivery_no']}. Void that billing first "
+                             "(50kg Commercial Billing > Void Billing), then adjust the sale.")
+        reason = (d.get("reason") or "").strip()
+        if not reason:
+            raise ValueError("Type the reason for the adjustment")
+
+        # customer: a walk-in sale can be linked to its account, or vice versa (cash only)
+        customer_id = d["customer_id"] if "customer_id" in d else sale["customer_id"]
+        customer_id = int(customer_id) if customer_id not in (None, "", 0, "0") else None
+        customer = None
+        if customer_id:
+            customer = conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+            if not customer:
+                raise ValueError("Customer not found")
+        if sale["sale_type"] == "CREDIT" and not customer:
+            raise ValueError("A credit / terms sale must stay on a customer account")
+        walkin_name = None if customer_id else (
+            ((d.get("walkin_name") if "walkin_name" in d else sale["walkin_name"]) or "").strip()[:120] or None)
+
+        items = d.get("items") or []
+        if not items:
+            raise ValueError("A sale needs at least one item (void it instead)")
+        commercial_delivery = bool(sale["sale_type"] == "CREDIT" and customer and is_commercial_account(customer))
+        resolved = []
+        for n, it in enumerate(items, start=1):
+            prod = conn.execute("SELECT * FROM products WHERE id=?", (it.get("product_id"),)).fetchone()
+            if not prod:
+                raise ValueError(f"Line {n}: choose a product")
+            try:
+                qty = int(it.get("qty"))
+            except (TypeError, ValueError):
+                raise ValueError(f"Line {n}: quantity must be a whole number")
+            if qty <= 0:
+                raise ValueError(f"Line {n}: quantity must be at least 1")
+            sale_mode = it.get("sale_mode") or "REFILL"
+            if sale_mode not in ("REFILL", "DEPOSIT", "SWAP"):
+                raise ValueError(f"Line {n}: mode must be REFILL, DEPOSIT or SWAP")
+            swap_brand, swap_fee = None, 0.0
+            if sale_mode == "SWAP":
+                swap_brand = (it.get("swap_brand") or "").strip()
+                if not swap_brand:
+                    raise ValueError(f"Line {n}: type the LPG brand being swapped for {prod['name']}")
+                swap_fee = round(_num(it.get("swap_fee"), "Swap fee", allow_blank=True) or 0, 2)
+                if swap_fee < 0:
+                    raise ValueError("Swap fee cannot be negative")
+            bill_later = commercial_delivery and is_commercial_cylinder(prod)
+            price = _num(it.get("price"), f"Line {n} unit price", allow_blank=True)
+            if price is None:  # default the way the POS prices it
+                price = 0.0 if bill_later else float(prod["price"])
+                price += float(prod["deposit_price"] or 0) if sale_mode == "DEPOSIT" else swap_fee
+            price = round(price, 2)
+            if price < 0:
+                raise ValueError(f"Line {n}: unit price cannot be negative")
+            line_total = round(price * qty, 2)
+            disc = round(_num(it.get("discount_amount"), f"Line {n} discount", allow_blank=True) or 0, 2)
+            if disc < 0 or disc > line_total + 0.009:
+                raise ValueError(f"Line {n}: discount must be between 0 and the line total ({line_total:.2f})")
+            resolved.append({"prod": prod, "qty": qty, "price": price, "line_total": line_total, "sale_mode": sale_mode,
+                             "swap_brand": swap_brand, "swap_fee": swap_fee, "bill_later": bill_later,
+                             "srp_price": float(prod["price"]) if bill_later else None, "discount_amount": disc,
+                             "discount_id": it.get("discount_id") if disc > 0 else None,
+                             "discount_name": (it.get("discount_name") or ("Adjustment" if disc > 0 else None)) if disc > 0 else None})
+
+        subtotal = round(sum(r["line_total"] for r in resolved), 2)
+        discount = round(sum(r["discount_amount"] for r in resolved), 2)
+        total = round(subtotal - discount, 2)
+        apply_wht = bool(d["withholding_tax"]) if "withholding_tax" in d else (sale["withholding_tax"] or 0) > 0
+        wht = compute_withholding_tax(total) if apply_wht else 0.0
+        amount_due = round(total - wht, 2)
+        paid = round(sale["paid"] or 0, 2)
+        balance = round(amount_due - paid, 2)
+        recv = conn.execute("SELECT * FROM receivables WHERE sale_id=?", (sale_id,)).fetchone()
+        if sale["sale_type"] == "CASH" and balance > 0.009:
+            raise ValueError(f"The new amount due ({amount_due:,.2f}) is more than what was paid ({paid:,.2f}) on this "
+                             "cash sale. Lower the amount, or ring up the difference as a new sale.")
+        if sale["sale_type"] == "CREDIT" and balance < -0.009:
+            raise ValueError(f"The customer already paid {paid:,.2f}, more than the new amount due {amount_due:,.2f}. "
+                             "Fix the payment first, then adjust the sale.")
+
+        old_items = conn.execute("SELECT * FROM sale_items WHERE sale_id=? ORDER BY id", (sale_id,)).fetchall()
+        sig = lambda rows: sorted((r[0], r[1], r[2], r[3] or "") for r in rows)
+        old_sig = sig([(i["product_id"], i["qty"], i["sale_mode"], i["swap_brand"]) for i in old_items])
+        new_sig = sig([(r["prod"]["id"], r["qty"], r["sale_mode"], r["swap_brand"]) for r in resolved])
+        has_deposit = any(i["sale_mode"] == "DEPOSIT" for i in old_items) or any(r["sale_mode"] == "DEPOSIT" for r in resolved)
+        stock_changed = old_sig != new_sig or (has_deposit and customer_id != sale["customer_id"])
+        ref = f"EDIT-{sale['sale_no']}"
+        if stock_changed:
+            for it in old_items:
+                _reverse_sale_line_stock(conn, sale, it, ref, sale["customer_id"])
+            for r in resolved:
+                _apply_sale_line_stock(conn, sale, r["prod"], r["qty"], r["sale_mode"], r["swap_brand"], ref, customer_id)
+
+        conn.execute("DELETE FROM sale_items WHERE sale_id=?", (sale_id,))
+        for r in resolved:
+            conn.execute(
+                """INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode,
+                   discount_id, discount_name, discount_amount, swap_brand, swap_fee, bill_later, srp_price)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (sale_id, r["prod"]["id"], r["prod"]["name"], r["qty"], r["price"], r["line_total"], r["sale_mode"],
+                 r["discount_id"], r["discount_name"], r["discount_amount"], r["swap_brand"], r["swap_fee"],
+                 1 if r["bill_later"] else 0, r["srp_price"]))
+        notes = d["notes"] if "notes" in d else sale["notes"]
+        conn.execute(
+            """UPDATE sales SET customer_id=?, walkin_name=?, subtotal=?, discount=?, total=?, withholding_tax=?,
+                   balance=?, notes=?, edited_at=datetime('now'), edited_by=? WHERE id=?""",
+            (customer_id, walkin_name, subtotal, discount, total, wht, balance, notes, u["id"], sale_id))
+
+        if recv:
+            conn.execute("UPDATE receivables SET customer_id=?, amount=?, balance=? WHERE id=?",
+                         (customer_id or recv["customer_id"], amount_due, round(amount_due - (recv["paid"] or 0), 2),
+                          recv["id"]))
+            recompute_receivable_status(conn, recv["id"])
+        elif sale["sale_type"] == "CREDIT" and balance > 0.009:
+            invoice_date = datetime.now().date()
+            conn.execute(
+                """INSERT INTO receivables (sale_id, customer_id, invoice_no, invoice_date, due_date, amount, paid, balance, status)
+                   VALUES (?,?,?,?,?,?,?,?,'CURRENT')""",
+                (sale_id, customer_id, next_number(conn, "INV", "receivables", "invoice_no"), str(invoice_date),
+                 str(invoice_date + timedelta(days=customer["terms_days"] or 0)), amount_due, paid, balance))
+
+        before = "; ".join(f"{i['qty']}x {i['product_name']} @{i['price']:.2f}" for i in old_items)
+        after = "; ".join(f"{r['qty']}x {r['prod']['name']} @{r['price']:.2f}" for r in resolved)
+        cust_note = ""
+        if customer_id != sale["customer_id"]:
+            old_c = conn.execute("SELECT name FROM customers WHERE id=?", (sale["customer_id"],)).fetchone() \
+                if sale["customer_id"] else None
+            cust_note = (f" | customer {old_c['name'] if old_c else (sale['walkin_name'] or 'Walk-in')} -> "
+                         f"{customer['name'] if customer else (walkin_name or 'Walk-in')}")
+        audit(conn, "ADJUST", "SALES", sale_id,
+              f"{sale['sale_no']} adjusted: total {sale['total']:.2f} -> {total:.2f}, balance {sale['balance']:.2f} -> "
+              f"{balance:.2f}{cust_note} | before: {before} | after: {after} | reason: {reason}")
+        conn.commit()
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(get_sale_detail(sale_id))
 
 
 # ---------------------------------------------------------------- receivables
@@ -3535,10 +3795,20 @@ def export_swapped_report():
 #   Growth    = change in active customers vs the period before
 
 # Same rule the POS uses to treat an item as a cylinder, minus a bare "LPG"
-# match so LPG accessories (regulators, hoses) are not counted.
+# match so LPG accessories (regulators, hoses) are not counted. A product
+# whose name or SKU carries a cylinder size ("11kg", "50 kg", "1.4KG") also
+# counts, so cylinders filed under another category (e.g. "LPG", "Refill")
+# with no deposit fee are not silently left out of the customer reports.
 LPG_CYLINDER_SQL = ("(LOWER(COALESCE(p.category,'')) LIKE '%cylinder%' "
-                    "OR COALESCE(p.deposit_price,0) > 0)")
+                    "OR COALESCE(p.deposit_price,0) > 0 "
+                    "OR LOWER(COALESCE(p.name,'') || ' ' || COALESCE(p.sku,'')) GLOB '*[0-9]kg*' "
+                    "OR LOWER(COALESCE(p.name,'') || ' ' || COALESCE(p.sku,'')) GLOB '*[0-9] kg*' "
+                    "OR LOWER(COALESCE(p.name,'') || ' ' || COALESCE(p.sku,'')) GLOB '*[0-9]-kg*')")
 GROWTH_MAX_PERIODS = 60
+# A POS line counts unless it is a Commercial 50kg delivery (bill_later)
+# that already has its 50kg Commercial Billing — then the billing counts.
+UNBILLED_OR_CHARGED_SQL = ("(COALESCE(si.bill_later,0)=0 OR NOT EXISTS (SELECT 1 FROM commercial_deliveries bx "
+                           "WHERE bx.source_sale_id=s.id AND bx.status!='CANCELLED'))")
 
 
 def _growth_periods(period, count, end_date):
@@ -3563,6 +3833,41 @@ def _growth_periods(period, count, end_date):
 
 def _pct(num, den):
     return round(num * 100.0 / den, 1) if den else None
+
+
+def _growth_billing_lines(conn, range_end, location_id=None, category=None):
+    """50kg Commercial Billing records, as customer purchase lines. Since the
+    billing is no longer a sale, without these a Commercial account billed
+    only through 50kg Commercial Billing (DR / WIWO / Reading, no POS sale)
+    never showed as a customer at all. A billing generated from a POS
+    delivery adds only its amount, on the delivery's date; the cylinders are
+    already counted on that POS sale."""
+    where = ["cd.status='BILLED'", "s.status='COMPLETED'", "s.customer_id IS NOT NULL",
+             "date(COALESCE(src.ts, s.ts)) <= date(?)"]
+    params = [range_end.isoformat()]
+    if location_id:
+        where.append("s.location_id=?"); params.append(location_id)
+    if category:
+        where.append("c.category=?"); params.append(category)
+    out = []
+    for r in conn.execute(
+        f"""SELECT s.customer_id, date(COALESCE(src.ts, s.ts)) d, cd.billing_type, cd.delivered_qty,
+                   cd.source_sale_id, s.total amount,
+                   (SELECT COUNT(*) FROM commercial_delivery_cylinders x WHERE x.delivery_id=cd.id) wiwo_cyls
+            FROM commercial_deliveries cd JOIN sales s ON s.id=cd.sale_id
+            JOIN customers c ON c.id=s.customer_id
+            LEFT JOIN sales src ON src.id=cd.source_sale_id AND src.status='COMPLETED'
+            WHERE {' AND '.join(where)}""", params).fetchall():
+        if r["source_sale_id"]:
+            qty = 0
+        elif r["billing_type"] == "DR":
+            qty = r["delivered_qty"] or 0
+        elif r["billing_type"] == "WIWO":
+            qty = r["wiwo_cyls"] or 0
+        else:
+            qty = 0  # meter / tank reading: no cylinders
+        out.append({"customer_id": r["customer_id"], "d": r["d"], "qty": qty, "amount": r["amount"] or 0})
+    return out
 
 
 def _build_customer_growth(conn, period="month", count=12, end_date=None, location_id=None, category=None):
@@ -3593,6 +3898,7 @@ def _build_customer_growth(conn, period="month", count=12, end_date=None, locati
             WHERE {' AND '.join(cust_where)} AND date(s.ts) <= date(?)""",
         cust_params + [range_end.isoformat()],
     ).fetchall()
+    lines = [dict(r) for r in lines] + _growth_billing_lines(conn, range_end, location_id, category)
 
     first_buy, last_buy = {}, {}
     for r in lines:
@@ -3800,7 +4106,9 @@ def _build_customer_kg_report(conn, month_from=None, month_to=None, location_id=
 
     # bill_later lines (Commercial 50kg deliveries) are counted through
     # their 50kg Commercial Billing instead, so they aren't counted twice.
-    where = ["s.status='COMPLETED'", "s.is_opening_balance=0", "si.qty > 0", "COALESCE(si.bill_later,0)=0",
+    # Until that delivery is billed, the delivered cylinders count, so the
+    # customer's kg isn't missing in the meantime.
+    where = ["s.status='COMPLETED'", "s.is_opening_balance=0", "si.qty > 0", UNBILLED_OR_CHARGED_SQL,
              LPG_CYLINDER_SQL, "date(s.ts) BETWEEN date(?) AND date(?)"]
     params = [first_day, last_day]
     if location_id:
@@ -3975,7 +4283,7 @@ def _target_actuals(conn, month_from, month_to):
                    (SELECT COUNT(*) FROM commercial_delivery_cylinders x WHERE x.delivery_id=cd.id) wiwo_cyls
             FROM sale_items si JOIN sales s ON s.id=si.sale_id JOIN products p ON p.id=si.product_id
             LEFT JOIN commercial_deliveries cd ON cd.sale_id=s.id
-            WHERE s.status='COMPLETED' AND s.is_opening_balance=0 AND si.qty > 0 AND COALESCE(si.bill_later,0)=0
+            WHERE s.status='COMPLETED' AND s.is_opening_balance=0 AND si.qty > 0 AND {UNBILLED_OR_CHARGED_SQL}
                   AND {LPG_CYLINDER_SQL} AND date(s.ts) BETWEEN date(?) AND date(?)""",
         (first_day, last_day),
     ).fetchall()

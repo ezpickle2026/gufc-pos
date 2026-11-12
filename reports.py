@@ -89,7 +89,8 @@ def pdf_table_response(title, headers, rows, filename, subtitle=None, col_widths
     return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
 
 
-def soa_pdf_response(customer, entries, beginning_balance, ending_balance, filename):
+def soa_pdf_response(customer, entries, beginning_balance, ending_balance, filename,
+                     previous_arrears=None, balance_forward=None):
     """Statement of Account: chronological invoice/payment ledger with running balance."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=36, bottomMargin=36, leftMargin=36, rightMargin=36)
@@ -98,7 +99,13 @@ def soa_pdf_response(customer, entries, beginning_balance, ending_balance, filen
         "Statement of Account",
         subtitle=f"{customer['name']} ({customer['account_no']}) — {customer.get('business_name') or ''}",
     )
-    flow.append(Paragraph(f"Beginning Balance: PHP {beginning_balance:,.2f}", styles["Normal"]))
+    flow.append(Paragraph(f"<b>Beginning Balance: PHP {beginning_balance:,.2f}</b>", styles["Normal"]))
+    if previous_arrears is not None and (previous_arrears or balance_forward):
+        detail = f"Previous arrears: PHP {previous_arrears:,.2f}"
+        if balance_forward:
+            detail += f" &nbsp;&nbsp; Balance forward (before this period): PHP {balance_forward:,.2f}"
+        flow.append(Paragraph(detail, ParagraphStyle("BegDetail", parent=styles["Normal"], fontSize=8,
+                                                     textColor=colors.HexColor("#555555"))))
     flow.append(Spacer(1, 8))
 
     headers = ["Date", "Type", "Reference", "Charges", "Payments", "Balance"]
