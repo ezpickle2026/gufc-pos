@@ -337,6 +337,19 @@ CREATE TABLE IF NOT EXISTS commercial_delivery_cylinders (
     consumption_weight REAL
 );
 
+-- READING billing: the beginning reading of each customer's meter / tank.
+-- Must be entered before the first READING bill; after that the previous
+-- reading always comes from the last bill (or this, for the first one).
+CREATE TABLE IF NOT EXISTS commercial_meters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    meter_label TEXT NOT NULL DEFAULT '',
+    beginning_reading REAL NOT NULL,
+    set_by INTEGER REFERENCES users(id),
+    set_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(customer_id, meter_label)
+);
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     migration_key TEXT PRIMARY KEY,
     applied_at TEXT DEFAULT (datetime('now'))
@@ -480,7 +493,7 @@ DEFAULT_ROLE_PERMISSIONS = {
     ],
     "ACCOUNTING": [
         "dashboard", "sales", "customers", "receivables", "reports", "eod_report",
-        "receivables_summary", "customer_growth",
+        "receivables_summary", "customer_growth", "commercial_deliveries",
     ],
     "ATTENDANT": [
         "dashboard", "pos", "sales", "customers", "receivables", "inventory",
@@ -858,6 +871,29 @@ def migrate_schema():
     if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
         if conn.execute("SELECT 1 FROM roles WHERE name='SUPERVISOR'").fetchone():
             conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES ('SUPERVISOR', 'sales')")
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
+        conn.commit()
+
+    # 19. Commercial billing is not a sale. The credit "sale" behind each
+    #     billing only carries the receivable (invoice, payments, SOA) and is
+    #     flagged is_billing=1 so it stays out of the Sales list and sales
+    #     reports. Also: the POS sale a billing was generated from, a per-
+    #     customer rate per kg for Commercial accounts, and Accounting gets
+    #     the 50kg Commercial Billing module.
+    if not _column_exists(conn, "sales", "is_billing"):
+        conn.execute("ALTER TABLE sales ADD COLUMN is_billing INTEGER NOT NULL DEFAULT 0")
+    if not _column_exists(conn, "commercial_deliveries", "source_sale_id"):
+        conn.execute("ALTER TABLE commercial_deliveries ADD COLUMN source_sale_id INTEGER REFERENCES sales(id)")
+    if not _column_exists(conn, "customers", "commercial_rate"):
+        conn.execute("ALTER TABLE customers ADD COLUMN commercial_rate REAL")
+    conn.commit()
+    MIGRATION_KEY = "commercial_billing_not_sales"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        conn.execute("UPDATE sales SET is_billing=1 WHERE id IN "
+                     "(SELECT sale_id FROM commercial_deliveries WHERE sale_id IS NOT NULL)")
+        if conn.execute("SELECT 1 FROM roles WHERE name='ACCOUNTING'").fetchone():
+            conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) "
+                         "VALUES ('ACCOUNTING', 'commercial_deliveries')")
         conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 

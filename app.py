@@ -1423,7 +1423,7 @@ def portal_purchases():
     sql = """SELECT s.id, s.sale_no, s.dr_no, s.ts, s.sale_type, s.status, s.subtotal, s.discount, s.total,
                     s.paid, s.balance, l.name location_name, r.invoice_no, r.due_date, r.status invoice_status
              FROM sales s JOIN locations l ON l.id = s.location_id LEFT JOIN receivables r ON r.sale_id = s.id
-             WHERE s.customer_id=? AND s.is_opening_balance=0"""
+             WHERE s.customer_id=? AND s.is_opening_balance=0 AND s.is_billing=0"""
     params = [g.portal["id"]]
     if date_from:
         sql += " AND date(s.ts) >= date(?)"; params.append(date_from)
@@ -2718,9 +2718,14 @@ def get_sale_detail(sale_id):
 def list_sales():
     u = session["user"]
     conn = get_db()
-    sql = """SELECT s.*, l.name location_name, u2.name cashier_name, COALESCE(c.name, s.walkin_name) customer_name
+    sql = """SELECT s.*, l.name location_name, u2.name cashier_name, COALESCE(c.name, s.walkin_name) customer_name,
+                     (SELECT COALESCE(SUM(x.qty),0) FROM sale_items x WHERE x.sale_id=s.id AND x.bill_later=1) bill_later_qty,
+                     (SELECT cd.id FROM commercial_deliveries cd WHERE cd.source_sale_id=s.id AND cd.status!='CANCELLED'
+                       ORDER BY cd.id DESC LIMIT 1) billing_id,
+                     (SELECT cd.delivery_no || '|' || COALESCE(cd.billed_amount,0) FROM commercial_deliveries cd
+                       WHERE cd.source_sale_id=s.id AND cd.status!='CANCELLED' ORDER BY cd.id DESC LIMIT 1) billing_ref
               FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u2 ON u2.id=s.user_id
-              LEFT JOIN customers c ON c.id=s.customer_id WHERE s.is_opening_balance=0"""
+              LEFT JOIN customers c ON c.id=s.customer_id WHERE s.is_opening_balance=0 AND s.is_billing=0"""
     params = []
     # Supervisor sees (and can void) sales at every location.
     if u["role"] not in ("ADMIN", "OPERATION_HEAD", "ACCOUNTING", "SUPERVISOR"):
@@ -2749,6 +2754,12 @@ def void_sale(sale_id):
     if sale["status"] == "VOIDED":
         conn.close()
         return jsonify(error="Already voided"), 400
+    billed = conn.execute("SELECT delivery_no FROM commercial_deliveries WHERE source_sale_id=? AND status!='CANCELLED'",
+                          (sale_id,)).fetchone()
+    if billed:
+        conn.close()
+        return jsonify(error=f"This delivery is billed in {billed['delivery_no']}. Void that billing first "
+                             "(50kg Commercial Billing > Void Billing)."), 400
     items = conn.execute("SELECT * FROM sale_items WHERE sale_id=?", (sale_id,)).fetchall()
     void_ref = f"VOID-{sale['sale_no']}"
     for it in items:
@@ -3234,7 +3245,7 @@ def dashboard():
     params = [] if all_locations else [u["location_id"]]
 
     today_sales = conn.execute(
-        f"SELECT COALESCE(SUM(total),0) t, COUNT(*) c FROM sales WHERE status='COMPLETED' AND is_opening_balance=0 "
+        f"SELECT COALESCE(SUM(total),0) t, COUNT(*) c FROM sales WHERE status='COMPLETED' AND is_opening_balance=0 AND is_billing=0 "
         f"AND date(ts)=date('now') {loc_filter}",
         params,
     ).fetchone()
@@ -3316,7 +3327,7 @@ def _sales_report_rows(date_from, date_to):
              FROM sales s JOIN locations l ON l.id=s.location_id JOIN users u ON u.id=s.user_id
              LEFT JOIN customers c ON c.id=s.customer_id
              LEFT JOIN sale_items si ON si.sale_id = s.id
-             WHERE s.is_opening_balance=0"""
+             WHERE s.is_opening_balance=0 AND s.is_billing=0"""
     params = []
     if date_from:
         sql += " AND date(s.ts) >= date(?)"; params.append(date_from)
@@ -3563,7 +3574,7 @@ def _build_customer_growth(conn, period="month", count=12, end_date=None, locati
     periods = _growth_periods(period, count + 1, end_date)
     range_start, range_end = periods[0][0], periods[-1][1]
 
-    where = ["s.status='COMPLETED'", "s.is_opening_balance=0", "si.qty > 0", LPG_CYLINDER_SQL]
+    where = ["s.status='COMPLETED'", "s.is_opening_balance=0", "s.is_billing=0", "si.qty > 0", LPG_CYLINDER_SQL]
     params = []
     if location_id:
         where.append("s.location_id=?"); params.append(location_id)
@@ -3842,6 +3853,19 @@ def _build_customer_kg_report(conn, month_from=None, month_to=None, location_id=
                                      "product_name": r["product_name"].replace(" (weight-billed)", ""),
                                      "months": {ym: 0.0 for ym in months}, "total_kg": 0.0, "cylinders": 0})
         sz["months"][r["ym"]] += kg; sz["total_kg"] += kg; sz["cylinders"] += cyl
+
+    # Every account is listed, not only those that bought in the period, so
+    # the report covers all customers (zero kg shows as "-"). Inactive
+    # accounts are listed only if they bought something in the period.
+    cust_sql = "SELECT id, account_no, name, business_name, category, status FROM customers"
+    cust_params = []
+    if category:
+        cust_sql += " WHERE category=?"; cust_params.append(category)
+    for c in conn.execute(cust_sql, cust_params).fetchall():
+        if c["id"] in customers or (c["status"] or "ACTIVE") != "ACTIVE":
+            continue
+        customers[c["id"]] = blank(customer_id=c["id"], account_no=c["account_no"], name=c["name"],
+                                   business_name=c["business_name"] or "", category=c["category"] or "")
 
     def finish(row):
         row["months"] = {k: round(v, 2) for k, v in row["months"].items()}
@@ -4321,7 +4345,7 @@ def _build_eod_report(conn, u, report_date, user_id=None, location_id=None):
     }
 
     # Sales rung up that day (by cashier), incl. what was charged to accounts.
-    s_where = ["date(s.ts) = date(?)", "s.is_opening_balance = 0"]
+    s_where = ["date(s.ts) = date(?)", "s.is_opening_balance = 0", "s.is_billing = 0"]
     s_params = [report_date]
     if user_id:
         s_where.append("s.user_id = ?"); s_params.append(user_id)
@@ -4801,17 +4825,17 @@ def delete_hauling(hid):
 # machinery (aging report, SOA, payments) rather than building a parallel one.
 
 @app.get("/api/commercial-deliveries")
-@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", "ACCOUNTING", module="commercial_deliveries")
 def list_commercial_deliveries():
     u = session["user"]
     conn = get_db()
     sql = """SELECT cd.*, c.name customer_name, c.account_no, l.name location_name, p.name product_name,
-                     creator.name created_by_name
-              FROM commercial_deliveries cd JOIN customers c ON c.id=cd.customer_id
+                     creator.name created_by_name, src.sale_no source_sale_no, src.dr_no source_dr_no
+              FROM commercial_deliveries cd LEFT JOIN sales src ON src.id=cd.source_sale_id JOIN customers c ON c.id=cd.customer_id
               JOIN locations l ON l.id=cd.location_id JOIN products p ON p.id=cd.product_id
               LEFT JOIN users creator ON creator.id=cd.created_by WHERE 1=1"""
     params = []
-    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
+    if u["role"] not in ALL_LOCATION_FINANCE_ROLES and u.get("location_id"):
         sql += " AND cd.location_id=?"
         params.append(u["location_id"])
     sql += " ORDER BY cd.delivery_date DESC"
@@ -4839,29 +4863,98 @@ def list_commercial_deliveries():
     return jsonify(out)
 
 
-@app.get("/api/commercial-deliveries/last-reading")
-@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
-def last_meter_reading():
-    """Auto-suggest the starting reading for a new READING-type bill: the
-    ending reading from that customer's last one, like a utility company."""
-    customer_id = request.args.get("customer_id", type=int)
-    meter_label = request.args.get("meter_label", "")
-    if not customer_id:
-        return jsonify(error="customer_id is required"), 400
-    conn = get_db()
+def _meter_previous_reading(conn, customer_id, meter_label):
+    """(previous_reading, source) for the next READING bill of a meter:
+    the current reading of its last bill, else the beginning reading entered
+    for it. (None, None) means the beginning reading must be entered first."""
+    meter_label = (meter_label or "").strip()
     row = conn.execute(
         """SELECT current_reading FROM commercial_deliveries
            WHERE customer_id=? AND billing_type='READING' AND current_reading IS NOT NULL
-                 AND (meter_label=? OR ?='')
+                 AND status != 'CANCELLED' AND TRIM(COALESCE(meter_label,''))=?
            ORDER BY id DESC LIMIT 1""",
-        (customer_id, meter_label, meter_label),
+        (customer_id, meter_label),
     ).fetchone()
+    if row:
+        return row["current_reading"], "LAST_BILL"
+    m = conn.execute("SELECT beginning_reading FROM commercial_meters WHERE customer_id=? AND meter_label=?",
+                     (customer_id, meter_label)).fetchone()
+    if m:
+        return m["beginning_reading"], "BEGINNING"
+    return None, None
+
+
+@app.get("/api/commercial-deliveries/last-reading")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", "ACCOUNTING", module="commercial_deliveries")
+def last_meter_reading():
+    """The previous reading for a new READING-type bill, like a utility
+    company: the ending reading of that meter's last bill, or its beginning
+    reading for the first bill. Also lists the customer's known meters."""
+    customer_id = request.args.get("customer_id", type=int)
+    meter_label = (request.args.get("meter_label") or "").strip()
+    if not customer_id:
+        return jsonify(error="customer_id is required"), 400
+    conn = get_db()
+    prev, source = _meter_previous_reading(conn, customer_id, meter_label)
+    beginning = conn.execute("SELECT beginning_reading, set_at FROM commercial_meters WHERE customer_id=? AND meter_label=?",
+                             (customer_id, meter_label)).fetchone()
+    meters = [r["label"] for r in conn.execute(
+        """SELECT meter_label label FROM commercial_meters WHERE customer_id=?
+           UNION SELECT TRIM(COALESCE(meter_label,'')) FROM commercial_deliveries
+                 WHERE customer_id=? AND billing_type='READING' AND status != 'CANCELLED'
+           ORDER BY 1""", (customer_id, customer_id)).fetchall()]
     conn.close()
-    return jsonify(previous_reading=row["current_reading"] if row else None)
+    return jsonify(previous_reading=prev, source=source, meters=meters,
+                   beginning_reading=beginning["beginning_reading"] if beginning else None,
+                   beginning_set_at=beginning["set_at"] if beginning else None)
+
+
+@app.post("/api/commercial-meters")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", "ACCOUNTING", module="commercial_deliveries")
+def set_meter_beginning_reading():
+    """Enter the beginning reading of a customer's meter / tank. Needed once,
+    before its first READING bill. Changing it afterwards is for
+    Admin / Manager / Accounting only."""
+    d = request.get_json(force=True) or {}
+    u = session["user"]
+    meter_label = (d.get("meter_label") or "").strip()
+    try:
+        customer_id = int(d.get("customer_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="customer_id is required"), 400
+    try:
+        reading = _num(d.get("beginning_reading"), "Beginning reading")
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    if reading < 0:
+        return jsonify(error="The beginning reading can't be negative"), 400
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM customers WHERE id=?", (customer_id,)).fetchone():
+        conn.close()
+        return jsonify(error="Customer not found"), 404
+    existing = conn.execute("SELECT * FROM commercial_meters WHERE customer_id=? AND meter_label=?",
+                            (customer_id, meter_label)).fetchone()
+    if existing:
+        if u["role"] not in COMMERCIAL_RATE_ROLES:
+            conn.close()
+            return jsonify(error="This meter already has a beginning reading. Ask Admin / Accounting to change it."), 403
+        conn.execute("UPDATE commercial_meters SET beginning_reading=?, set_by=?, set_at=datetime('now') WHERE id=?",
+                     (reading, u["id"], existing["id"]))
+        audit(conn, "UPDATE", "COMMERCIAL_METERS", existing["id"],
+              f"customer {customer_id} meter '{meter_label or 'default'}': beginning {existing['beginning_reading']} -> {reading}")
+    else:
+        cur = conn.execute("INSERT INTO commercial_meters (customer_id, meter_label, beginning_reading, set_by) VALUES (?,?,?,?)",
+                           (customer_id, meter_label, reading, u["id"]))
+        audit(conn, "CREATE", "COMMERCIAL_METERS", cur.lastrowid,
+              f"customer {customer_id} meter '{meter_label or 'default'}': beginning reading {reading}")
+    conn.commit()
+    prev, source = _meter_previous_reading(conn, customer_id, meter_label)
+    conn.close()
+    return jsonify(ok=True, previous_reading=prev, source=source)
 
 
 @app.post("/api/commercial-deliveries")
-@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", "ACCOUNTING", module="commercial_deliveries")
 def create_commercial_delivery():
     d = request.get_json(force=True)
     u = session["user"]
@@ -4922,12 +5015,19 @@ def create_commercial_delivery():
         return jsonify(id=delivery_id, delivery_no=delivery_no, total_net_weight_in=total_nw), 201
 
     else:  # READING
+        # The previous reading is never typed: it is the last bill's current
+        # reading, or the meter's beginning reading for its first bill.
+        meter_label = (d.get("meter_label") or "").strip()
+        previous_reading, _src = _meter_previous_reading(conn, d["customer_id"], meter_label)
+        if previous_reading is None:
+            conn.close()
+            return jsonify(error=f"Enter the beginning reading of meter '{meter_label or 'default'}' first — "
+                                 "it becomes the previous reading of the first bill"), 400
         try:
-            previous_reading = float(d.get("previous_reading"))
             current_reading = float(d.get("current_reading"))
         except (TypeError, ValueError):
             conn.close()
-            return jsonify(error="previous_reading and current_reading must be numbers"), 400
+            return jsonify(error="The current reading must be a number"), 400
         if previous_reading < 0 or current_reading < 0:
             conn.close()
             return jsonify(error="Readings can't be negative"), 400
@@ -4943,7 +5043,7 @@ def create_commercial_delivery():
                    meter_label, previous_reading, current_reading, status, pickup_date, notes, created_by, collected_by)
                VALUES (?,?,?,?,?,?,?,?,?,datetime('now'),?,?,?)""",
             (delivery_no, d["customer_id"], location_id, d["product_id"], "READING",
-             d.get("meter_label", ""), previous_reading, current_reading, "PICKED_UP",
+             meter_label, previous_reading, current_reading, "PICKED_UP",
              d.get("notes", ""), u["id"], u["id"]),
         )
         delivery_id = cur.lastrowid
@@ -4956,7 +5056,7 @@ def create_commercial_delivery():
 
 
 @app.get("/api/commercial-deliveries/<int:did>")
-@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", "ACCOUNTING", module="commercial_deliveries")
 def get_commercial_delivery(did):
     conn = get_db()
     row = conn.execute(
@@ -4988,7 +5088,7 @@ def get_commercial_delivery(did):
 
 
 @app.get("/api/commercial-deliveries/<int:did>/export/pdf")
-@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", "ACCOUNTING", module="commercial_deliveries")
 def export_commercial_delivery_pdf(did):
     conn = get_db()
     row = conn.execute(
@@ -5013,7 +5113,7 @@ def export_commercial_delivery_pdf(did):
 
 
 @app.put("/api/commercial-deliveries/<int:did>/pickup")
-@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", "ACCOUNTING", module="commercial_deliveries")
 def record_commercial_pickup(did):
     """Weigh-out: record the residual weight for each cylinder. Consumption
     (billable weight) = net weight delivered - net weight residual."""
@@ -5100,7 +5200,19 @@ def _num(v, label, allow_blank=False):
         raise ValueError(f"{label} must be a number")
 
 
-def _create_dr_billing(d, location_id):
+def _commercial_rate(customer, product, typed=None):
+    """(price per kg, source) for a commercial billing. The rate Accounting
+    set on the Commercial account always wins; without one, a rate typed by
+    a rate role, else the product's default price per kg."""
+    rate = customer["commercial_rate"] if "commercial_rate" in customer.keys() else None
+    if rate and rate > 0:
+        return float(rate), "CUSTOMER"
+    if typed not in (None, "") and session["user"]["role"] in COMMERCIAL_RATE_ROLES:
+        return _num(typed, "Price per kg"), "TYPED"
+    return float(product["price_per_kg"] or 0), "PRODUCT"
+
+
+def _create_dr_billing(d, location_id, source_sale=None):
     """DR (manual) 50kg billing, the way the business actually does it: bill
     right at delivery, even when the serial numbers of the 50kg cylinders
     pulled out don't match the ones delivered.
@@ -5108,8 +5220,10 @@ def _create_dr_billing(d, location_id):
         billable kg = delivered cylinders x kg per cylinder
                       - residual kg left in the cylinders pulled out
 
-    Creates the credit sale (with its own DR number) and receivable at once,
-    so the record is BILLED immediately."""
+    Creates the receivable at once (carried by a hidden is_billing credit
+    "sale", so it is not counted as a sale), so the record is BILLED
+    immediately. With source_sale (Generate Billing on a POS delivery sale)
+    the delivery's own DR is used instead of issuing a new one."""
     u = session["user"]
     conn = get_db()
     try:
@@ -5156,35 +5270,35 @@ def _create_dr_billing(d, location_id):
         if billable_kg <= 0:
             raise ValueError("Residual is equal to or more than what was delivered — nothing to bill")
 
-        rate = d.get("price_per_kg")
-        if rate not in (None, "") and u["role"] in COMMERCIAL_RATE_ROLES:
-            price_per_kg = _num(rate, "Price per kg")
-        else:
-            price_per_kg = float(product["price_per_kg"] or 0)
+        price_per_kg, _src = _commercial_rate(customer, product, d.get("price_per_kg"))
         if price_per_kg <= 0:
-            raise ValueError("No price per kg — set a default price per kg on the product"
+            raise ValueError("No rate per kg — Accounting can set this Commercial account's rate (Customers > Rate)"
                              + (", or enter one now" if u["role"] in COMMERCIAL_RATE_ROLES else ""))
         billed_amount = round(billable_kg * price_per_kg, 2)
         dr_ref = (d.get("dr_ref") or "").strip()
+        if source_sale is not None and not dr_ref:
+            dr_ref = source_sale["dr_no"] or source_sale["sale_no"]
 
         delivery_no = next_number(conn, "CD", "commercial_deliveries", "delivery_no")
         cur = conn.execute(
             """INSERT INTO commercial_deliveries (delivery_no, customer_id, location_id, product_id, billing_type, status,
-                   pickup_date, notes, created_by, collected_by, dr_ref, delivered_qty, kg_per_cylinder, total_residual_kg)
-               VALUES (?,?,?,?,'DR','DELIVERED',datetime('now'),?,?,?,?,?,?,?)""",
+                   pickup_date, notes, created_by, collected_by, dr_ref, delivered_qty, kg_per_cylinder, total_residual_kg,
+                   source_sale_id)
+               VALUES (?,?,?,?,'DR','DELIVERED',datetime('now'),?,?,?,?,?,?,?,?)""",
             (delivery_no, customer["id"], location_id, product["id"], d.get("notes", ""), u["id"], u["id"],
-             dr_ref, delivered_qty, kg_per_cyl, total_residual),
+             dr_ref, delivered_qty, kg_per_cyl, total_residual, source_sale["id"] if source_sale is not None else None),
         )
         did = cur.lastrowid
         for serial, gw, tw, residual in pullouts:
             conn.execute("INSERT INTO commercial_pullouts (delivery_id, serial_no, gross_weight, tare_weight, residual_kg) "
                          "VALUES (?,?,?,?,?)", (did, serial, gw, tw, residual))
         desc = (f"Commercial DR billing {delivery_no}" + (f" (DR {dr_ref})" if dr_ref else "") +
+                (f" for {source_sale['sale_no']}" if source_sale is not None else "") +
                 f": {delivered_qty} x {kg_per_cyl:g}kg = {delivered_kg}kg delivered - {total_residual}kg residual "
                 f"({len(pullouts)} pulled out) = {billable_kg}kg @ {money_fmt(price_per_kg)}/kg")
         sale_id, sale_no, dr_no = _bill_delivery_as_credit_sale(
             conn, did, customer, product, location_id, billable_kg, price_per_kg, desc,
-            f"{product['name']} (DR billing)", with_dr_no=True)
+            f"{product['name']} (DR billing)", with_dr_no=source_sale is None)
         audit(conn, "CREATE", "COMMERCIAL_DELIVERIES", did,
               f"{delivery_no} (DR{' ' + dr_ref if dr_ref else ''}) -> {sale_no}: {delivered_kg}kg - {total_residual}kg residual "
               f"= {billable_kg}kg @ {price_per_kg}/kg = {billed_amount}")
@@ -5200,15 +5314,18 @@ def _create_dr_billing(d, location_id):
 
 def _bill_delivery_as_credit_sale(conn, did, customer, product, location_id, qty_kg, price_per_kg, desc, item_label,
                                   with_dr_no=False):
-    """Turn a commercial delivery into a credit sale + receivable and mark it
-    BILLED. Caller commits."""
+    """Turn a commercial delivery into a receivable and mark it BILLED. The
+    receivable needs a sale row to hang on (payments, SOA, aging all key on
+    it), so one is made with is_billing=1, which keeps it out of the Sales
+    list and every sales report. Caller commits."""
     u = session["user"]
     billed_amount = round(qty_kg * price_per_kg, 2)
     sale_no = next_number(conn, "SALE", "sales", "sale_no")
     dr_no = next_number(conn, "DR", "sales", "dr_no") if with_dr_no else None
     cur = conn.execute(
-        """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance, notes, dr_no)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance, notes, dr_no,
+                              is_billing)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)""",
         (sale_no, location_id, u["id"], customer["id"], "CREDIT",
          billed_amount, 0, billed_amount, 0, billed_amount, desc, dr_no),
     )
@@ -5233,7 +5350,7 @@ def _bill_delivery_as_credit_sale(conn, did, customer, product, location_id, qty
 
 
 @app.post("/api/commercial-deliveries/<int:did>/bill")
-@roles_required("ADMIN", "MANAGER")
+@roles_required("ADMIN", "MANAGER", "ACCOUNTING")
 def bill_commercial_delivery(did):
     """The accountant's step: convert consumed weight into a credit sale +
     receivable at a price per kg. Deliberately restricted to Admin/Manager
@@ -5250,8 +5367,12 @@ def bill_commercial_delivery(did):
         return jsonify(error=f"Delivery must be picked up (weighed out) before billing — currently {delivery['status']}"), 400
 
     product = conn.execute("SELECT * FROM products WHERE id=?", (delivery["product_id"],)).fetchone()
-    price_per_kg = d.get("price_per_kg")
-    price_per_kg = float(price_per_kg) if price_per_kg is not None else float(product["price_per_kg"] or 0)
+    customer = conn.execute("SELECT * FROM customers WHERE id=?", (delivery["customer_id"],)).fetchone()
+    try:
+        price_per_kg, _src = _commercial_rate(customer, product, d.get("price_per_kg"))
+    except ValueError as e:
+        conn.close()
+        return jsonify(error=str(e)), 400
     if price_per_kg <= 0:
         conn.close()
         return jsonify(error="A positive price per kg is required (set a default on the product, or enter one now)"), 400
@@ -5265,8 +5386,6 @@ def bill_commercial_delivery(did):
         conn.close()
         return jsonify(error="Total consumption is zero — nothing to bill"), 400
     billed_amount = round(total_consumption * price_per_kg, 2)
-
-    customer = conn.execute("SELECT * FROM customers WHERE id=?", (delivery["customer_id"],)).fetchone()
     u = session["user"]
     if delivery["billing_type"] == "READING":
         billing_desc = (f"Commercial meter billing for {delivery['delivery_no']} ({delivery['meter_label'] or 'meter'}): "
@@ -5279,8 +5398,9 @@ def bill_commercial_delivery(did):
     try:
         sale_no = next_number(conn, "SALE", "sales", "sale_no")
         cur = conn.execute(
-            """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance, notes)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance, notes,
+                                  is_billing)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,1)""",
             (sale_no, delivery["location_id"], u["id"], delivery["customer_id"], "CREDIT",
              billed_amount, 0, billed_amount, 0, billed_amount, billing_desc),
         )
@@ -5315,7 +5435,7 @@ def bill_commercial_delivery(did):
 
 
 @app.post("/api/commercial-deliveries/<int:did>/cancel")
-@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", module="commercial_deliveries")
+@roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", "ACCOUNTING", module="commercial_deliveries")
 def cancel_commercial_delivery(did):
     conn = get_db()
     delivery = conn.execute("SELECT * FROM commercial_deliveries WHERE id=?", (did,)).fetchone()
@@ -5330,6 +5450,162 @@ def cancel_commercial_delivery(did):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- Generate Billing from a POS delivery sale
+# A Commercial account's 50kg cylinders on a POS credit sale are delivered
+# only (bill_later lines, no gas charge). Accounting then clicks "Generate
+# Billing" beside that sale, types the residual of the cylinders pulled out,
+# and the customer's rate is applied automatically. The billing is a
+# receivable only — it is NOT a new sale (see _bill_delivery_as_credit_sale).
+
+COMMERCIAL_BILLING_ROLES = ("ADMIN", "ACCOUNTING")
+
+
+def _sale_billing_context(conn, sale_id):
+    sale = conn.execute("SELECT * FROM sales WHERE id=?", (sale_id,)).fetchone()
+    if not sale:
+        raise LookupError("Sale not found")
+    if sale["is_billing"]:
+        raise ValueError("This is already a billing, not a delivery")
+    lines = conn.execute(
+        """SELECT si.*, p.name p_name, p.sku FROM sale_items si JOIN products p ON p.id=si.product_id
+           WHERE si.sale_id=? AND COALESCE(si.bill_later,0)=1 AND si.qty > 0 ORDER BY si.id""", (sale_id,)).fetchall()
+    customer = conn.execute("SELECT * FROM customers WHERE id=?", (sale["customer_id"],)).fetchone() \
+        if sale["customer_id"] else None
+    billing = conn.execute(
+        """SELECT cd.id, cd.delivery_no, cd.status, cd.billed_amount, cd.total_residual_kg, cd.price_per_kg, cd.sale_id,
+                  r.invoice_no, r.paid invoice_paid
+           FROM commercial_deliveries cd LEFT JOIN receivables r ON r.sale_id=cd.sale_id
+           WHERE cd.source_sale_id=? AND cd.status!='CANCELLED' ORDER BY cd.id DESC LIMIT 1""", (sale_id,)).fetchone()
+    return sale, lines, customer, billing
+
+
+@app.get("/api/sales/<int:sale_id>/commercial-billing")
+@roles_required(*COMMERCIAL_BILLING_ROLES)
+def sale_commercial_billing_preview(sale_id):
+    conn = get_db()
+    try:
+        sale, lines, customer, billing = _sale_billing_context(conn, sale_id)
+    except LookupError as e:
+        conn.close(); return jsonify(error=str(e)), 404
+    except ValueError as e:
+        conn.close(); return jsonify(error=str(e)), 400
+    out_lines, delivered_qty, delivered_kg = [], 0, 0.0
+    for ln in lines:
+        size = product_kg_size(ln["p_name"], ln["sku"]) or 50.0
+        out_lines.append({"product_id": ln["product_id"], "product_name": ln["product_name"], "qty": ln["qty"],
+                          "kg_per_cylinder": size, "kg": round(ln["qty"] * size, 2)})
+        delivered_qty += ln["qty"]; delivered_kg += ln["qty"] * size
+    rate, rate_source = (None, None)
+    if customer and lines:
+        product = conn.execute("SELECT * FROM products WHERE id=?", (lines[0]["product_id"],)).fetchone()
+        rate, rate_source = _commercial_rate(customer, product)
+    # Billings made in 50kg Commercial Billing before this button existed are
+    # not linked to their sale — show them so nothing is billed twice.
+    possible_dupes = []
+    if customer and not billing:
+        possible_dupes = [dict(r) for r in conn.execute(
+            """SELECT id, delivery_no, delivery_date, dr_ref, delivered_qty, billed_amount FROM commercial_deliveries
+               WHERE customer_id=? AND source_sale_id IS NULL AND status='BILLED' AND billing_type='DR'
+                     AND date(delivery_date) >= date(?) ORDER BY id LIMIT 10""", (customer["id"], sale["ts"])).fetchall()]
+    conn.close()
+    return jsonify(
+        sale={"id": sale["id"], "sale_no": sale["sale_no"], "dr_no": sale["dr_no"], "ts": sale["ts"],
+              "status": sale["status"], "sale_type": sale["sale_type"]},
+        customer={"id": customer["id"], "name": customer["name"], "account_no": customer["account_no"],
+                  "category": customer["category"], "commercial_rate": customer["commercial_rate"]} if customer else None,
+        lines=out_lines, delivered_qty=delivered_qty, delivered_kg=round(delivered_kg, 2),
+        rate=rate, rate_source=rate_source, billing=dict(billing) if billing else None,
+        possible_duplicates=possible_dupes)
+
+
+@app.post("/api/sales/<int:sale_id>/commercial-billing")
+@roles_required(*COMMERCIAL_BILLING_ROLES)
+def sale_generate_commercial_billing(sale_id):
+    """Accounting's Generate Billing: delivered kg (from the sale's 50kg
+    lines) less the residual typed in, at the customer's rate."""
+    d = request.get_json(force=True) or {}
+    conn = get_db()
+    try:
+        sale, lines, customer, billing = _sale_billing_context(conn, sale_id)
+        if sale["status"] != "COMPLETED":
+            raise ValueError(f"This sale is {sale['status']} — it can't be billed")
+        if not customer:
+            raise ValueError("This sale has no customer account")
+        if not lines:
+            raise ValueError("This sale has no 50kg cylinders delivered for billing")
+        if billing:
+            raise ValueError(f"Already billed in {billing['delivery_no']}")
+    except LookupError as e:
+        conn.close(); return jsonify(error=str(e)), 404
+    except ValueError as e:
+        conn.close(); return jsonify(error=str(e)), 400
+    delivered_qty = sum(ln["qty"] for ln in lines)
+    delivered_kg = sum(ln["qty"] * (product_kg_size(ln["p_name"], ln["sku"]) or 50.0) for ln in lines)
+    location_id = sale["location_id"]
+    conn.close()
+    body = {
+        "customer_id": customer["id"], "product_id": lines[0]["product_id"],
+        "delivered_qty": delivered_qty,
+        # one size per billing record (mixed sizes are averaged so the kg stays exact)
+        "kg_per_cylinder": delivered_kg / delivered_qty,
+        "pullouts": d.get("pullouts") or [], "notes": d.get("notes", ""), "dr_ref": d.get("dr_ref") or "",
+    }
+    return _create_dr_billing(body, location_id, source_sale=sale)
+
+
+@app.post("/api/commercial-deliveries/<int:did>/void-billing")
+@roles_required(*COMMERCIAL_BILLING_ROLES)
+def void_commercial_billing(did):
+    """Undo a billing made by mistake (wrong residual or rate) while nothing
+    has been paid on it: the invoice is voided and, for one generated from a
+    POS sale, Generate Billing can be used again."""
+    conn = get_db()
+    cd = conn.execute("SELECT * FROM commercial_deliveries WHERE id=?", (did,)).fetchone()
+    if not cd:
+        conn.close(); return jsonify(error="Not found"), 404
+    if cd["status"] != "BILLED" or not cd["sale_id"]:
+        conn.close(); return jsonify(error="Only a billed record can be voided"), 400
+    r = conn.execute("SELECT * FROM receivables WHERE sale_id=?", (cd["sale_id"],)).fetchone()
+    if r and (r["paid"] or 0) > 0.009:
+        conn.close()
+        return jsonify(error=f"Invoice {r['invoice_no']} already has {money_fmt(r['paid'])} paid — it can't be voided"), 400
+    conn.execute("UPDATE sales SET status='VOIDED' WHERE id=?", (cd["sale_id"],))
+    conn.execute("UPDATE receivables SET status='PAID', balance=0 WHERE sale_id=?", (cd["sale_id"],))
+    conn.execute("UPDATE commercial_deliveries SET status='CANCELLED' WHERE id=?", (did,))
+    audit(conn, "VOID", "COMMERCIAL_DELIVERIES", did,
+          f"{cd['delivery_no']} billing voided ({money_fmt(cd['billed_amount'] or 0)})"
+          + (f", invoice {r['invoice_no']}" if r else ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.put("/api/customers/<int:cid>/commercial-rate")
+@roles_required(*COMMERCIAL_BILLING_ROLES)
+def set_customer_commercial_rate(cid):
+    """Accounting sets a Commercial account's rate per kg; every billing for
+    that account then uses it automatically. Blank clears it."""
+    d = request.get_json(force=True) or {}
+    conn = get_db()
+    cust = conn.execute("SELECT * FROM customers WHERE id=?", (cid,)).fetchone()
+    if not cust:
+        conn.close(); return jsonify(error="Not found"), 404
+    if not is_commercial_account(cust):
+        conn.close(); return jsonify(error="A rate per kg is only for Commercial accounts"), 400
+    try:
+        rate = _num(d.get("rate"), "Rate per kg", allow_blank=True)
+    except ValueError as e:
+        conn.close(); return jsonify(error=str(e)), 400
+    if rate is not None and rate <= 0:
+        conn.close(); return jsonify(error="The rate per kg must be more than zero"), 400
+    conn.execute("UPDATE customers SET commercial_rate=? WHERE id=?", (rate, cid))
+    audit(conn, "UPDATE", "CUSTOMERS", cid,
+          f"{cust['name']}: commercial rate {cust['commercial_rate'] or '-'} -> {rate if rate is not None else '-'} per kg")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, commercial_rate=rate)
 
 
 def money_fmt(n):
@@ -5485,7 +5761,7 @@ def employee_kpi():
                      COALESCE(AVG(s.total),0) avg_sale_value,
                      COALESCE(SUM((SELECT SUM(qty) FROM sale_items si WHERE si.sale_id=s.id)),0) total_items_sold
               FROM users u LEFT JOIN locations l ON l.id=u.location_id
-              LEFT JOIN sales s ON s.user_id=u.id AND s.status='COMPLETED' AND s.is_opening_balance=0"""
+              LEFT JOIN sales s ON s.user_id=u.id AND s.status='COMPLETED' AND s.is_opening_balance=0 AND s.is_billing=0"""
     params = []
     conds = []
     if date_from:
