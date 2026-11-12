@@ -692,24 +692,42 @@ async function openCheckout(locationId) {
 
 function printReceipt(result) {
   const { sale, items, payments } = result;
-  const html = `
-    <div style="max-width:340px;font-family:monospace;font-size:12.5px">
+  // Sized for 58mm thermal paper (~48mm printable width).
+  const hr = `<div class="r58-hr"></div>`;
+  const row = (l, r, b) => `<div class="r58-row"${b ? ' style="font-weight:700"' : ""}><span>${l}</span><span>${r}</span></div>`;
+  const html = `<style>
+      @page{size:58mm auto;margin:0}
+      @media print{#receiptArea{width:58mm !important;padding:2mm 5mm !important}}
+      .r58{width:48mm;font-family:monospace;font-size:10px;line-height:1.3;color:#000;word-wrap:break-word;overflow-wrap:anywhere}
+      .r58-hr{border-top:1px dashed #000;margin:3px 0}
+      .r58-row{display:flex;justify-content:space-between;gap:4px}
+      .r58-row span:last-child{text-align:right;white-space:nowrap}
+      .r58-item{margin-bottom:2px}
+      .r58-sub{padding-left:6px}
+    </style>
+    <div class="r58">
       <div style="text-align:center">
-        <img src="/images/logo.png" alt="GUFC" style="width:56px;height:56px;object-fit:contain;margin-bottom:4px">
-        <br><strong style="font-size:15px">GREAT UNLI FOOD CORP.</strong><br>
-        Solane LPG Distributor<br>${esc(sale.location_name)}<br>
-        --------------------------------
+        <img src="/images/logo.png" alt="GUFC" style="width:40px;height:40px;object-fit:contain;margin-bottom:2px">
+        <br><strong style="font-size:12px">GREAT UNLI FOOD CORP.</strong><br>
+        Solane LPG Distributor<br>${esc(sale.location_name)}
       </div>
+      ${hr}
       <div>Txn: ${sale.sale_no}<br>Date: ${sale.ts}<br>Cashier: ${esc(sale.cashier_name)}<br>
       Customer: ${esc(sale.customer_name || "Walk-in")} ${sale.account_no ? "(" + sale.account_no + ")" : ""}</div>
-      <div>--------------------------------</div>
-      ${items.map(i => `${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}${i.sale_mode === 'SWAP' ? `<br>  SWAP from ${esc(i.swap_brand)}${i.swap_fee > 0 ? ` (fee ${money(i.swap_fee)}/cyl)` : ""}` : ''}<br>  ${i.qty} x ${money(i.price)} = ${money(i.subtotal)}${i.discount_amount > 0 ? `<br>  Less: ${esc(i.discount_name)} -${money(i.discount_amount)}` : ""}`).join("<br>")}
-      <div>--------------------------------</div>
-      <div>Subtotal: ${money(sale.subtotal)}<br>Discount: ${money(sale.discount)}<br><b>Total: ${money(sale.total)}</b>${sale.withholding_tax > 0 ? `<br>Less 1% withholding tax: -${money(sale.withholding_tax)}<br><b>Amount Due: ${money(sale.total - sale.withholding_tax)}</b>` : ""}</div>
-      <div>--------------------------------</div>
-      ${payments.map(p => `${esc(p.method)}: ${money(p.amount)}`).join("<br>")}
-      <div>Paid: ${money(sale.paid)}<br>Balance: ${money(sale.balance)}</div>
-      <div style="text-align:center;margin-top:8px">Thank you for your purchase!</div>
+      ${hr}
+      ${items.map(i => `<div class="r58-item">${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}${i.sale_mode === 'SWAP' ? `<div class="r58-sub">SWAP from ${esc(i.swap_brand)}${i.swap_fee > 0 ? ` (fee ${money(i.swap_fee)}/cyl)` : ""}</div>` : ''}
+        <div class="r58-sub">${row(`${i.qty} x ${money(i.price)}`, money(i.subtotal))}</div>${i.discount_amount > 0 ? `<div class="r58-sub">${row(`Less: ${esc(i.discount_name)}`, `-${money(i.discount_amount)}`)}</div>` : ""}</div>`).join("")}
+      ${hr}
+      ${row("Subtotal:", money(sale.subtotal))}
+      ${row("Discount:", money(sale.discount))}
+      ${row("Total:", money(sale.total), true)}
+      ${sale.withholding_tax > 0 ? row("Less 1% WHT:", `-${money(sale.withholding_tax)}`) + row("Amount Due:", money(sale.total - sale.withholding_tax), true) : ""}
+      ${hr}
+      ${payments.map(p => row(`${esc(p.method)}:`, money(p.amount))).join("")}
+      ${row("Paid:", money(sale.paid))}
+      ${row("Balance:", money(sale.balance))}
+      ${hr}
+      <div style="text-align:center;margin-top:4px">Thank you for your purchase!</div>
     </div>`;
   printDocument(html);
 }
