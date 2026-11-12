@@ -4672,13 +4672,34 @@ def _build_eod_report(conn, u, report_date, user_id=None, location_id=None):
             FROM sales s WHERE {sw}""",
         s_params,
     ).fetchone()
-    paid_at_sale = conn.execute(
-        f"""SELECT COALESCE(SUM(p.amount),0) a FROM payments p JOIN sales s ON s.id=p.sale_id
+    paid = conn.execute(
+        f"""SELECT COALESCE(SUM(p.amount),0) a,
+                   COALESCE(SUM(CASE WHEN s.sale_type='CASH' THEN p.amount END),0) cash_paid,
+                   COALESCE(SUM(CASE WHEN s.sale_type='CREDIT' THEN p.amount END),0) credit_paid
+            FROM payments p JOIN sales s ON s.id=p.sale_id
             WHERE {sw} AND s.status='COMPLETED' AND p.payment_source='SALE'""",
         s_params,
-    ).fetchone()["a"]
+    ).fetchone()
+    paid_at_sale = paid["a"]
+    cash_wht = conn.execute(
+        f"""SELECT COALESCE(SUM(withholding_tax),0) w FROM sales s
+            WHERE {sw} AND status='COMPLETED' AND sale_type='CASH'""", s_params).fetchone()["w"]
     sales_summary = {k: (round(sales[k], 2) if isinstance(sales[k], float) else sales[k]) for k in sales.keys()}
     sales_summary["charged_to_accounts"] = round(sales["total"] - paid_at_sale, 2)
+    # How "Cash sales" (sale totals) ties to what was received at the POS
+    # (Collections by Payment Method): down payments on credit / terms sales
+    # are received too, 1% WHT on cash sales is not, and a cash sale can be
+    # paid above its amount due (change typed in as payment, or the sale
+    # lowered afterwards).
+    sales_summary["paid_at_sale"] = round(paid_at_sale, 2)
+    sales_summary["credit_paid_at_sale"] = round(paid["credit_paid"], 2)
+    sales_summary["cash_wht"] = round(cash_wht, 2)
+    sales_summary["cash_overpaid"] = round(paid["cash_paid"] - (sales["cash_sales"] - cash_wht), 2)
+    sales_summary["overpaid_sales"] = [dict(r) for r in conn.execute(
+        f"""SELECT s.id, s.sale_no, s.ts, s.total, s.withholding_tax, s.paid,
+                   ROUND(s.paid - (s.total - s.withholding_tax), 2) over, s.edited_at
+            FROM sales s WHERE {sw} AND s.status='COMPLETED' AND s.sale_type='CASH'
+              AND s.paid - (s.total - s.withholding_tax) > 0.009 ORDER BY s.ts""", s_params).fetchall()]
 
     items = conn.execute(
         f"""SELECT si.product_name, si.sale_mode, SUM(si.qty) qty, SUM(si.subtotal) amount
