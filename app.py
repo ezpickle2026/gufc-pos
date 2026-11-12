@@ -2,6 +2,7 @@ import os
 import functools
 import csv
 import io
+import json
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -2470,7 +2471,7 @@ def delete_discount(did):
 
 # Child tables first so foreign keys never block a delete.
 RESET_TRANSACTION_TABLES = [
-    "payments", "receivables", "sale_items",
+    "pending_sales", "payments", "receivables", "sale_items",
     "commercial_delivery_cylinders", "commercial_pullouts", "commercial_deliveries",
     "sales",
     "inventory_movements", "empty_cylinder_movements", "swapped_empty_movements", "cylinder_deposits",
@@ -2662,6 +2663,205 @@ def system_reset():
 
 # ---------------------------------------------------------------- POS / sales
 
+def _price_sale_items(conn, items, customer, sale_type, locked=None):
+    """Server-side pricing for a POS cart. `locked` (For Delivery) carries
+    the per-line prices and discounts captured when the order was taken."""
+    if not items:
+        raise ValueError("Cart is empty")
+    # Commercial accounts: 50kg cylinders on a credit sale are only
+    # delivered here (stock moves, DR prints); the customer is charged
+    # later through 50kg Commercial Billing, so the SRP never hits their
+    # receivables / SOA.
+    commercial_delivery = bool(sale_type == "CREDIT" and customer and is_commercial_account(customer))
+    subtotal = 0.0
+    resolved_items = []
+    for idx, it in enumerate(items):
+        lock = locked[idx] if locked else None
+        prod = conn.execute("SELECT * FROM products WHERE id=?", (it["product_id"],)).fetchone()
+        if not prod:
+            raise ValueError(f"Unknown product {it['product_id']}")
+        qty = int(it["qty"])
+        if qty <= 0:
+            raise ValueError("Quantity must be positive")
+        sale_mode = it.get("sale_mode", "REFILL")
+        if sale_mode not in ("REFILL", "DEPOSIT", "SWAP"):
+            raise ValueError("sale_mode must be REFILL, DEPOSIT or SWAP")
+        # server-side price, never trust frontend: REFILL is gas only;
+        # DEPOSIT adds the cylinder deposit fee (customer keeps the tank);
+        # SWAP adds a per-cylinder swap fee (customer hands over an empty
+        # of another brand in exchange).
+        gas_price = float(lock["gas_price"]) if lock else float(prod["price"])
+        bill_later = commercial_delivery and is_commercial_cylinder(prod)
+        srp_price = gas_price if bill_later else None
+        if bill_later:
+            gas_price = 0.0  # charged later in 50kg Commercial Billing
+        price = gas_price
+        swap_brand, swap_fee = None, 0.0
+        if sale_mode == "DEPOSIT":
+            price += float(lock["deposit_price"]) if lock else float(prod["deposit_price"])
+        elif sale_mode == "SWAP":
+            swap_brand = (it.get("swap_brand") or "").strip()
+            if not swap_brand:
+                raise ValueError(f"Choose the LPG brand being swapped for {prod['name']}")
+            try:
+                swap_fee = round(float(it.get("swap_fee") or 0), 2)
+            except (TypeError, ValueError):
+                raise ValueError("Swap fee must be a number")
+            if swap_fee < 0:
+                raise ValueError("Swap fee cannot be negative")
+            price += swap_fee
+        line_total = round(price * qty, 2)
+        subtotal += line_total
+        # optional per-item discount, recomputed server-side
+        disc_id, disc_name, disc_amount = None, None, 0.0
+        if lock and not bill_later:
+            # For Delivery: keep the discount agreed when the order was taken,
+            # even if the promo has ended by the delivery day.
+            if lock.get("discount_amount"):
+                disc_id, disc_name = lock.get("discount_id"), lock.get("discount_name")
+                disc_amount = round(float(lock["discount_amount"]), 2)
+        elif it.get("discount_id") and not bill_later:
+            disc = conn.execute("SELECT * FROM discounts WHERE id=?", (it["discount_id"],)).fetchone()
+            if not disc:
+                raise ValueError("Selected discount no longer exists")
+            disc_amount = compute_item_discount(disc, prod["id"], gas_price, qty)
+            disc_id, disc_name = disc["id"], disc["name"]
+        resolved_items.append((prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
+                               swap_brand, swap_fee, bill_later, srp_price))
+
+    subtotal = round(subtotal, 2)
+    discount = round(sum(r[7] for r in resolved_items), 2)
+    total = round(subtotal - discount, 2)
+    if total < 0:
+        raise ValueError("Discount exceeds subtotal")
+    return resolved_items, subtotal, discount, total
+
+
+def _locked_prices(resolved_items):
+    """What a For Delivery order keeps from the day it was taken."""
+    out = []
+    for (prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
+         swap_brand, swap_fee, bill_later, srp_price) in resolved_items:
+        out.append({"gas_price": float(prod["price"]), "deposit_price": float(prod["deposit_price"]),
+                    "discount_id": disc_id, "discount_name": disc_name, "discount_amount": disc_amount})
+    return out
+
+
+def _record_sale(conn, u, location_id, d, locked=None, notes=None):
+    """Records a completed POS sale (stock out, payments, receivable) inside
+    the caller's transaction and returns its id. Raises ValueError."""
+    items = d.get("items") or []
+    payments = d.get("payments") or []
+    sale_type = d.get("sale_type", "CASH")
+    if sale_type not in ("CASH", "CREDIT"):
+        raise ValueError("sale_type must be CASH or CREDIT")
+    customer_id = d.get("customer_id") or None
+    # Walk-in buyers have no account; the cashier may type their name.
+    walkin_name = None if customer_id else ((d.get("walkin_name") or "").strip()[:120] or None)
+    apply_wht = bool(d.get("withholding_tax"))
+    if notes is None:
+        notes = d.get("notes", "")
+    customer = None
+    if customer_id:
+        customer = conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+        if not customer:
+            raise ValueError("Customer not found")
+    resolved_items, subtotal, discount, total = _price_sale_items(conn, items, customer, sale_type, locked)
+    # 1% expanded withholding tax: the customer pays the gross less
+    # (gross / 1.12) x 1%, and hands over a BIR Form 2307 for it.
+    withholding_tax = compute_withholding_tax(total) if apply_wht else 0.0
+    amount_due = round(total - withholding_tax, 2)
+
+    paid_total = round(sum(float(p["amount"]) for p in payments), 2)
+
+    if sale_type == "CASH" and paid_total < amount_due:
+        raise ValueError("Cash sale payments do not cover the total. Use CREDIT for partial payment.")
+
+    if any(r[10] for r in resolved_items) and paid_total > amount_due + 0.009:
+        raise ValueError(f"Payment is more than the amount due ({amount_due:.2f}). The 50kg cylinders for a "
+                         "Commercial account are charged later in 50kg Commercial Billing, not here.")
+
+    # credit sale: check customer terms + credit limit
+    if sale_type == "CREDIT":
+        if not customer:
+            raise ValueError("Credit sale requires a customer with approved terms")
+        outstanding = conn.execute(
+            "SELECT COALESCE(SUM(balance),0) b FROM receivables WHERE customer_id=? AND status!='PAID'",
+            (customer_id,),
+        ).fetchone()["b"]
+        projected = outstanding + (amount_due - paid_total)
+        if customer["credit_limit"] > 0 and projected > customer["credit_limit"]:
+            raise ValueError(
+                f"Credit limit exceeded: outstanding+this sale = {projected:.2f}, limit = {customer['credit_limit']:.2f}"
+            )
+
+    balance = round(amount_due - paid_total, 2)
+    sale_no = next_number(conn, "SALE", "sales", "sale_no")
+    # Credit / terms sales get a Delivery Receipt number the customer signs against.
+    dr_no = next_number(conn, "DR", "sales", "dr_no") if sale_type == "CREDIT" else None
+
+    cur = conn.execute(
+        """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance,
+                              notes, dr_no, walkin_name, withholding_tax)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (sale_no, location_id, u["id"], customer_id, sale_type, subtotal, discount, total,
+         paid_total, balance, notes, dr_no, walkin_name, withholding_tax),
+    )
+    sale_id = cur.lastrowid
+
+    for (prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
+         swap_brand, swap_fee, bill_later, srp_price) in resolved_items:
+        conn.execute(
+            """INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode,
+               discount_id, discount_name, discount_amount, swap_brand, swap_fee, bill_later, srp_price)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (sale_id, prod["id"], prod["name"], qty, price, line_total, sale_mode,
+             disc_id, disc_name, disc_amount, swap_brand, swap_fee, 1 if bill_later else 0, srp_price),
+        )
+        mode_note = f"SWAP from {swap_brand}" if sale_mode == "SWAP" else sale_mode
+        adjust_inventory(conn, location_id, prod["id"], -qty, "SALE", sale_no,
+                          notes=f"Sold via {sale_no} ({mode_note})")
+        if sale_mode == "REFILL":
+            # Customer exchanges an empty cylinder for a full one — the empty
+            # comes back into our stock, ready to be hauled to the plant for refill.
+            add_empty_cylinders(conn, location_id, prod["id"], qty, "REFILL SALE",
+                                reference=sale_no, notes=f"Empty returned on refill sale {sale_no}")
+        elif sale_mode == "SWAP":
+            # SWAP: the customer hands over an empty of a different brand.
+            # It's kept apart from our own empties, counted per brand.
+            add_swapped_empties(conn, location_id, prod["id"], swap_brand, qty, "SWAP SALE",
+                                reference=sale_no, notes=f"{swap_brand} empty taken in on swap sale {sale_no}")
+        else:
+            # DEPOSIT: customer takes a full cylinder with no exchange — no
+            # empty comes back, and the cylinder is now outstanding on loan
+            # to them (tracked so we know our total cylinders in circulation).
+            if customer_id:
+                record_cylinder_deposit(conn, customer_id, prod["id"], qty)
+
+    for p in payments:
+        conn.execute(
+            "INSERT INTO payments (sale_id, method, amount, reference, user_id) VALUES (?,?,?,?,?)",
+            (sale_id, p["method"], float(p["amount"]), p.get("reference", ""), u["id"]),
+        )
+
+    if balance > 0.009:
+        if sale_type != "CREDIT":
+            raise ValueError("Balance remaining but sale is not marked CREDIT")
+        terms_days = customer["terms_days"] or 0
+        invoice_date = datetime.now().date()
+        due_date = invoice_date + timedelta(days=terms_days)
+        invoice_no = next_number(conn, "INV", "receivables", "invoice_no")
+        conn.execute(
+            """INSERT INTO receivables (sale_id, customer_id, invoice_no, invoice_date, due_date, amount, paid, balance, status)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (sale_id, customer_id, invoice_no, str(invoice_date), str(due_date), amount_due, paid_total, balance,
+             "CURRENT"),
+        )
+
+    audit(conn, "CREATE", "SALES", sale_id, f"{sale_no} total={total} wht={withholding_tax} paid={paid_total} balance={balance}")
+    return sale_id
+
+
 @app.post("/api/sales")
 @roles_or_module_required("ADMIN", "ATTENDANT", module="pos")
 def create_sale():
@@ -2670,173 +2870,12 @@ def create_sale():
     location_id = u["location_id"] if not is_admin_like(u["role"]) else d.get("location_id")
     if not location_id:
         return jsonify(error="No location specified"), 400
-
-    items = d.get("items") or []
-    if not items:
+    if not (d.get("items") or []):
         return jsonify(error="Cart is empty"), 400
-    payments = d.get("payments") or []
-    sale_type = d.get("sale_type", "CASH")
-    customer_id = d.get("customer_id")
-    # Walk-in buyers have no account; the cashier may type their name.
-    walkin_name = None if customer_id else ((d.get("walkin_name") or "").strip()[:120] or None)
-    apply_wht = bool(d.get("withholding_tax"))
 
     conn = get_db()
     try:
-        customer = None
-        if customer_id:
-            customer = conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
-        # Commercial accounts: 50kg cylinders on a credit sale are only
-        # delivered here (stock moves, DR prints); the customer is charged
-        # later through 50kg Commercial Billing, so the SRP never hits their
-        # receivables / SOA.
-        commercial_delivery = bool(sale_type == "CREDIT" and customer and is_commercial_account(customer))
-        subtotal = 0.0
-        resolved_items = []
-        for it in items:
-            prod = conn.execute("SELECT * FROM products WHERE id=?", (it["product_id"],)).fetchone()
-            if not prod:
-                raise ValueError(f"Unknown product {it['product_id']}")
-            qty = int(it["qty"])
-            if qty <= 0:
-                raise ValueError("Quantity must be positive")
-            sale_mode = it.get("sale_mode", "REFILL")
-            if sale_mode not in ("REFILL", "DEPOSIT", "SWAP"):
-                raise ValueError("sale_mode must be REFILL, DEPOSIT or SWAP")
-            # server-side price, never trust frontend: REFILL is gas only;
-            # DEPOSIT adds the cylinder deposit fee (customer keeps the tank);
-            # SWAP adds a per-cylinder swap fee (customer hands over an empty
-            # of another brand in exchange).
-            gas_price = float(prod["price"])
-            bill_later = commercial_delivery and is_commercial_cylinder(prod)
-            srp_price = gas_price if bill_later else None
-            if bill_later:
-                gas_price = 0.0  # charged later in 50kg Commercial Billing
-            price = gas_price
-            swap_brand, swap_fee = None, 0.0
-            if sale_mode == "DEPOSIT":
-                price += float(prod["deposit_price"])
-            elif sale_mode == "SWAP":
-                swap_brand = (it.get("swap_brand") or "").strip()
-                if not swap_brand:
-                    raise ValueError(f"Choose the LPG brand being swapped for {prod['name']}")
-                try:
-                    swap_fee = round(float(it.get("swap_fee") or 0), 2)
-                except (TypeError, ValueError):
-                    raise ValueError("Swap fee must be a number")
-                if swap_fee < 0:
-                    raise ValueError("Swap fee cannot be negative")
-                price += swap_fee
-            line_total = round(price * qty, 2)
-            subtotal += line_total
-            # optional per-item discount, recomputed server-side
-            disc_id, disc_name, disc_amount = None, None, 0.0
-            if it.get("discount_id") and not bill_later:
-                disc = conn.execute("SELECT * FROM discounts WHERE id=?", (it["discount_id"],)).fetchone()
-                if not disc:
-                    raise ValueError("Selected discount no longer exists")
-                disc_amount = compute_item_discount(disc, prod["id"], gas_price, qty)
-                disc_id, disc_name = disc["id"], disc["name"]
-            resolved_items.append((prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
-                                   swap_brand, swap_fee, bill_later, srp_price))
-
-        subtotal = round(subtotal, 2)
-        discount = round(sum(r[7] for r in resolved_items), 2)
-        total = round(subtotal - discount, 2)
-        if total < 0:
-            raise ValueError("Discount exceeds subtotal")
-        # 1% expanded withholding tax: the customer pays the gross less
-        # (gross / 1.12) x 1%, and hands over a BIR Form 2307 for it.
-        withholding_tax = compute_withholding_tax(total) if apply_wht else 0.0
-        amount_due = round(total - withholding_tax, 2)
-
-        paid_total = round(sum(float(p["amount"]) for p in payments), 2)
-
-        if sale_type == "CASH" and paid_total < amount_due:
-            raise ValueError("Cash sale payments do not cover the total. Use CREDIT for partial payment.")
-
-        if any(r[10] for r in resolved_items) and paid_total > amount_due + 0.009:
-            raise ValueError(f"Payment is more than the amount due ({amount_due:.2f}). The 50kg cylinders for a "
-                             "Commercial account are charged later in 50kg Commercial Billing, not here.")
-
-        # credit sale: check customer terms + credit limit
-        if sale_type == "CREDIT":
-            if not customer:
-                raise ValueError("Credit sale requires a customer with approved terms")
-            outstanding = conn.execute(
-                "SELECT COALESCE(SUM(balance),0) b FROM receivables WHERE customer_id=? AND status!='PAID'",
-                (customer_id,),
-            ).fetchone()["b"]
-            projected = outstanding + (amount_due - paid_total)
-            if customer["credit_limit"] > 0 and projected > customer["credit_limit"]:
-                raise ValueError(
-                    f"Credit limit exceeded: outstanding+this sale = {projected:.2f}, limit = {customer['credit_limit']:.2f}"
-                )
-
-        balance = round(amount_due - paid_total, 2)
-        sale_no = next_number(conn, "SALE", "sales", "sale_no")
-        # Credit / terms sales get a Delivery Receipt number the customer signs against.
-        dr_no = next_number(conn, "DR", "sales", "dr_no") if sale_type == "CREDIT" else None
-
-        cur = conn.execute(
-            """INSERT INTO sales (sale_no, location_id, user_id, customer_id, sale_type, subtotal, discount, total, paid, balance,
-                                  notes, dr_no, walkin_name, withholding_tax)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (sale_no, location_id, u["id"], customer_id, sale_type, subtotal, discount, total,
-             paid_total, balance, d.get("notes", ""), dr_no, walkin_name, withholding_tax),
-        )
-        sale_id = cur.lastrowid
-
-        for (prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
-             swap_brand, swap_fee, bill_later, srp_price) in resolved_items:
-            conn.execute(
-                """INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode,
-                   discount_id, discount_name, discount_amount, swap_brand, swap_fee, bill_later, srp_price)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (sale_id, prod["id"], prod["name"], qty, price, line_total, sale_mode,
-                 disc_id, disc_name, disc_amount, swap_brand, swap_fee, 1 if bill_later else 0, srp_price),
-            )
-            mode_note = f"SWAP from {swap_brand}" if sale_mode == "SWAP" else sale_mode
-            adjust_inventory(conn, location_id, prod["id"], -qty, "SALE", sale_no,
-                              notes=f"Sold via {sale_no} ({mode_note})")
-            if sale_mode == "REFILL":
-                # Customer exchanges an empty cylinder for a full one — the empty
-                # comes back into our stock, ready to be hauled to the plant for refill.
-                add_empty_cylinders(conn, location_id, prod["id"], qty, "REFILL SALE",
-                                    reference=sale_no, notes=f"Empty returned on refill sale {sale_no}")
-            elif sale_mode == "SWAP":
-                # SWAP: the customer hands over an empty of a different brand.
-                # It's kept apart from our own empties, counted per brand.
-                add_swapped_empties(conn, location_id, prod["id"], swap_brand, qty, "SWAP SALE",
-                                    reference=sale_no, notes=f"{swap_brand} empty taken in on swap sale {sale_no}")
-            else:
-                # DEPOSIT: customer takes a full cylinder with no exchange — no
-                # empty comes back, and the cylinder is now outstanding on loan
-                # to them (tracked so we know our total cylinders in circulation).
-                if customer_id:
-                    record_cylinder_deposit(conn, customer_id, prod["id"], qty)
-
-        for p in payments:
-            conn.execute(
-                "INSERT INTO payments (sale_id, method, amount, reference, user_id) VALUES (?,?,?,?,?)",
-                (sale_id, p["method"], float(p["amount"]), p.get("reference", ""), u["id"]),
-            )
-
-        if balance > 0.009:
-            if sale_type != "CREDIT":
-                raise ValueError("Balance remaining but sale is not marked CREDIT")
-            terms_days = customer["terms_days"] or 0
-            invoice_date = datetime.now().date()
-            due_date = invoice_date + timedelta(days=terms_days)
-            invoice_no = next_number(conn, "INV", "receivables", "invoice_no")
-            conn.execute(
-                """INSERT INTO receivables (sale_id, customer_id, invoice_no, invoice_date, due_date, amount, paid, balance, status)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (sale_id, customer_id, invoice_no, str(invoice_date), str(due_date), amount_due, paid_total, balance,
-                 "CURRENT"),
-            )
-
-        audit(conn, "CREATE", "SALES", sale_id, f"{sale_no} total={total} wht={withholding_tax} paid={paid_total} balance={balance}")
+        sale_id = _record_sale(conn, u, location_id, d)
         conn.commit()
     except ValueError as e:
         conn.rollback()
@@ -2850,6 +2889,198 @@ def create_sale():
     result = get_sale_detail(sale_id)
     conn.close()
     return jsonify(result), 201
+
+
+# ---------------------------------------------------------------- For Delivery
+# An order rung up at the POS that goes out later (tomorrow, next week). It
+# is kept here with its prices locked; no stock, payment or receivable moves.
+# "Mark Delivered" records the real sale on the delivery day, with whatever
+# payment is collected then (or on terms), so the End of Day report and the
+# sales reports count it on the day it was actually delivered.
+
+PENDING_SALE_FIELDS = ("customer_id", "walkin_name", "sale_type", "withholding_tax", "notes", "items")
+
+
+def _pending_location_ok(u, row):
+    return is_admin_like(u["role"]) or row["location_id"] == u["location_id"]
+
+
+def _pending_sale_out(conn, r):
+    payload = json.loads(r["payload"] or "{}")
+    raw_items = payload.get("items") or []
+    locked = payload.get("locked") or []
+    names = {}
+    if raw_items:
+        ids = [it["product_id"] for it in raw_items]
+        names = {p["id"]: p["name"] for p in conn.execute(
+            f"SELECT id, name FROM products WHERE id IN ({','.join('?' * len(ids))})", ids).fetchall()}
+    items = []
+    for idx, it in enumerate(raw_items):
+        lock = locked[idx] if idx < len(locked) else {}
+        items.append({**{k: it.get(k) for k in ("product_id", "qty", "sale_mode", "swap_brand", "swap_fee")},
+                      "product_name": names.get(it["product_id"], f"#{it['product_id']}"),
+                      "gas_price": lock.get("gas_price"), "discount_name": lock.get("discount_name"),
+                      "discount_amount": lock.get("discount_amount") or 0})
+    out = dict(r)
+    out.pop("payload", None)
+    out["items"] = items
+    out["ts"] = _local_ts(r["ts"])
+    out["delivered_at"] = _local_ts(r["delivered_at"])
+    out["cancelled_at"] = _local_ts(r["cancelled_at"])
+    return out
+
+
+@app.post("/api/pending-sales")
+@roles_or_module_required("ADMIN", "ATTENDANT", module="pos")
+def create_pending_sale():
+    d = request.get_json(force=True)
+    u = session["user"]
+    location_id = u["location_id"] if not is_admin_like(u["role"]) else d.get("location_id")
+    if not location_id:
+        return jsonify(error="No location specified"), 400
+    sale_type = d.get("sale_type", "CASH")
+    if sale_type not in ("CASH", "CREDIT"):
+        return jsonify(error="sale_type must be CASH or CREDIT"), 400
+    customer_id = d.get("customer_id") or None
+    conn = get_db()
+    try:
+        customer = None
+        if customer_id:
+            customer = conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+            if not customer:
+                raise ValueError("Customer not found")
+        if sale_type == "CREDIT" and not customer:
+            raise ValueError("Credit sale requires a customer with approved terms")
+        resolved, subtotal, discount, total = _price_sale_items(conn, d.get("items") or [], customer, sale_type)
+        wht = compute_withholding_tax(total) if d.get("withholding_tax") else 0.0
+        payload = {k: d.get(k) for k in PENDING_SALE_FIELDS}
+        payload["customer_id"] = customer_id
+        payload["walkin_name"] = None if customer_id else ((d.get("walkin_name") or "").strip()[:120] or None)
+        payload["items"] = [{**{k: it[k] for k in ("discount_id", "swap_brand", "swap_fee") if it.get(k) is not None},
+                             "product_id": it["product_id"], "qty": int(it["qty"]),
+                             "sale_mode": it.get("sale_mode") or "REFILL"} for it in d.get("items")]
+        payload["locked"] = _locked_prices(resolved)
+        pending_no = next_number(conn, "FD", "pending_sales", "pending_no")
+        cur = conn.execute(
+            """INSERT INTO pending_sales (pending_no, location_id, created_by, customer_id, walkin_name, sale_type,
+                   withholding_tax, payload, total, amount_due, delivery_address, notes)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (pending_no, location_id, u["id"], customer_id, payload["walkin_name"], sale_type,
+             1 if d.get("withholding_tax") else 0, json.dumps(payload), total, round(total - wht, 2),
+             (d.get("delivery_address") or "").strip()[:300] or None, (d.get("notes") or "").strip() or None),
+        )
+        pid = cur.lastrowid
+        audit(conn, "CREATE", "PENDING_SALES", pid, f"{pending_no} for delivery, total={total}")
+        conn.commit()
+        row = conn.execute(
+            """SELECT ps.*, COALESCE(c.name, ps.walkin_name) customer_name, c.account_no, l.name location_name,
+                      cu.name created_by_name
+               FROM pending_sales ps JOIN locations l ON l.id=ps.location_id JOIN users cu ON cu.id=ps.created_by
+               LEFT JOIN customers c ON c.id=ps.customer_id WHERE ps.id=?""", (pid,)).fetchone()
+        out = _pending_sale_out(conn, row)
+    except ValueError as e:
+        conn.rollback()
+        conn.close()
+        return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(out), 201
+
+
+@app.get("/api/pending-sales")
+@roles_or_module_required("ADMIN", "MANAGER", "ATTENDANT", "ACCOUNTING", module="pos")
+def list_pending_sales():
+    u = session["user"]
+    where, params = [], []
+    status = (request.args.get("status") or "PENDING").upper()
+    if status in ("PENDING", "DELIVERED", "CANCELLED"):
+        where.append("ps.status=?"); params.append(status)
+    if not is_admin_like(u["role"]) and u["role"] not in ("MANAGER", "ACCOUNTING"):
+        where.append("ps.location_id=?"); params.append(u["location_id"])
+    conn = get_db()
+    rows = conn.execute(
+        f"""SELECT ps.*, COALESCE(c.name, ps.walkin_name) customer_name, c.account_no, l.name location_name,
+                   cu.name created_by_name, du.name delivered_by_name, xu.name cancelled_by_name, s.sale_no
+            FROM pending_sales ps JOIN locations l ON l.id=ps.location_id JOIN users cu ON cu.id=ps.created_by
+            LEFT JOIN customers c ON c.id=ps.customer_id LEFT JOIN users du ON du.id=ps.delivered_by
+            LEFT JOIN users xu ON xu.id=ps.cancelled_by LEFT JOIN sales s ON s.id=ps.sale_id
+            {"WHERE " + " AND ".join(where) if where else ""}
+            ORDER BY ps.ts {"ASC" if status == "PENDING" else "DESC"} LIMIT 500""", params).fetchall()
+    out = [_pending_sale_out(conn, r) for r in rows]
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/pending-sales/<int:pid>/deliver")
+@roles_or_module_required("ADMIN", "ATTENDANT", module="pos")
+def deliver_pending_sale(pid):
+    """Delivered: records the sale today with the payment collected now."""
+    d = request.get_json(force=True) or {}
+    u = session["user"]
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT ps.*, cu.name created_by_name FROM pending_sales ps "
+                           "JOIN users cu ON cu.id=ps.created_by WHERE ps.id=?", (pid,)).fetchone()
+        if not row:
+            raise LookupError("Not found")
+        if not _pending_location_ok(u, row):
+            raise PermissionError("This order belongs to another location")
+        if row["status"] != "PENDING":
+            raise ValueError(f"{row['pending_no']} is already {row['status'].lower()}")
+        payload = json.loads(row["payload"])
+        sale_type = d.get("sale_type") or row["sale_type"]
+        sale_d = {
+            "items": payload["items"], "customer_id": payload.get("customer_id"),
+            "walkin_name": payload.get("walkin_name"), "sale_type": sale_type,
+            "withholding_tax": d.get("withholding_tax", bool(row["withholding_tax"])),
+            "payments": [p for p in (d.get("payments") or []) if float(p.get("amount") or 0) > 0],
+        }
+        note = f"For Delivery {row['pending_no']} (taken {_local_ts(row['ts'])[:10]} by {row['created_by_name']})"
+        if row["notes"]:
+            note += f" - {row['notes']}"
+        sale_id = _record_sale(conn, u, row["location_id"], sale_d, locked=payload.get("locked"), notes=note)
+        conn.execute("UPDATE pending_sales SET status='DELIVERED', sale_id=?, delivered_at=datetime('now'), "
+                     "delivered_by=? WHERE id=?", (sale_id, u["id"], pid))
+        audit(conn, "DELIVER", "PENDING_SALES", pid, f"{row['pending_no']} delivered as sale #{sale_id}")
+        conn.commit()
+    except LookupError as e:
+        conn.rollback(); conn.close()
+        return jsonify(error=str(e)), 404
+    except PermissionError as e:
+        conn.rollback(); conn.close()
+        return jsonify(error=str(e)), 403
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return jsonify(error=str(e)), 400
+    except Exception as e:
+        conn.rollback(); conn.close()
+        return jsonify(error=f"Unable to complete delivery: {e}"), 500
+    conn.close()
+    return jsonify(get_sale_detail(sale_id)), 201
+
+
+@app.post("/api/pending-sales/<int:pid>/cancel")
+@roles_or_module_required("ADMIN", "ATTENDANT", module="pos")
+def cancel_pending_sale(pid):
+    d = request.get_json(force=True) or {}
+    u = session["user"]
+    reason = (d.get("reason") or "").strip()
+    if not reason:
+        return jsonify(error="Please give a reason for cancelling"), 400
+    conn = get_db()
+    row = conn.execute("SELECT * FROM pending_sales WHERE id=?", (pid,)).fetchone()
+    if not row:
+        conn.close(); return jsonify(error="Not found"), 404
+    if not _pending_location_ok(u, row):
+        conn.close(); return jsonify(error="This order belongs to another location"), 403
+    if row["status"] != "PENDING":
+        conn.close(); return jsonify(error=f"{row['pending_no']} is already {row['status'].lower()}"), 400
+    conn.execute("UPDATE pending_sales SET status='CANCELLED', cancelled_at=datetime('now'), cancelled_by=?, "
+                 "cancel_reason=? WHERE id=?", (u["id"], reason[:300], pid))
+    audit(conn, "CANCEL", "PENDING_SALES", pid, f"{row['pending_no']}: {reason[:200]}")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
 
 
 def get_sale_detail(sale_id):
@@ -4883,6 +5114,33 @@ def _build_eod_report(conn, u, report_date, user_id=None, location_id=None):
         s_params,
     ).fetchall()
 
+    # For Delivery orders: not in the sales above until they're delivered.
+    # Shown so the day's orders reconcile with what actually went out.
+    def _fd(date_col, user_col, extra=""):
+        w, prm = [f"date(ps.{date_col}) = date(?)"], [report_date]
+        if user_id:
+            w.append(f"ps.{user_col} = ?"); prm.append(user_id)
+        if location_id:
+            w.append("ps.location_id = ?"); prm.append(location_id)
+        r = conn.execute(f"SELECT COUNT(*) n, COALESCE(SUM(ps.total),0) t FROM pending_sales ps "
+                         f"WHERE {' AND '.join(w)}{extra}", prm).fetchone()
+        return {"count": r["n"], "total": round(r["t"], 2)}
+    o_w, o_p = ["ps.status='PENDING'", "date(ps.ts) <= date(?)"], [report_date]
+    if user_id:
+        o_w.append("ps.created_by = ?"); o_p.append(user_id)
+    if location_id:
+        o_w.append("ps.location_id = ?"); o_p.append(location_id)
+    open_rows = conn.execute(
+        f"""SELECT ps.pending_no, ps.ts, ps.total, ps.sale_type, COALESCE(c.name, ps.walkin_name) customer_name
+            FROM pending_sales ps LEFT JOIN customers c ON c.id=ps.customer_id
+            WHERE {' AND '.join(o_w)} ORDER BY ps.ts""", o_p).fetchall()
+    for_delivery = {
+        "taken": _fd("ts", "created_by"),
+        "delivered": _fd("delivered_at", "delivered_by", " AND ps.status='DELIVERED'"),
+        "open": {"count": len(open_rows), "total": round(sum(r["total"] for r in open_rows), 2)},
+        "open_list": [{**dict(r), "ts": _local_ts(r["ts"])} for r in open_rows],
+    }
+
     staff_name, location_name = "All staff", None
     if user_id:
         row = conn.execute("SELECT u.name, l.name location_name FROM users u LEFT JOIN locations l ON l.id=u.location_id WHERE u.id=?",
@@ -4899,6 +5157,7 @@ def _build_eod_report(conn, u, report_date, user_id=None, location_id=None):
         "methods": methods, "totals": totals, "sales": sales_summary,
         "items": [dict(i) for i in items],
         "payments": [dict(p) for p in payments],
+        "for_delivery": for_delivery,
         "generated_by": u["name"],
     }
 

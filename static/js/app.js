@@ -60,6 +60,7 @@ const NAV = [
   { section: "Operations" },
   { id: "dashboard", label: "Dashboard", icon: "\u{1F3E0}", module: "dashboard" },
   { id: "pos", label: "POS", icon: "\u{1F6D2}", module: "pos" },
+  { id: "for_delivery", label: "For Delivery", icon: "\u23F3", module: "pos" },
   { id: "sales", label: "Sales", icon: "\u{1F9FE}", module: "sales" },
   { id: "eod_report", label: "End of Day Report", icon: "\u{1F4B5}", module: "eod_report" },
   { id: "booked_orders", label: "Booked Orders", icon: "\u{1F4CB}", module: "booked_orders" },
@@ -172,7 +173,7 @@ function render() {
   const c = document.getElementById("content");
   c.innerHTML = "";
   const views = {
-    dashboard: renderDashboard, pos: renderPOS, sales: renderSales,
+    dashboard: renderDashboard, pos: renderPOS, for_delivery: renderForDelivery, sales: renderSales,
     customers: renderCustomers, receivables: renderReceivables,
     inventory: renderInventory, inventory_ledger: renderInventoryLedger, transfers: renderTransfers, reports: renderReports,
     users: renderUsers, products: renderProducts, locations: renderLocations, discounts: renderDiscounts, system_reset: renderSystemReset,
@@ -590,12 +591,22 @@ async function openCheckout(locationId) {
         Gross ${money(gross)} &divide; 1.12 = ${money(gross / 1.12)} &times; 1% = <b>&minus;${money(withholdingTax(gross))}</b></div></div>
     <div class="field"><label>Total Due</label><div style="font-size:20px;font-weight:800" id="totalDue">${money(total)}</div>
       <div id="commercialNote" style="display:none;font-size:12.5px;color:var(--muted);margin-top:4px"></div></div>
-    <div class="field">
+    <div class="field" style="background:var(--bg);padding:8px 10px;border-radius:8px">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin:0">
+        <input type="checkbox" id="forDeliveryCheck" style="width:auto;margin:0"> <b>For Delivery</b> &mdash; deliver later (tomorrow or another day)</label>
+      <div id="forDeliveryFields" style="display:none;margin-top:8px">
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:6px">The order is saved with today's prices, but stock, payment and
+          sales are recorded only when you <b>Mark Delivered</b> on the For Delivery page. It counts in the End of Day report of the delivery day.</div>
+        <input type="text" id="fdAddress" maxlength="300" placeholder="Delivery address (optional)" style="width:100%;margin-bottom:6px">
+        <input type="text" id="fdNotes" maxlength="300" placeholder="Notes, e.g. deliver tomorrow AM (optional)" style="width:100%">
+      </div>
+    </div>
+    <div class="field" id="paySection">
       <label>Payments (split payments supported)</label>
       <div id="payRows"></div>
       <button class="btn small" id="addPayRow" type="button">+ Add Payment</button>
     </div>
-    <div class="field"><b>Paid so far: </b><span id="paidSoFar">${money(0)}</span> &nbsp; <b>Balance: </b><span id="balSoFar">${money(total)}</span></div>
+    <div class="field" id="paySummary"><b>Paid so far: </b><span id="paidSoFar">${money(0)}</span> &nbsp; <b>Balance: </b><span id="balSoFar">${money(total)}</span></div>
     <div class="modal-actions">
       <button class="btn" onclick="closeModal()">Cancel</button>
       <button class="btn green" id="submitSaleBtn">Complete Sale</button>
@@ -656,8 +667,41 @@ async function openCheckout(locationId) {
       refreshTotal();
     });
     addRow(total); // default: single cash payment for full total
+    const fdCheck = document.getElementById("forDeliveryCheck");
+    fdCheck.addEventListener("change", () => {
+      const fd = fdCheck.checked;
+      document.getElementById("forDeliveryFields").style.display = fd ? "" : "none";
+      document.getElementById("paySection").style.display = fd ? "none" : "";
+      document.getElementById("paySummary").style.display = fd ? "none" : "";
+      document.getElementById("submitSaleBtn").textContent = fd ? "Save For Delivery" : "Complete Sale";
+    });
 
     document.getElementById("submitSaleBtn").addEventListener("click", async () => {
+      if (fdCheck.checked) {
+        const custId = document.getElementById("custSelect").value || null;
+        const body = {
+          location_id: locationId, customer_id: custId,
+          walkin_name: custId ? "" : document.getElementById("walkinName").value.trim(),
+          withholding_tax: document.getElementById("whtCheck").checked,
+          sale_type: document.getElementById("saleType").value,
+          delivery_address: document.getElementById("fdAddress").value.trim(),
+          notes: document.getElementById("fdNotes").value.trim(),
+          items: state.cart.map(i => ({
+            product_id: i.product_id, qty: i.qty, sale_mode: i.sale_mode,
+            discount_id: lineDiscount(i) > 0 ? i.discount_id : null,
+            ...(i.sale_mode === "SWAP" ? { swap_brand: i.swap_brand, swap_fee: i.swap_fee } : {}),
+          })),
+        };
+        try {
+          const o = await api("/pending-sales", { method: "POST", body });
+          closeModal();
+          toast(`${o.pending_no} saved for delivery`, "success");
+          state.cart = [];
+          printDeliverySlip(o);
+          switchView("pos");
+        } catch (e) { /* toast already shown */ }
+        return;
+      }
       const payments = [...payRows.querySelectorAll(".pay-row")].map(r => ({
         method: r.querySelector(".payMethod").value,
         amount: parseFloat(r.querySelector(".payAmount").value) || 0,
@@ -730,6 +774,174 @@ function printReceipt(result) {
       <div style="text-align:center;margin-top:4px">Thank you for your purchase!</div>
     </div>`;
   printDocument(html);
+}
+
+// Slip for an order saved For Delivery: goes out with the driver. Not a
+// receipt; the sale (and its receipt / DR) is made on Mark Delivered.
+function printDeliverySlip(o) {
+  const hr = `<div class="r58-hr"></div>`;
+  const row = (l, r, b) => `<div class="r58-row"${b ? ' style="font-weight:700"' : ""}><span>${l}</span><span>${r}</span></div>`;
+  printDocument(`<style>
+      @page{size:58mm auto;margin:0}
+      @media print{#receiptArea{width:58mm !important;padding:2mm 5mm !important}}
+      .r58{width:48mm;font-family:monospace;font-size:10px;line-height:1.3;color:#000;word-wrap:break-word;overflow-wrap:anywhere}
+      .r58-hr{border-top:1px dashed #000;margin:3px 0}
+      .r58-row{display:flex;justify-content:space-between;gap:4px}
+      .r58-row span:last-child{text-align:right;white-space:nowrap}
+    </style>
+    <div class="r58">
+      <div style="text-align:center"><strong style="font-size:12px">GREAT UNLI FOOD CORP.</strong><br>${esc(o.location_name)}<br>
+        <strong style="font-size:12px">FOR DELIVERY</strong></div>
+      ${hr}
+      <div>Order: ${esc(o.pending_no)}<br>Taken: ${esc(o.ts)}<br>By: ${esc(o.created_by_name)}<br>
+        Customer: ${esc(o.customer_name || "Walk-in")}${o.account_no ? " (" + esc(o.account_no) + ")" : ""}
+        ${o.delivery_address ? `<br>Address: ${esc(o.delivery_address)}` : ""}
+        ${o.notes ? `<br>Notes: ${esc(o.notes)}` : ""}</div>
+      ${hr}
+      ${o.items.map(i => row(`${i.qty} x ${esc(i.product_name)}${i.sale_mode !== "REFILL" ? " (" + i.sale_mode + ")" : ""}`, "")).join("")}
+      ${hr}
+      ${row("Total:", money(o.total), true)}
+      ${o.amount_due < o.total - 0.004 ? row("Amount due (less WHT):", money(o.amount_due), true) : ""}
+      ${row("Terms:", o.sale_type === "CREDIT" ? "Credit / Terms" : "Cash")}
+      ${hr}
+      <div style="margin-top:14px">Received by: ____________<br><br>Date: ____________</div>
+    </div>`);
+}
+
+// ================================================================== FOR DELIVERY
+// Orders taken at the POS that go out later. Nothing is in sales / EOD / stock
+// until Mark Delivered, which records the sale on that day.
+async function renderForDelivery(c) {
+  let status = "PENDING";
+  const canAct = hasModule("pos");
+  c.innerHTML = `<div class="card" style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <div class="tabs" style="display:flex;gap:6px">
+        <button class="btn small fdTab" data-s="PENDING">Not yet delivered</button>
+        <button class="btn small fdTab" data-s="DELIVERED">Delivered</button>
+        <button class="btn small fdTab" data-s="CANCELLED">Cancelled</button>
+      </div>
+      <span style="color:var(--muted);font-size:12.5px">To add one: POS &rarr; Checkout &rarr; tick <b>For Delivery</b>.</span>
+    </div>
+    <div id="fdTable">Loading...</div>`;
+  let rows = [];
+  async function load() {
+    c.querySelectorAll(".fdTab").forEach(b => b.classList.toggle("green", b.dataset.s === status));
+    rows = await api("/pending-sales?status=" + status);
+    const pendingTotal = rows.reduce((a, r) => a + r.total, 0);
+    document.getElementById("fdTable").innerHTML = `
+      ${status === "PENDING" && rows.length ? `<div style="font-size:13px;color:var(--muted);margin-bottom:8px">${rows.length} order(s) not yet delivered &middot; ${money(pendingTotal)} &middot; not yet in sales or the End of Day report</div>` : ""}
+      <div class="table-wrap"><table><thead><tr>
+        <th>Order #</th><th>Taken</th><th>Customer</th><th>Items</th><th>Type</th><th>Total</th><th>Taken By</th>
+        ${status === "DELIVERED" ? "<th>Delivered</th><th>Sale #</th>" : status === "CANCELLED" ? "<th>Cancelled</th><th>Reason</th>" : ""}<th></th>
+      </tr></thead><tbody>
+      ${rows.length ? rows.map(o => `<tr>
+        <td>${esc(o.pending_no)}</td><td>${esc(o.ts)}</td>
+        <td>${esc(o.customer_name || "Walk-in")}${o.delivery_address ? `<br><span style="color:var(--muted);font-size:11.5px">${esc(o.delivery_address)}</span>` : ""}
+          ${o.notes ? `<br><span style="color:var(--muted);font-size:11.5px">${esc(o.notes)}</span>` : ""}</td>
+        <td>${o.items.map(i => `${esc(i.product_name)} x${i.qty}${i.sale_mode !== "REFILL" ? " (" + i.sale_mode + ")" : ""}`).join("<br>")}</td>
+        <td><span class="badge ${o.sale_type === 'CASH' ? 'green' : 'warn'}">${o.sale_type}</span></td>
+        <td>${money(o.total)}</td><td>${esc(o.created_by_name)}${isAdminLike() ? `<br><span style="color:var(--muted);font-size:11.5px">${esc(o.location_name)}</span>` : ""}</td>
+        ${status === "DELIVERED" ? `<td>${esc(o.delivered_at || "")}<br><span style="color:var(--muted);font-size:11.5px">${esc(o.delivered_by_name || "")}</span></td><td>${esc(o.sale_no || "")}</td>` : ""}
+        ${status === "CANCELLED" ? `<td>${esc(o.cancelled_at || "")}<br><span style="color:var(--muted);font-size:11.5px">${esc(o.cancelled_by_name || "")}</span></td><td>${esc(o.cancel_reason || "")}</td>` : ""}
+        <td style="display:flex;gap:6px;flex-wrap:wrap">
+          ${status === "PENDING" ? `<button class="btn small" onclick="__fdSlip(${o.id})">Slip</button>` : ""}
+          ${status === "PENDING" && canAct ? `<button class="btn small green" onclick="__fdDeliver(${o.id})">Mark Delivered</button>
+            <button class="btn small danger" onclick="__fdCancel(${o.id})">Cancel</button>` : ""}
+          ${status === "DELIVERED" && o.sale_id ? `<button class="btn small" onclick="__fdReceipt(${o.sale_id})">Receipt</button>` : ""}
+        </td></tr>`).join("") : `<tr><td colspan="10" style="color:var(--muted)">None.</td></tr>`}
+      </tbody></table></div>`;
+  }
+  c.querySelectorAll(".fdTab").forEach(b => b.addEventListener("click", () => { status = b.dataset.s; load(); }));
+  window.__fdReceipt = async saleId => {
+    try { const r = await api(`/sales/${saleId}`); r.sale.sale_type === "CREDIT" ? printDeliveryReceipt(r) : printReceipt(r); } catch (e) {}
+  };
+  window.__fdSlip = id => { const o = rows.find(r => r.id === id); if (o) printDeliverySlip(o); };
+  window.__fdCancel = id => {
+    const o = rows.find(r => r.id === id);
+    openModal(`Cancel ${esc(o.pending_no)}`, `
+      <p style="margin-top:0">${esc(o.customer_name || "Walk-in")} &middot; ${money(o.total)}. Nothing was recorded yet, so nothing needs reversing.</p>
+      <div class="field"><label>Reason</label><input type="text" id="fdReason" maxlength="300" placeholder="e.g. customer cancelled"></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Back</button>
+        <button class="btn danger" id="fdCancelBtn">Cancel Order</button></div>`, () => {
+      document.getElementById("fdCancelBtn").addEventListener("click", async () => {
+        try {
+          await api(`/pending-sales/${id}/cancel`, { method: "POST", body: { reason: document.getElementById("fdReason").value.trim() } });
+          closeModal(); toast(`${o.pending_no} cancelled`, "success"); load();
+        } catch (e) {}
+      });
+    });
+  };
+  window.__fdDeliver = id => {
+    const o = rows.find(r => r.id === id);
+    const hasCustomer = !!o.customer_id;
+    const wht = (gross) => Math.round((gross - withholdingTax(gross)) * 100) / 100;
+    let due = o.amount_due;
+    openModal(`Mark Delivered: ${esc(o.pending_no)}`, `
+      <p style="margin-top:0">${esc(o.customer_name || "Walk-in")} &middot; ${o.items.map(i => `${esc(i.product_name)} x${i.qty}`).join(", ")}<br>
+        <span style="color:var(--muted);font-size:12.5px">The sale is recorded now (today's sales and End of Day report), stock is deducted, at the prices locked on ${esc(o.ts.slice(0, 10))}.</span></p>
+      <div class="field"><label>Sale Type</label><select id="fdType">
+        <option value="CASH" ${o.sale_type === "CASH" ? "selected" : ""}>Cash Sale</option>
+        ${hasCustomer ? `<option value="CREDIT" ${o.sale_type === "CREDIT" ? "selected" : ""}>Credit / Terms Sale</option>` : ""}
+      </select></div>
+      <div class="field"><label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="fdWht" style="width:auto;margin:0" ${o.withholding_tax ? "checked" : ""}> Withholding tax (1%)</label></div>
+      <div class="field"><label>Amount Due</label><div style="font-size:20px;font-weight:800" id="fdDue">${money(due)}</div>
+        <div style="font-size:12px;color:var(--muted)">Commercial 50kg lines are billed later in 50kg Commercial Billing, as usual.</div></div>
+      <div class="field"><label>Payments collected (split payments supported)</label>
+        <div id="fdPayRows"></div><button class="btn small" id="fdAddPay" type="button">+ Add Payment</button></div>
+      <div class="field"><b>Paid: </b><span id="fdPaid">${money(0)}</span> &nbsp; <b>Balance: </b><span id="fdBal">${money(due)}</span></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Back</button>
+        <button class="btn green" id="fdDeliverBtn">Mark Delivered</button></div>`, () => {
+      const payRows = document.getElementById("fdPayRows");
+      function recalc() {
+        let paid = 0;
+        payRows.querySelectorAll(".payAmount").forEach(i => paid += parseFloat(i.value) || 0);
+        document.getElementById("fdPaid").textContent = money(paid);
+        document.getElementById("fdBal").textContent = money(Math.max(0, due - paid));
+      }
+      function addRow(amount = "") {
+        const row = document.createElement("div");
+        row.className = "pay-row";
+        row.innerHTML = `<select class="payMethod">
+            <option>Cash</option><option>GCash</option><option>Bank Transfer</option><option>Maya</option><option>Cheque</option><option>Other</option>
+          </select>
+          <input type="number" class="payAmount" placeholder="Amount" value="${amount}" min="0">
+          <input type="text" class="payRef" placeholder="Ref #" style="width:90px">
+          <button class="btn small danger" type="button">&times;</button>`;
+        row.querySelector("button").addEventListener("click", () => { row.remove(); recalc(); });
+        row.querySelector(".payAmount").addEventListener("input", recalc);
+        payRows.appendChild(row); recalc();
+      }
+      document.getElementById("fdAddPay").addEventListener("click", () => addRow());
+      document.getElementById("fdWht").addEventListener("change", e => {
+        const prev = due;
+        due = e.target.checked ? wht(o.total) : o.total;
+        document.getElementById("fdDue").textContent = money(due);
+        const amts = payRows.querySelectorAll(".payAmount");
+        if (amts.length === 1 && Math.abs((parseFloat(amts[0].value) || 0) - prev) < 0.005) amts[0].value = due;
+        recalc();
+      });
+      if (o.sale_type === "CASH") addRow(due);
+      document.getElementById("fdDeliverBtn").addEventListener("click", async () => {
+        const payments = [...payRows.querySelectorAll(".pay-row")].map(r => ({
+          method: r.querySelector(".payMethod").value,
+          amount: parseFloat(r.querySelector(".payAmount").value) || 0,
+          reference: r.querySelector(".payRef").value,
+        })).filter(p => p.amount > 0);
+        try {
+          const result = await api(`/pending-sales/${id}/deliver`, { method: "POST", body: {
+            sale_type: document.getElementById("fdType").value,
+            withholding_tax: document.getElementById("fdWht").checked, payments } });
+          closeModal();
+          toast(`Delivered: sale ${result.sale.sale_no} recorded`, "success");
+          if (result.sale.sale_type === "CREDIT") printDeliveryReceipt(result);
+          else printReceipt(result);
+          load();
+        } catch (e) {}
+      });
+    });
+  };
+  load();
 }
 
 // Delivery Receipt for credit / terms sales: letter-size page with two
@@ -2145,6 +2357,7 @@ async function renderEndOfDay(c) {
           ${eodReconcileHtml(s)}
         </div>
       </div>
+      ${eodForDeliveryHtml(d.for_delivery)}
       <div class="card" style="margin-top:16px">
         <h3 style="margin-top:0">Products Sold</h3>
         <div class="table-wrap"><table><thead><tr><th>Product</th><th>Type</th><th>Qty</th><th>Amount</th></tr></thead><tbody>
@@ -2178,6 +2391,28 @@ async function renderEndOfDay(c) {
   load();
 }
 
+// For Delivery orders aren't in the sales until delivered; this block shows
+// how the day's orders tie to what actually went out.
+function eodForDeliveryHtml(fd, print) {
+  if (!fd || !(fd.taken.count || fd.delivered.count || fd.open.count)) return "";
+  const rows = [
+    [`Orders taken for delivery (${fd.taken.count})`, fd.taken.total],
+    [`Delivered &amp; counted in sales above (${fd.delivered.count})`, fd.delivered.total],
+    [`Still not delivered, not in sales (${fd.open.count})`, fd.open.total],
+  ];
+  const list = fd.open_list.map(o => `${esc(o.pending_no)} &middot; ${esc(o.customer_name || "Walk-in")} &middot; ${money(o.total)}`).join("<br>");
+  if (print) return `<h4>For Delivery</h4>
+    <table style="width:100%;border-collapse:collapse" border="1" cellpadding="4">
+      ${rows.map(r => `<tr><td>${r[0]}</td><td style="text-align:right">${money(r[1])}</td></tr>`).join("")}
+    </table>${list ? `<div style="font-size:11px;margin-top:4px">${list}</div>` : ""}`;
+  return `<div class="card" style="margin-top:16px">
+      <h3 style="margin-top:0">For Delivery</h3>
+      <p style="color:var(--muted);font-size:12.5px;margin-top:0">Orders taken for delivery are counted in sales on the day they are marked delivered.</p>
+      ${rows.map(r => `<div class="cart-total-row"><span>${r[0]}</span><span>${money(r[1])}</span></div>`).join("")}
+      ${list ? `<div style="font-size:12.5px;color:var(--muted);margin-top:8px">${list}</div>` : ""}
+    </div>`;
+}
+
 const eodItemQty = d => d.items.reduce((a, i) => a + (i.qty || 0), 0);
 const eodItemAmount = d => d.items.reduce((a, i) => a + (i.amount || 0), 0);
 
@@ -2204,6 +2439,7 @@ function printEndOfDay(d) {
       ${row(`Voided sales (${s.voided_count})`, money(s.voided_total))}
     </table>
     ${eodReconcileHtml(s, true)}
+    ${eodForDeliveryHtml(d.for_delivery, true)}
     <h4>Products Sold</h4>
     <table style="width:100%;border-collapse:collapse" border="1" cellpadding="4">
       <tr><th align="left">Product</th><th align="left">Type</th><th align="right">Qty</th><th align="right">Amount</th></tr>

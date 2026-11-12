@@ -446,6 +446,34 @@ CREATE TABLE IF NOT EXISTS incident_report_attachments (
     uploaded_by INTEGER REFERENCES users(id),
     uploaded_at TEXT DEFAULT (datetime('now'))
 );
+
+-- POS sales entered "For Delivery": the order is taken now (prices locked)
+-- but nothing moves until it is delivered. Marking it delivered records the
+-- real sale on that day (stock out, payments, receivable), so the End of Day
+-- report counts it on the day it actually went out.
+CREATE TABLE IF NOT EXISTS pending_sales (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pending_no TEXT UNIQUE NOT NULL,
+    ts TEXT DEFAULT (datetime('now')),
+    location_id INTEGER NOT NULL REFERENCES locations(id),
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    customer_id INTEGER REFERENCES customers(id),
+    walkin_name TEXT,
+    sale_type TEXT NOT NULL DEFAULT 'CASH' CHECK(sale_type IN ('CASH','CREDIT')),
+    withholding_tax INTEGER NOT NULL DEFAULT 0,
+    payload TEXT NOT NULL,
+    total REAL NOT NULL DEFAULT 0,
+    amount_due REAL NOT NULL DEFAULT 0,
+    delivery_address TEXT,
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','DELIVERED','CANCELLED')),
+    sale_id INTEGER REFERENCES sales(id),
+    delivered_at TEXT,
+    delivered_by INTEGER REFERENCES users(id),
+    cancelled_at TEXT,
+    cancelled_by INTEGER REFERENCES users(id),
+    cancel_reason TEXT
+);
 """
 
 

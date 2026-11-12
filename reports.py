@@ -264,6 +264,17 @@ def _eod_title(data):
     return f"End of Day Report — {data['date']}", sub
 
 
+def _eod_for_delivery_rows(data):
+    fd = data.get("for_delivery")
+    if not fd or not (fd["taken"]["count"] or fd["delivered"]["count"] or fd["open"]["count"]):
+        return []
+    rows = [(f"Orders taken for delivery ({fd['taken']['count']})", fd["taken"]["total"]),
+            (f"Delivered & counted in sales ({fd['delivered']['count']})", fd["delivered"]["total"]),
+            (f"Still not delivered, not in sales ({fd['open']['count']})", fd["open"]["total"])]
+    rows += [(f"  {o['pending_no']} - {(o['customer_name'] or 'Walk-in')[:30]}", o["total"]) for o in fd["open_list"]]
+    return rows
+
+
 def eod_pdf_response(data, filename):
     """Attendant cash-up: totals by payment method, sales summary, items sold,
     and the full list of payments received, with a signature block."""
@@ -320,6 +331,11 @@ def eod_pdf_response(data, filename):
             summary.append(["  + Paid above the amount due on cash sales", m(s["cash_overpaid"])])
         summary.append(["= POS Sales received (Collections)", m(s["paid_at_sale"])])
     flow.append(styled(summary, [300, 120]))
+
+    fd_rows = _eod_for_delivery_rows(data)
+    if fd_rows:
+        flow.append(Paragraph("For Delivery (counted in sales on the day delivered)", h3))
+        flow.append(styled([["", "Amount"]] + [[a, m(b)] for a, b in fd_rows], [300, 120]))
 
     if data["items"]:
         flow.append(Paragraph("Products Sold", h3))
@@ -388,6 +404,12 @@ def eod_xlsx_response(data, filename):
                        ("Charged to accounts (unpaid)", s["charged_to_accounts"]),
                        ("Discounts given", s["discount"]), (f"Voided sales ({s['voided_count']})", s["voided_total"])]:
         ws.append([label, val])
+    fd_rows = _eod_for_delivery_rows(data)
+    if fd_rows:
+        ws.append([])
+        header(ws, ["For Delivery (counted in sales on the day delivered)", "Amount"])
+        for label, val in fd_rows:
+            ws.append([label, val])
     for col, width in zip("ABCDE", (32, 12, 14, 16, 14)):
         ws.column_dimensions[col].width = width
 
