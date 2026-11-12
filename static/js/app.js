@@ -831,29 +831,207 @@ function printDeliveryReceipt(result) {
 // ================================================================== SALES
 // Generate Billing (Commercial 50kg deliveries) is for Accounting only (+ Admin).
 const canCommercialBilling = () => isAdminLike() || state.user.role === "ACCOUNTING";
+// Operation Head (and Admin) can adjust a completed sale.
+const canEditSale = () => isAdminLike();
+const salesView = { q: "", from: "", to: "", status: "", order: "newest", page: 1, pageSize: 100 };
 async function renderSales(c) {
-  c.innerHTML = "Loading...";
-  const sales = await api("/sales");
+  const v = salesView;
+  c.innerHTML = `<div class="card" style="margin-bottom:12px">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input type="search" id="salesQ" placeholder="Search sale #, DR # or customer name..." value="${esc(v.q)}" style="flex:1;min-width:220px">
+      <label style="font-size:13px;color:var(--muted)">From</label><input type="date" id="salesFrom" value="${esc(v.from)}">
+      <label style="font-size:13px;color:var(--muted)">to</label><input type="date" id="salesTo" value="${esc(v.to)}">
+      <select id="salesStatus"><option value="">All statuses</option><option value="COMPLETED">Completed</option><option value="VOIDED">Voided</option></select>
+      <select id="salesOrder"><option value="newest">Newest first</option><option value="oldest">Oldest first (from the first sale)</option></select>
+      <select id="salesPageSize"><option>50</option><option>100</option><option>250</option><option>500</option></select>
+      <button class="btn small" id="salesClear" type="button">Clear</button>
+    </div>
+  </div>
+  <div id="salesSummary" style="font-size:13px;color:var(--muted);margin-bottom:8px"></div>
+  <div id="salesTable">Loading...</div>
+  <div id="salesPager" style="display:flex;gap:8px;align-items:center;justify-content:center;margin-top:10px;flex-wrap:wrap"></div>`;
+  document.getElementById("salesStatus").value = v.status;
+  document.getElementById("salesOrder").value = v.order;
+  document.getElementById("salesPageSize").value = String(v.pageSize);
+  const reload = (resetPage = true) => { if (resetPage) v.page = 1; loadSalesPage(); };
+  let t;
+  document.getElementById("salesQ").addEventListener("input", (e) => { clearTimeout(t); t = setTimeout(() => { v.q = e.target.value.trim(); reload(); }, 300); });
+  [["salesFrom", "from"], ["salesTo", "to"], ["salesStatus", "status"], ["salesOrder", "order"]].forEach(([id, k]) =>
+    document.getElementById(id).addEventListener("change", (e) => { v[k] = e.target.value; reload(); }));
+  document.getElementById("salesPageSize").addEventListener("change", (e) => { v.pageSize = parseInt(e.target.value) || 100; reload(); });
+  document.getElementById("salesClear").addEventListener("click", () => {
+    Object.assign(v, { q: "", from: "", to: "", status: "", order: "newest", page: 1 });
+    renderSales(c);
+  });
+  await loadSalesPage();
+}
+async function loadSalesPage() {
+  const v = salesView;
+  const qs = new URLSearchParams({ page: v.page, page_size: v.pageSize, order: v.order });
+  if (v.q) qs.set("q", v.q);
+  if (v.from) qs.set("from", v.from);
+  if (v.to) qs.set("to", v.to);
+  if (v.status) qs.set("status", v.status);
+  let data;
+  try { data = await api("/sales?" + qs.toString()); } catch (e) { return; }
+  const tableEl = document.getElementById("salesTable");
+  if (!tableEl) return;
+  const sales = data.rows;
   const canGenBill = canCommercialBilling();
-  c.innerHTML = `<div class="table-wrap"><table><thead><tr>
+  const first = data.total ? (data.page - 1) * data.page_size + 1 : 0;
+  document.getElementById("salesSummary").innerHTML = data.total
+    ? `Showing <b>${first}–${first + sales.length - 1}</b> of <b>${data.total}</b> sale(s)${v.q ? ` matching “${esc(v.q)}”` : ""} &middot; completed total ${money(data.total_amount)}`
+    : "";
+  tableEl.innerHTML = `<div class="table-wrap"><table><thead><tr>
     <th>Sale #</th><th>Date</th><th>Location</th><th>Cashier</th><th>Customer</th><th>Type</th><th>Total</th><th>Balance</th><th>Status</th><th></th>
   </tr></thead><tbody>
-    ${sales.map(s => `<tr>
-      <td>${s.sale_no}</td><td>${s.ts}</td><td>${esc(s.location_name)}</td><td>${esc(s.cashier_name)}</td>
-      <td>${esc(s.customer_name || "Walk-in")}</td>
+    ${sales.length ? sales.map(s => `<tr>
+      <td>${esc(s.sale_no)}${s.dr_no ? `<br><span style="font-size:11.5px;color:var(--muted)">${esc(s.dr_no)}</span>` : ""}</td><td>${s.ts}</td><td>${esc(s.location_name)}</td><td>${esc(s.cashier_name)}</td>
+      <td>${s.customer_id ? esc(s.customer_name) : `${esc(s.customer_name || "Walk-in")} <span class="badge gray">walk-in</span>`}</td>
       <td><span class="badge ${s.sale_type === 'CASH' ? 'green' : 'warn'}">${s.sale_type}</span></td>
       <td>${money(s.total)}</td><td>${money(s.balance)}</td>
-      <td><span class="badge ${s.status === 'VOIDED' ? 'danger' : 'blue'}">${s.status}</span></td>
+      <td><span class="badge ${s.status === 'VOIDED' ? 'danger' : 'blue'}">${s.status}</span>
+        ${s.edited_at ? `<br><span class="badge gray" title="Adjusted ${esc(s.edited_at)}${s.edited_by_name ? " by " + esc(s.edited_by_name) : ""}">ADJUSTED</span>` : ""}</td>
       <td style="display:flex;gap:6px">
         <button class="btn small" onclick="viewSale(${s.id})">View</button>
         ${s.sale_type === 'CREDIT' ? `<button class="btn small green" onclick="printSaleDR(${s.id})" title="Print Delivery Receipt">DR</button>` : ""}
         ${s.billing_id ? `<span class="badge green" title="Billed ${money(Number((s.billing_ref || "|0").split("|")[1]))}">Billed ${esc((s.billing_ref || "").split("|")[0])}</span>`
           : canGenBill && s.bill_later_qty > 0 && s.status === 'COMPLETED' ? `<button class="btn small blue" onclick="openSaleBilling(${s.id})" title="50kg commercial delivery — bill the gas">Generate Billing</button>` : ""}
+        ${canEditSale() && s.status === 'COMPLETED' && !s.billing_id ? `<button class="btn small" onclick="openEditSale(${s.id})" title="Adjust items, prices or customer">Edit</button>` : ""}
         ${(isAdminLike() || state.user.role === 'SUPERVISOR') && s.status !== 'VOIDED' ? `<button class="btn small danger" onclick="voidSale(${s.id})">Void</button>` : ""}
       </td>
-    </tr>`).join("")}
+    </tr>`).join("") : `<tr><td colspan="10" style="color:var(--muted)">No sales found.</td></tr>`}
   </tbody></table></div>`;
+  const pager = document.getElementById("salesPager");
+  pager.innerHTML = data.pages > 1 ? `
+    <button class="btn small" id="spFirst" ${data.page <= 1 ? "disabled" : ""}>&laquo; First</button>
+    <button class="btn small" id="spPrev" ${data.page <= 1 ? "disabled" : ""}>&lsaquo; Prev</button>
+    <span style="font-size:13px">Page <input type="number" id="spPage" min="1" max="${data.pages}" value="${data.page}" style="width:70px"> of ${data.pages}</span>
+    <button class="btn small" id="spNext" ${data.page >= data.pages ? "disabled" : ""}>Next &rsaquo;</button>
+    <button class="btn small" id="spLast" ${data.page >= data.pages ? "disabled" : ""}>Last &raquo;</button>` : "";
+  const go = (p) => { v.page = Math.min(Math.max(1, p), data.pages); loadSalesPage(); };
+  if (data.pages > 1) {
+    document.getElementById("spFirst").onclick = () => go(1);
+    document.getElementById("spPrev").onclick = () => go(data.page - 1);
+    document.getElementById("spNext").onclick = () => go(data.page + 1);
+    document.getElementById("spLast").onclick = () => go(data.pages);
+    document.getElementById("spPage").onchange = (e) => go(parseInt(e.target.value) || 1);
+  }
 }
+// Operation Head / Admin: adjust a completed sale — items, qty, unit price,
+// discount, customer and notes. Stock and the receivable follow the change.
+window.openEditSale = async (saleId) => {
+  let detail, customers;
+  try { [detail, customers] = await Promise.all([api(`/sales/${saleId}`), api("/customers")]); } catch (e) { return; }
+  const { sale, items } = detail;
+  const isCredit = sale.sale_type === "CREDIT";
+  const prodOpts = (sel, selName) => {
+    const list = state.products.filter(p => p.active !== 0 || p.id === sel);
+    const missing = sel && !list.some(p => p.id === sel) ? `<option value="${sel}" selected>${esc(selName || "Product #" + sel)}</option>` : "";
+    return missing + list.map(p => `<option value="${p.id}" ${p.id === sel ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+  };
+  // Commercial account on credit: 50kg gas is billed later, so its line price is only the deposit / swap fee.
+  const is50 = p => /(^|[^0-9.])50\s*-?\s*kg/i.test(`${p.name || ""} ${p.sku || ""}`);
+  const billLater = (p) => {
+    const cu = customers.find(x => x.id === parseInt(document.getElementById("esCust").value));
+    return isCredit && cu && (cu.category || "").trim().toLowerCase() === "commercial" && is50(p);
+  };
+  const custOpts = `${isCredit ? "" : `<option value="">Walk-in (no account)</option>`}` + customers
+    .filter(cu => cu.status === "ACTIVE" || cu.id === sale.customer_id)
+    .map(cu => `<option value="${cu.id}" ${cu.id === sale.customer_id ? "selected" : ""}>${esc(cu.name)} (${esc(cu.account_no)})</option>`).join("");
+  openModal(`Edit Sale ${esc(sale.sale_no)}`, `
+    <p style="font-size:12.5px;color:var(--muted);margin-top:0">${esc(sale.ts)} &middot; ${esc(sale.location_name)} &middot; ${sale.sale_type}
+      &middot; paid so far <b>${money(sale.paid)}</b>. Changing items or quantities moves stock (and empties) for you; payments are not changed.</p>
+    <div class="field"><label>Customer</label><select id="esCust">${custOpts}</select></div>
+    <div class="field" id="esWalkinWrap"><label>Walk-in name (optional)</label><input id="esWalkin" value="${esc(sale.walkin_name || "")}"></div>
+    <div class="field"><label>Items</label>
+      <div style="display:flex;gap:6px;font-size:11.5px;color:var(--muted);font-weight:600">
+        <span style="flex:2.2">Product</span><span style="flex:1.1">Mode</span><span style="width:64px">Qty</span>
+        <span style="flex:1">Unit price</span><span style="flex:1">Discount</span><span style="flex:1.2">Swap brand</span><span style="width:30px"></span></div>
+      <div id="esRows"></div>
+      <button class="btn small" id="esAdd" type="button">+ Add Item</button>
+    </div>
+    <label style="font-size:13px;display:flex;gap:6px;align-items:center;margin-bottom:10px"><input type="checkbox" id="esWht" ${sale.withholding_tax > 0 ? "checked" : ""}> Less 1% withholding tax</label>
+    <div class="field"><label>Notes</label><input id="esNotes" value="${esc(sale.notes || "")}"></div>
+    <div class="field"><label>Reason for the adjustment (required, kept in the Audit Log)</label><input id="esReason" placeholder="e.g. wrong price entered, wrong customer"></div>
+    <div class="field" id="esSummary" style="background:var(--bg);padding:10px;border-radius:8px;font-size:13.5px"></div>
+    <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="esSave">Save Adjustment</button></div>
+  `, () => {
+    document.querySelector("#modalRoot .modal").style.width = "900px";
+    const rowsEl = document.getElementById("esRows");
+    const custSel = document.getElementById("esCust");
+    const syncWalkin = () => { document.getElementById("esWalkinWrap").style.display = custSel.value ? "none" : ""; };
+    custSel.addEventListener("change", syncWalkin); syncWalkin();
+    const recalc = () => {
+      let sub = 0, disc = 0;
+      rowsEl.querySelectorAll(".pay-row").forEach(r => {
+        const q = parseInt(r.querySelector(".esQty").value) || 0, pr = parseFloat(r.querySelector(".esPrice").value) || 0;
+        sub += q * pr; disc += parseFloat(r.querySelector(".esDisc").value) || 0;
+      });
+      const total = sub - disc;
+      const wht = document.getElementById("esWht").checked ? Math.round(total / 1.12 * 0.01 * 100) / 100 : 0;
+      const due = total - wht, bal = due - sale.paid;
+      document.getElementById("esSummary").innerHTML = `
+        Total: <b>${money(total)}</b> <span style="color:var(--muted)">(was ${money(sale.total)})</span>${wht ? ` &middot; less WHT ${money(wht)} = due <b>${money(due)}</b>` : ""}<br>
+        Paid: ${money(sale.paid)} &middot; New balance: <b style="color:${bal > 0.009 && !isCredit ? "var(--danger)" : "inherit"}">${money(bal)}</b>
+        ${!isCredit && bal > 0.009 ? `<br><span style="color:var(--danger)">A cash sale can't be left unpaid — lower the amount or ring up the difference as a new sale.</span>` : ""}
+        ${!isCredit && bal < -0.009 ? `<br><span style="color:var(--muted)">Refund / change due to the customer: ${money(-bal)}</span>` : ""}`;
+    };
+    const addRow = (it = {}) => {
+      const row = document.createElement("div");
+      row.className = "pay-row";
+      row.dataset.discountId = it.discount_id || "";
+      row.dataset.discountName = it.discount_name || "";
+      row.innerHTML = `<select class="esProd" style="flex:2.2;min-width:0;width:auto">${prodOpts(it.product_id, it.product_name)}</select>
+        <select class="esMode" style="flex:1.1;min-width:0;width:auto">
+          ${["REFILL", "DEPOSIT", "SWAP"].map(m => `<option ${m === (it.sale_mode || "REFILL") ? "selected" : ""}>${m}</option>`).join("")}</select>
+        <input type="number" class="esQty" min="1" step="1" value="${it.qty || 1}" style="width:64px;flex:none">
+        <input type="number" class="esPrice" min="0" step="0.01" value="${it.price ?? ""}" style="flex:1;min-width:0">
+        <input type="number" class="esDisc" min="0" step="0.01" value="${it.discount_amount || 0}" style="flex:1;min-width:0">
+        <input type="text" class="esBrand" placeholder="brand" value="${esc(it.swap_brand || "")}" style="flex:1.2;min-width:0">
+        <button class="btn small danger" type="button">&times;</button>`;
+      const prodSel = row.querySelector(".esProd"), modeSel = row.querySelector(".esMode"), priceIn = row.querySelector(".esPrice");
+      const defaultPrice = () => {
+        const p = state.products.find(x => x.id === parseInt(prodSel.value)) || {};
+        priceIn.value = ((billLater(p) ? 0 : Number(p.price || 0)) + (modeSel.value === "DEPOSIT" ? Number(p.deposit_price || 0) : 0)).toFixed(2);
+      };
+      if (it.price === undefined) defaultPrice();
+      prodSel.addEventListener("change", () => { defaultPrice(); recalc(); });
+      modeSel.addEventListener("change", () => { defaultPrice(); recalc(); });
+      row.querySelectorAll("input").forEach(i => i.addEventListener("input", recalc));
+      row.querySelector("button").addEventListener("click", () => { row.remove(); recalc(); });
+      rowsEl.appendChild(row);
+    };
+    items.forEach(addRow);
+    document.getElementById("esAdd").addEventListener("click", () => { addRow(); recalc(); });
+    document.getElementById("esWht").addEventListener("change", recalc);
+    recalc();
+    document.getElementById("esSave").addEventListener("click", async (ev) => {
+      const body = {
+        customer_id: custSel.value ? parseInt(custSel.value) : null,
+        walkin_name: document.getElementById("esWalkin").value,
+        notes: document.getElementById("esNotes").value,
+        reason: document.getElementById("esReason").value.trim(),
+        withholding_tax: document.getElementById("esWht").checked,
+        items: [...rowsEl.querySelectorAll(".pay-row")].map(r => ({
+          product_id: parseInt(r.querySelector(".esProd").value), sale_mode: r.querySelector(".esMode").value,
+          qty: r.querySelector(".esQty").value, price: r.querySelector(".esPrice").value,
+          discount_amount: r.querySelector(".esDisc").value, swap_brand: r.querySelector(".esBrand").value,
+          discount_id: r.dataset.discountId ? parseInt(r.dataset.discountId) : null, discount_name: r.dataset.discountName || null,
+        })),
+      };
+      if (!body.reason) { toast("Type the reason for the adjustment", "error"); return; }
+      if (!confirm(`Save the adjustment to ${sale.sale_no}?`)) return;
+      ev.target.disabled = true;
+      try {
+        await api(`/sales/${saleId}`, { method: "PUT", body });
+        closeModal(); toast(`${sale.sale_no} adjusted`, "success");
+        loadSalesPage();
+      } catch (e) { ev.target.disabled = false; }
+    });
+  });
+};
 // Accounting: bill a Commercial account's 50kg delivery from its POS sale.
 // Delivered kg (from the sale) less the residual of the cylinders pulled
 // out, at the account's rate. This is a receivable, not a new sale.
@@ -921,7 +1099,7 @@ window.openSaleBilling = async (saleId) => {
           body: { pullouts, notes: document.getElementById("sbNotes").value } });
         closeModal();
         toast(`Billed ${r.billable_kg} kg = ${money(r.billed_amount)} (${r.delivery_no})`, "success");
-        renderSales(document.getElementById("content"));
+        loadSalesPage();
       } catch (e) { ev.target.disabled = false; }
     });
   });
@@ -931,7 +1109,7 @@ window.printSaleDR = async (id) => {
 };
 window.voidSale = async (id) => {
   if (!confirm("Void this sale? This will reverse the inventory and cannot be undone.")) return;
-  try { await api(`/sales/${id}/void`, { method: "POST" }); toast("Sale voided", "success"); renderSales(document.getElementById("content")); }
+  try { await api(`/sales/${id}/void`, { method: "POST" }); toast("Sale voided", "success"); loadSalesPage(); }
   catch (e) {}
 };
 window.viewSale = async (id) => {
@@ -941,7 +1119,8 @@ window.viewSale = async (id) => {
     <div class="field"><b>Date:</b> ${sale.ts} &nbsp; <b>Location:</b> ${esc(sale.location_name)}</div>
     <div class="field"><b>Cashier:</b> ${esc(sale.cashier_name)} &nbsp; <b>Customer:</b> ${esc(sale.customer_name || "Walk-in")}</div>
     <div class="field"><b>Status:</b> <span class="badge ${sale.status === 'VOIDED' ? 'danger' : 'blue'}">${sale.status}</span>
-      ${sale.dr_no ? ` &nbsp; <b>Delivery Receipt:</b> ${esc(sale.dr_no)}` : ""}</div>
+      ${sale.dr_no ? ` &nbsp; <b>Delivery Receipt:</b> ${esc(sale.dr_no)}` : ""}
+      ${sale.edited_at ? `<br><span style="font-size:12.5px;color:var(--muted)">Adjusted ${esc(sale.edited_at)}${sale.edited_by_name ? " by " + esc(sale.edited_by_name) : ""} (see Audit Log for the details)</span>` : ""}</div>
     <div class="table-wrap"><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Subtotal</th></tr></thead><tbody>
       ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}${i.sale_mode === 'SWAP' ? ` <span class="badge blue">SWAP</span><br><span style="font-size:12px">from ${esc(i.swap_brand)}${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : ""}</span>` : ''}${i.discount_amount > 0 ? `<br><span style="font-size:12px;color:var(--green-dark)">${esc(i.discount_name)} &minus;${money(i.discount_amount)}</span>` : ""}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
     </tbody></table></div>
@@ -1263,7 +1442,9 @@ window.openCustomerLedger = async (cid) => {
     const body = document.getElementById("modalBody");
     if (!body) return;
     body.querySelector("#ledgerContent").innerHTML = `
-      <div class="cart-total-row"><span>Beginning Balance</span><span>${money(data.beginning_balance)}</span></div>
+      <div class="cart-total-row"><span><b>Beginning Balance</b></span><span><b>${money(data.beginning_balance)}</b></span></div>
+      ${data.previous_arrears || data.balance_forward ? `<div style="font-size:12.5px;color:var(--muted);padding:0 0 4px 12px">
+        Previous arrears ${money(data.previous_arrears)}${data.balance_forward ? ` &middot; balance forward (before From) ${money(data.balance_forward)}` : ""}</div>` : ""}
       <div class="table-wrap" style="margin:8px 0"><table><thead><tr><th>Date</th><th>Type</th><th>Reference</th><th>Charges</th><th>Payments</th><th>Balance</th></tr></thead><tbody>
         ${data.entries.length ? data.entries.map(e => `<tr><td>${e.date}</td>
           <td><span class="badge ${e.type === 'PAYMENT' ? 'green' : 'warn'}">${e.type}</span></td><td>${esc(e.ref)}</td>
@@ -2057,13 +2238,14 @@ async function renderCustomerGrowth(c) {
         <a class="btn small" id="cgPdf" href="#">Export PDF</a>
       </div>
       <p style="color:var(--muted);font-size:12.5px;margin:10px 0 0">Only <b>LPG cylinder</b> purchases (refill, deposit or swap) count.
-        Accessories and other items are ignored. Walk-in sales can't be tracked per customer, so they're shown only as a cylinder count.</p>
+        Accessories and other items are ignored. 50kg Commercial Billings count for their customer too. Walk-in sales can't be tracked per customer, so they're shown only as a cylinder count —
+        a sale rung up as walk-in by mistake can be linked to its customer with <b>Edit</b> in Sales (Operation Head / Admin).</p>
     </div>
     <div id="cgOut">Loading...</div>
     <div class="card" style="margin-top:16px;min-width:0">
       <h3 style="margin-top:0">Monthly LPG per Customer (kg)</h3>
       <p style="color:var(--muted);font-size:12.5px;margin:0 0 10px">Each customer's completed LPG cylinder orders per month, in kg
-        (cylinders × size, e.g. 3 × 11kg = 33 kg; 50kg weight-billed accounts use the actual kg billed). Voided sales are excluded.</p>
+        (cylinders × size, e.g. 3 × 11kg = 33 kg; 50kg weight-billed accounts use the actual kg billed; a 50kg delivery not yet billed counts as delivered until it is). Voided sales are excluded.</p>
       <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center">
         <label style="font-size:13px;color:var(--muted)">From</label><input type="month" id="kgFrom">
         <label style="font-size:13px;color:var(--muted)">to</label><input type="month" id="kgTo">
@@ -2150,14 +2332,14 @@ async function renderCustomerGrowth(c) {
 
       <div class="grid grid-2" style="margin-top:16px">
         <div class="card" style="min-width:0"><h3 style="margin-top:0">New Customers This ${unit === "week" ? "Week" : "Month"} (${d.new_customers.length})</h3>
-          <div class="table-wrap"><table><thead><tr><th>Customer</th><th>Category</th><th>First Purchase</th><th>Cylinders</th><th>Amount</th></tr></thead><tbody>
+          <div class="table-wrap scroll-box"><table><thead><tr><th>Customer</th><th>Category</th><th>First Purchase</th><th>Cylinders</th><th>Amount</th></tr></thead><tbody>
             ${d.new_customers.length ? d.new_customers.map(x => `<tr><td><b>${esc(x.name)}</b><br><span style="color:var(--muted);font-size:12px">${esc(x.account_no)}${x.phone ? " · " + esc(x.phone) : ""}</span></td>
               <td><span class="badge blue">${esc(x.category || "")}</span></td><td>${x.first_purchase}</td><td>${x.cylinders}</td><td>${money(x.amount)}</td></tr>`).join("")
               : `<tr><td colspan="5" style="color:var(--muted)">No new customers yet this ${unit}.</td></tr>`}
           </tbody></table></div></div>
         <div class="card" style="min-width:0"><h3 style="margin-top:0">Lapsed — Follow Up (${d.lapsed_customers.length})</h3>
           <p style="color:var(--muted);font-size:12.5px;margin:0 0 8px">Bought LPG last ${unit} but not yet this ${unit}.</p>
-          <div class="table-wrap"><table><thead><tr><th>Customer</th><th>Category</th><th>Last Purchase</th><th>Cyl. Last ${unit === "week" ? "Week" : "Month"}</th></tr></thead><tbody>
+          <div class="table-wrap scroll-box"><table><thead><tr><th>Customer</th><th>Category</th><th>Last Purchase</th><th>Cyl. Last ${unit === "week" ? "Week" : "Month"}</th></tr></thead><tbody>
             ${d.lapsed_customers.length ? d.lapsed_customers.map(x => `<tr><td><b>${esc(x.name)}</b><br><span style="color:var(--muted);font-size:12px">${esc(x.account_no)}${x.phone ? " · " + esc(x.phone) : ""}</span></td>
               <td><span class="badge blue">${esc(x.category || "")}</span></td><td>${x.last_purchase || ""}</td><td>${x.prev_cylinders}</td></tr>`).join("")
               : `<tr><td colspan="4" style="color:var(--muted)">Nobody lapsed.</td></tr>`}

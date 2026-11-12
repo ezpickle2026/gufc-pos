@@ -897,6 +897,14 @@ def migrate_schema():
         conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 
+    # 20. Completed sales can be adjusted (items, prices, customer) by the
+    #     Operation Head / Admin. Remember who last changed one, and when.
+    if not _column_exists(conn, "sales", "edited_at"):
+        conn.execute("ALTER TABLE sales ADD COLUMN edited_at TEXT")
+    if not _column_exists(conn, "sales", "edited_by"):
+        conn.execute("ALTER TABLE sales ADD COLUMN edited_by INTEGER REFERENCES users(id)")
+    conn.commit()
+
     conn.close()
 
 

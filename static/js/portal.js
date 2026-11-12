@@ -271,7 +271,8 @@ async function viewBilling(main) {
     document.getElementById("sPdf").href = "/api/portal/soa/export?" + qs();
     const d = await api("/soa?" + qs());
     document.getElementById("sOut").innerHTML = `
-      <p class="small">Beginning balance: <b>${money(d.beginning_balance)}</b></p>
+      <p class="small">Beginning balance: <b>${money(d.beginning_balance)}</b>${d.previous_arrears || d.balance_forward
+        ? ` <span class="muted">(previous arrears ${money(d.previous_arrears)}${d.balance_forward ? `, balance forward ${money(d.balance_forward)}` : ""})</span>` : ""}</p>
       <div class="table-wrap"><table><thead><tr><th>Date</th><th>Type</th><th>Reference</th><th class="right">Charges</th><th class="right">Payments</th><th class="right">Balance</th></tr></thead><tbody>
         ${d.entries.length ? d.entries.map(e => `<tr><td>${day(e.date)}</td><td>${esc(e.type)}</td><td>${esc(e.ref)}</td>
           <td class="right">${e.debit ? money(e.debit) : ""}</td><td class="right">${e.credit ? money(e.credit) : ""}</td><td class="right">${money(e.balance)}</td></tr>`).join("")

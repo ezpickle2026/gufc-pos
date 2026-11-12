@@ -138,3 +138,6 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase}
   /* Keep overlays out of the printout entirely */
   .modal-backdrop, .toast-wrap, .bottom-nav, .sidebar, .topbar{display:none !important}
 }
+/* Short list box with its own vertical scroll bar (e.g. New Customers This Month) */
+.table-wrap.scroll-box{max-height:260px;overflow-y:auto}
+.table-wrap.scroll-box thead th{position:sticky;top:0;background:#fff;z-index:1}
