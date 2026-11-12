@@ -32,6 +32,14 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Customer Portal: latest rate and rate movement.** Commercial accounts (and any customer with a 50kg
+  Commercial Billing) get a **My Rate** tab in the portal, and a rate card on Home. It shows the current rate
+  per kg (the account rate set in Customers → Rate, or the 50kg product's standard price per kg when none is set),
+  the last change (▲/▼ amount and %), the 12-month high / low and number of changes, the average rate billed this
+  month vs last month, a chart of the rate over the last 12 months with the rate on each billing, the full list of
+  rate changes, and the rate / kg / amount of each billing. Every change to an account rate or a product's price per
+  kg is now kept in `rate_history`; rate changes made before this update are taken from the Audit Log.
+
 - **Sales: search and full history.** Sales has a search bar (sale #, DR #, customer name / business /
   account #, walk-in name), date and status filters, and pages through **every** sale back to the first one
   (Newest first or Oldest first, 50–500 per page). It no longer stops at the latest 100.

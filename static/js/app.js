@@ -1257,7 +1257,8 @@ async function renderCustomers(c) {
     const rate = cu.commercial_rate;
     openModal(`Commercial Rate — ${esc(cu.name || "")}`, `
       <p style="font-size:13px;color:var(--muted);margin-top:0">Price per kg used automatically when this account is billed
-        (Generate Billing, DR / WIWO / Reading billing). Leave blank to use the product's default price per kg.</p>
+        (Generate Billing, DR / WIWO / Reading billing). Leave blank to use the product's default price per kg.
+        The customer sees the new rate and its movement in the Customer Portal (My Rate).</p>
       <div class="field"><label>Rate per kg</label><input type="number" step="0.01" min="0" id="crRate" value="${rate || ""}"></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
         <button class="btn green" id="crSave">Save</button></div>
