@@ -2110,12 +2110,6 @@ def adjust_swapped_empties():
     reason = (d.get("reason") or "").strip()
     if not location_id or not product_id or not brand or d.get("delta") is None:
         return jsonify(error="location_id, product_id, brand and delta are required"), 400
-    try:
-        delta = int(d.get("delta"))
-    except (TypeError, ValueError):
-        return jsonify(error="delta must be a whole number (positive to add, negative to remove)"), 400
-    if delta == 0:
-        return jsonify(error="delta cannot be zero"), 400
     if not reason:
         return jsonify(error="A reason is required for adjustments"), 400
     conn = get_db()
@@ -2124,10 +2118,16 @@ def adjust_swapped_empties():
         conn.close()
         return jsonify(error=problem), 400
     try:
+        row = conn.execute("SELECT quantity FROM swapped_empty_inventory WHERE location_id=? AND product_id=? AND brand=?",
+                           (location_id, product_id, brand)).fetchone()
+        delta, target = _parse_adjust_delta(d.get("delta"), row["quantity"] if row else 0)
         if delta > 0:
             add_swapped_empties(conn, location_id, product_id, brand, delta, "ADJUSTMENT", "MANUAL-ADMIN", reason)
         else:
             remove_swapped_empties(conn, location_id, product_id, brand, -delta, "ADJUSTMENT", "MANUAL-ADMIN", reason)
+        if target is not None:
+            conn.execute("UPDATE swapped_empty_inventory SET quantity=? WHERE location_id=? AND product_id=? AND brand=?",
+                         (target, location_id, product_id, brand))
         audit(conn, "ADJUST", "SWAPPED EMPTIES", f"{location_id}:{product_id}:{brand}", f"delta={delta} reason={reason}")
         conn.commit()
     except ValueError as e:
@@ -2136,6 +2136,32 @@ def adjust_swapped_empties():
         return jsonify(error=str(e)), 400
     conn.close()
     return jsonify(ok=True)
+
+
+def _parse_adjust_delta(raw, current):
+    """Quantity change for a manual adjustment. Normally a whole number; a
+    decimal is accepted only when it turns a fractional count (left behind by
+    an old kg-based line) back into a whole one, e.g. 55.9 -> 55 with -0.9.
+    Returns (delta, target) where target is the whole count to store exactly,
+    or None for an ordinary whole-number change."""
+    try:
+        delta = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError("delta must be a number (positive to add, negative to remove)")
+    if abs(delta) < 1e-9:
+        raise ValueError("delta cannot be zero")
+    current = float(current or 0)
+    if float(current).is_integer():
+        if not float(delta).is_integer():
+            raise ValueError("delta must be a whole number (positive to add, negative to remove)")
+        return int(delta), None
+    target = current + delta
+    if abs(target - round(target)) > 0.001:
+        raise ValueError(f"The count here is {round(current, 3):g}. Use a change that lands on a whole number "
+                         f"(e.g. {round(int(current) - current, 3):g} to make it {int(current)}, "
+                         f"or {round(int(current) + 1 - current, 3):g} to make it {int(current) + 1})")
+    target = int(round(target))
+    return round(target - current, 6), target
 
 
 def _check_location_product(conn, location_id, product_id):
@@ -2163,12 +2189,6 @@ def adjust_empty_cylinders():
     reason = (d.get("reason") or "").strip()
     if not location_id or not product_id or d.get("delta") is None:
         return jsonify(error="location_id, product_id and delta are required"), 400
-    try:
-        delta = int(d.get("delta"))
-    except (TypeError, ValueError):
-        return jsonify(error="delta must be a whole number (positive to add, negative to remove)"), 400
-    if delta == 0:
-        return jsonify(error="delta cannot be zero"), 400
     if not reason:
         return jsonify(error="A reason is required for empty cylinder adjustments"), 400
 
@@ -2178,10 +2198,17 @@ def adjust_empty_cylinders():
         conn.close()
         return jsonify(error=problem), 400
     try:
+        row = conn.execute("SELECT quantity FROM empty_cylinder_inventory WHERE location_id=? AND product_id=?",
+                           (location_id, product_id)).fetchone()
+        delta, target = _parse_adjust_delta(d.get("delta"), row["quantity"] if row else 0)
         if delta > 0:
             add_empty_cylinders(conn, location_id, product_id, delta, "ADJUSTMENT", "MANUAL-ADMIN", reason)
         else:
-            remove_empty_cylinders(conn, location_id, product_id, -delta, "ADJUSTMENT", "MANUAL-ADMIN", reason)
+            remove_empty_cylinders(conn, location_id, product_id, -delta, "ADJUSTMENT", "MANUAL-ADMIN", reason,
+                                   allow_negative=target is not None and target >= 0)
+        if target is not None:
+            conn.execute("UPDATE empty_cylinder_inventory SET quantity=? WHERE location_id=? AND product_id=?",
+                         (target, location_id, product_id))
         audit(conn, "ADJUST", "EMPTY CYLINDERS", f"{location_id}:{product_id}", f"delta={delta} reason={reason}")
         conn.commit()
     except ValueError as e:
@@ -2309,12 +2336,6 @@ def manual_inventory_adjust():
     allow_negative = bool(d.get("allow_negative", False))
     if not location_id or not product_id or delta is None:
         return jsonify(error="location_id, product_id and delta are required"), 400
-    try:
-        delta = int(delta)
-    except (TypeError, ValueError):
-        return jsonify(error="delta must be a whole number (positive to add, negative to remove)"), 400
-    if delta == 0:
-        return jsonify(error="delta cannot be zero"), 400
     if not reason:
         return jsonify(error="A reason is required for manual inventory adjustments"), 400
 
@@ -2324,8 +2345,14 @@ def manual_inventory_adjust():
         conn.close()
         return jsonify(error=problem), 400
     try:
+        row = conn.execute("SELECT quantity FROM inventory WHERE location_id=? AND product_id=?",
+                           (location_id, product_id)).fetchone()
+        delta, target = _parse_adjust_delta(delta, row["quantity"] if row else 0)
         adjust_inventory(conn, location_id, product_id, delta, "ADJUSTMENT", "MANUAL-ADMIN",
-                          notes=reason, allow_negative=allow_negative)
+                          notes=reason, allow_negative=allow_negative or (target is not None and target >= 0))
+        if target is not None:
+            conn.execute("UPDATE inventory SET quantity=? WHERE location_id=? AND product_id=?",
+                         (target, location_id, product_id))
         audit(conn, "ADJUST", "INVENTORY", f"{location_id}:{product_id}",
               f"delta={delta} reason={reason}")
         conn.commit()
@@ -3503,6 +3530,12 @@ def void_sale(sale_id):
     if sale["status"] == "VOIDED":
         conn.close()
         return jsonify(error="Already voided"), 400
+    if sale["is_billing"]:
+        # A billing's line is in kg, not cylinders: reversing it as stock
+        # would put fractional counts (e.g. 44.9) into inventory and empties.
+        conn.close()
+        return jsonify(error="This is a billing, not a sale — void it from "
+                             "50kg Commercial Billing > Void Billing"), 400
     billed = conn.execute("SELECT delivery_no FROM commercial_deliveries WHERE source_sale_id=? AND status!='CANCELLED'",
                           (sale_id,)).fetchone()
     if billed:
