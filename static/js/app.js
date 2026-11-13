@@ -2169,32 +2169,69 @@ async function renderInventory(c) {
 
 // ================================================================== INVENTORY LEDGER (admin)
 async function renderInventoryLedger(c) {
+  const PAGE = 100;
+  let offset = 0;
   c.innerHTML = `
-    <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
-      <select id="ledgerStock"><option value="FULL">Full Cylinders</option><option value="EMPTY">Empty Cylinders</option><option value="SWAPPED">Swapped Empties (other brands)</option></select>
-      <select id="ledgerLoc"><option value="">All Locations</option>${state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}</select>
-      <select id="ledgerProd"><option value="">All Products</option>${state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>
+    <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;align-items:flex-end">
+      <div><label style="font-size:11.5px;color:var(--muted)">Stock</label><select id="ledgerStock">
+        <option value="ALL">All (Full + Empty + Swapped)</option><option value="FULL">Full Cylinders</option>
+        <option value="EMPTY">Empty Cylinders</option><option value="SWAPPED">Swapped Empties (other brands)</option></select></div>
+      <div><label style="font-size:11.5px;color:var(--muted)">Location</label><select id="ledgerLoc"><option value="">All Locations</option>${state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}</select></div>
+      <div><label style="font-size:11.5px;color:var(--muted)">Product</label><select id="ledgerProd"><option value="">All Products</option>${state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select></div>
+      <div><label style="font-size:11.5px;color:var(--muted)">From</label><input type="date" id="ledgerFrom"></div>
+      <div><label style="font-size:11.5px;color:var(--muted)">To</label><input type="date" id="ledgerTo"></div>
+      <div><label style="font-size:11.5px;color:var(--muted)">Search</label><input type="text" id="ledgerQ" placeholder="Reference, notes, type, brand"></div>
+      <div><label style="font-size:11.5px;color:var(--muted)">Order</label><select id="ledgerOrder">
+        <option value="desc">Newest first</option><option value="asc">Oldest first (from the beginning)</option></select></div>
       <button class="btn" id="ledgerFilterBtn">Filter</button>
+      <a class="btn green" id="ledgerXlsx" href="#">Export Excel</a>
     </div>
-    <div id="ledgerTable">Loading...</div>`;
-  async function load() {
-    const loc = document.getElementById("ledgerLoc").value;
-    const prod = document.getElementById("ledgerProd").value;
-    const qs = new URLSearchParams();
-    qs.set("stock", document.getElementById("ledgerStock").value);
-    if (loc) qs.set("location_id", loc);
-    if (prod) qs.set("product_id", prod);
-    const rows = await api("/inventory/movements?" + qs.toString());
-    document.getElementById("ledgerTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
-      <th>Date</th><th>Location</th><th>Product</th><th>Change</th><th>Type</th><th>Reference</th><th>Notes</th>
-    </tr></thead><tbody>
-      ${rows.length ? rows.map(r => `<tr><td>${r.ts}</td><td>${esc(r.location_name)}</td><td>${r.brand ? `<b>${esc(r.brand)}</b> empty &middot; ` : ""}${esc(r.product_name)}</td>
-        <td style="color:${r.qty_change >= 0 ? 'var(--green-dark)' : 'var(--danger)'};font-weight:700">${r.qty_change >= 0 ? '+' : ''}${r.qty_change}</td>
-        <td><span class="badge blue">${esc(r.type)}</span></td><td>${esc(r.reference || "")}</td><td>${esc(r.notes || "")}</td></tr>`).join("")
-        : `<tr><td colspan="7" style="color:var(--muted)">No movements found.</td></tr>`}
-    </tbody></table></div>`;
+    <p style="color:var(--muted);font-size:12.5px;margin:0 0 10px">Balance = the count after that movement for that location / product (and brand, for swapped empties). Leave the dates blank to see every movement since the first one.</p>
+    <div id="ledgerTable">Loading...</div>
+    <div id="ledgerPager" style="display:flex;gap:8px;align-items:center;margin-top:10px"></div>`;
+  function qs(withPage) {
+    const q = new URLSearchParams();
+    q.set("stock", document.getElementById("ledgerStock").value);
+    const map = { location_id: "ledgerLoc", product_id: "ledgerProd", date_from: "ledgerFrom", date_to: "ledgerTo", q: "ledgerQ" };
+    for (const [k, id] of Object.entries(map)) { const v = document.getElementById(id).value.trim(); if (v) q.set(k, v); }
+    q.set("order", document.getElementById("ledgerOrder").value);
+    if (withPage) { q.set("limit", PAGE); q.set("offset", offset); }
+    return q.toString();
   }
-  document.getElementById("ledgerFilterBtn").addEventListener("click", load);
+  const stockBadge = { FULL: "green", EMPTY: "gray", SWAPPED: "warn" };
+  async function load() {
+    document.getElementById("ledgerXlsx").href = "/api/inventory/movements/export?" + qs(false);
+    const d = await api("/inventory/movements?" + qs(true));
+    const rows = d.rows;
+    document.getElementById("ledgerTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+      <th>Date</th><th>Stock</th><th>Location</th><th>Product</th><th>Change</th><th>Balance</th><th>Type</th><th>Reference</th><th>Notes</th><th>User</th>
+    </tr></thead><tbody>
+      ${rows.length ? rows.map(r => `<tr><td style="white-space:nowrap">${esc(r.ts)}</td>
+        <td><span class="badge ${stockBadge[r.stock] || "blue"}">${esc(r.stock_label)}</span></td>
+        <td>${esc(r.location_name)}</td><td>${r.brand ? `<b>${esc(r.brand)}</b> empty &middot; ` : ""}${esc(r.product_name)}</td>
+        <td style="color:${r.qty_change >= 0 ? 'var(--green-dark)' : 'var(--danger)'};font-weight:700">${r.qty_change >= 0 ? '+' : ''}${r.qty_change}</td>
+        <td style="font-weight:600${r.balance < 0 ? ';color:var(--danger)' : ''}">${r.balance}</td>
+        <td><span class="badge blue">${esc(r.type)}</span></td><td>${esc(r.reference || "")}</td><td>${esc(r.notes || "")}</td><td>${esc(r.user_name || "")}</td></tr>`).join("")
+        : `<tr><td colspan="10" style="color:var(--muted)">No movements found.</td></tr>`}
+    </tbody></table></div>`;
+    const from = d.total ? offset + 1 : 0, to = offset + rows.length;
+    document.getElementById("ledgerPager").innerHTML = `
+      <button class="btn small" id="ledgerFirst" ${offset === 0 ? "disabled" : ""}>&laquo; First</button>
+      <button class="btn small" id="ledgerPrev" ${offset === 0 ? "disabled" : ""}>&lsaquo; Prev</button>
+      <span style="font-size:13px;color:var(--muted)">${from}&ndash;${to} of ${d.total}</span>
+      <button class="btn small" id="ledgerNext" ${to >= d.total ? "disabled" : ""}>Next &rsaquo;</button>
+      <button class="btn small" id="ledgerLast" ${to >= d.total ? "disabled" : ""}>Last &raquo;</button>`;
+    const go = (o) => { offset = Math.max(0, o); load(); };
+    document.getElementById("ledgerFirst").onclick = () => go(0);
+    document.getElementById("ledgerPrev").onclick = () => go(offset - PAGE);
+    document.getElementById("ledgerNext").onclick = () => go(offset + PAGE);
+    document.getElementById("ledgerLast").onclick = () => go(Math.floor((d.total - 1) / PAGE) * PAGE);
+  }
+  const refilter = () => { offset = 0; load(); };
+  document.getElementById("ledgerFilterBtn").addEventListener("click", refilter);
+  ["ledgerStock", "ledgerLoc", "ledgerProd", "ledgerOrder", "ledgerFrom", "ledgerTo"].forEach(id =>
+    document.getElementById(id).addEventListener("change", refilter));
+  document.getElementById("ledgerQ").addEventListener("keydown", e => { if (e.key === "Enter") refilter(); });
   load();
 }
 
