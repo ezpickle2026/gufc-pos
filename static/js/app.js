@@ -1422,12 +1422,9 @@ window.openSaleBilling = async (saleId) => {
       ⚠ This customer already has 50kg Commercial Billing record(s) since this sale that aren't linked to a sale:
       ${d.possible_duplicates.map(x => `${esc(x.delivery_no)}${x.dr_ref ? " (DR " + esc(x.dr_ref) + ")" : ""} ${money(x.billed_amount)}`).join(", ")}.
       Make sure this delivery wasn't billed there already.</div>` : ""}
-    <div class="field"><label>Residual of the cylinders pulled out (kg)</label>
-      <p style="font-size:12px;color:var(--muted);margin:0 0 6px">Type the residual kg of each pulled-out cylinder (serial optional). It is deducted from the delivered kg.</p>
-      <div style="display:flex;gap:8px;font-size:11.5px;color:var(--muted);font-weight:600">
-        <span style="flex:1">Serial no.</span><span style="flex:1">Residual (kg)</span><span style="width:30px"></span></div>
-      <div id="sbRows"></div>
-      <button class="btn small" id="sbAdd" type="button">+ Add Pull-out</button>
+    <div class="field"><label>Total residual of the cylinders pulled out (kg)</label>
+      <p style="font-size:12px;color:var(--muted);margin:0 0 6px">Type the overall residual kg of all pulled-out cylinders. It is deducted from the delivered kg.</p>
+      <input type="number" step="0.01" min="0" id="sbResidual" placeholder="0.00">
     </div>
     <div class="field"><label>Notes</label><input id="sbNotes"></div>
     <div class="field" id="sbSummary" style="background:var(--bg);padding:10px;border-radius:8px;font-size:13.5px"></div>
@@ -1435,37 +1432,23 @@ window.openSaleBilling = async (saleId) => {
     <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
       <button class="btn green" id="sbSave" ${rate ? "" : "disabled"}>Generate Billing</button></div>
   `, () => {
-    const rowsEl = document.getElementById("sbRows");
+    const resEl = document.getElementById("sbResidual");
     const recalc = () => {
-      const rows = [...rowsEl.querySelectorAll(".pay-row")];
-      const residual = rows.reduce((t, r) => t + (parseFloat(r.querySelector(".sbRes").value) || 0), 0);
+      const residual = parseFloat(resEl.value) || 0;
       const billable = d.delivered_kg - residual;
       document.getElementById("sbSummary").innerHTML = `
         Delivered: <b>${d.delivered_kg.toFixed(2)} kg</b><br>
-        Less residual (${rows.length} pulled out): <b>${residual.toFixed(2)} kg</b><br>
+        Less residual: <b>${residual.toFixed(2)} kg</b><br>
         Billable: <b>${billable.toFixed(2)} kg</b> @ ${money(rate)}/kg = <b style="color:var(--green-dark)">${money(billable * rate)}</b>`;
     };
-    const addRow = () => {
-      const row = document.createElement("div");
-      row.className = "pay-row";
-      row.innerHTML = `<input type="text" class="sbSerial" placeholder="Serial no." style="flex:1;min-width:0">
-        <input type="number" step="0.01" min="0" class="sbRes" placeholder="Residual kg" style="flex:1;min-width:0">
-        <button class="btn small danger" type="button">&times;</button>`;
-      row.querySelector(".sbRes").addEventListener("input", recalc);
-      row.querySelector("button").addEventListener("click", () => { row.remove(); recalc(); });
-      rowsEl.appendChild(row);
-    };
-    for (let i = 0; i < d.delivered_qty; i++) addRow();
-    document.getElementById("sbAdd").addEventListener("click", () => { addRow(); recalc(); });
+    resEl.addEventListener("input", recalc);
     recalc();
+    setTimeout(() => resEl.focus(), 0);
     document.getElementById("sbSave").addEventListener("click", async (ev) => {
-      const pullouts = [...rowsEl.querySelectorAll(".pay-row")].map(r => ({
-        serial_no: r.querySelector(".sbSerial").value, residual_kg: r.querySelector(".sbRes").value,
-      })).filter(p => p.serial_no || p.residual_kg);
       ev.target.disabled = true;
       try {
         const r = await api(`/sales/${saleId}/commercial-billing`, { method: "POST",
-          body: { pullouts, notes: document.getElementById("sbNotes").value } });
+          body: { total_residual_kg: resEl.value, notes: document.getElementById("sbNotes").value } });
         closeModal();
         toast(`Billed ${r.billable_kg} kg = ${money(r.billed_amount)} (${r.delivery_no})`, "success");
         loadSalesPage();
