@@ -722,6 +722,8 @@ def delete_product(pid):
         # Past sales/ledgers still point at it, so hide it instead of deleting.
         conn.execute("UPDATE products SET active=0 WHERE id=?", (pid,))
         conn.execute("UPDATE discounts SET active=0 WHERE product_id=?", (pid,))
+        conn.execute("UPDATE promo_packages SET active=0 WHERE id IN "
+                     "(SELECT package_id FROM promo_package_items WHERE product_id=?)", (pid,))
         audit(conn, "ARCHIVE", "PRODUCTS", pid, prod["name"])
         conn.commit()
         conn.close()
@@ -730,6 +732,9 @@ def delete_product(pid):
     conn.execute("DELETE FROM empty_cylinder_inventory WHERE product_id=?", (pid,))
     conn.execute("DELETE FROM swapped_empty_inventory WHERE product_id=?", (pid,))
     conn.execute("DELETE FROM discounts WHERE product_id=?", (pid,))
+    conn.execute("UPDATE promo_packages SET active=0 WHERE id IN "
+                 "(SELECT package_id FROM promo_package_items WHERE product_id=?)", (pid,))
+    conn.execute("DELETE FROM promo_package_items WHERE product_id=?", (pid,))
     conn.execute("DELETE FROM products WHERE id=?", (pid,))
     audit(conn, "DELETE", "PRODUCTS", pid, prod["name"])
     conn.commit()
@@ -2424,7 +2429,7 @@ def adjust_inventory(conn, location_id, product_id, delta, mtype, reference, not
     current = row["quantity"] if row else 0
     new_qty = current + delta
     if new_qty < 0 and not allow_negative:
-        raise ValueError("Insufficient inventory")
+        raise ValueError(f"Insufficient inventory: only {current} {_product_name(conn, product_id)} in stock here")
     if row:
         conn.execute("UPDATE inventory SET quantity=? WHERE location_id=? AND product_id=?",
                      (new_qty, location_id, product_id))
@@ -2569,6 +2574,193 @@ def delete_discount(did):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- package promos
+# A package is several products sold together for one package price, e.g.
+# "11kg Refill + Stove" for 2,500. At the POS the cashier adds the package;
+# the sale records one line per product (each comes out of stock, empties /
+# deposits follow its mode) at the regular price, and the package savings
+# are shown as that line's discount under the package name.
+
+PACKAGE_MODES = ("REFILL", "DEPOSIT")
+
+
+def _package_components(conn, package_id):
+    return conn.execute(
+        """SELECT pi.product_id, pi.qty, pi.sale_mode, p.name product_name, p.price, p.deposit_price, p.active
+           FROM promo_package_items pi JOIN products p ON p.id=pi.product_id
+           WHERE pi.package_id=? ORDER BY pi.id""", (package_id,)).fetchall()
+
+
+def _component_unit_price(c):
+    return round(float(c["price"]) + (float(c["deposit_price"] or 0) if c["sale_mode"] == "DEPOSIT" else 0), 2)
+
+
+def _package_out(conn, pkg):
+    comps = [dict(c) | {"unit_price": _component_unit_price(c)} for c in _package_components(conn, pkg["id"])]
+    regular = round(sum(c["unit_price"] * c["qty"] for c in comps), 2)
+    return {**dict(pkg), "items": comps, "regular_price": regular, "savings": round(regular - pkg["price"], 2),
+            "live": _discount_is_live(pkg)}
+
+
+def _package_payload(conn, d):
+    name = (d.get("name") or "").strip()
+    if not name:
+        raise ValueError("Package name is required")
+    try:
+        price = round(float(d.get("price")), 2)
+    except (TypeError, ValueError):
+        raise ValueError("Package price must be a number")
+    if price <= 0:
+        raise ValueError("Package price must be greater than zero")
+    start = (d.get("start_date") or "").strip() or None
+    end = (d.get("end_date") or "").strip() or None
+    for v in (start, end):
+        if v:
+            datetime.strptime(v, "%Y-%m-%d")
+    if start and end and end < start:
+        raise ValueError("End date is before start date")
+    comps, seen = [], set()
+    regular = 0.0
+    for n, it in enumerate(d.get("items") or [], start=1):
+        prod = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (it.get("product_id"),)).fetchone()
+        if not prod:
+            raise ValueError(f"Item {n}: choose a product")
+        try:
+            qty = int(it.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty < 1:
+            raise ValueError(f"Item {n}: quantity must be at least 1")
+        mode = (it.get("sale_mode") or "REFILL").upper()
+        if mode not in PACKAGE_MODES:
+            raise ValueError(f"Item {n}: mode must be REFILL or DEPOSIT")
+        if (prod["id"], mode) in seen:
+            raise ValueError(f"{prod['name']} is listed twice — put the total quantity on one line")
+        seen.add((prod["id"], mode))
+        regular += (float(prod["price"]) + (float(prod["deposit_price"] or 0) if mode == "DEPOSIT" else 0)) * qty
+        comps.append((prod["id"], qty, mode))
+    if not comps:
+        raise ValueError("Add at least one product to the package")
+    if price > round(regular, 2) + 0.009:
+        raise ValueError(f"Package price ({price:,.2f}) is more than the regular price of its items ({regular:,.2f})")
+    active = 1 if d.get("active", True) in (True, 1, "1", "true") else 0
+    return (name, price, start, end, active, (d.get("notes") or "").strip()), comps
+
+
+@app.get("/api/packages")
+@login_required
+def list_packages():
+    """?live=1 returns only packages usable today (for the POS)."""
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM promo_packages ORDER BY active DESC, name").fetchall()
+    out = [_package_out(conn, r) for r in rows]
+    conn.close()
+    if request.args.get("live"):
+        out = [r for r in out if r["live"] and r["items"] and all(c["active"] for c in r["items"])]
+    return jsonify(out)
+
+
+def _save_package(pid=None):
+    conn = get_db()
+    try:
+        vals, comps = _package_payload(conn, request.get_json(force=True) or {})
+        if pid:
+            cur = conn.execute("UPDATE promo_packages SET name=?, price=?, start_date=?, end_date=?, active=?, notes=? "
+                               "WHERE id=?", vals + (pid,))
+            if not cur.rowcount:
+                conn.close()
+                return jsonify(error="Package not found"), 404
+            conn.execute("DELETE FROM promo_package_items WHERE package_id=?", (pid,))
+        else:
+            pid = conn.execute("INSERT INTO promo_packages (name, price, start_date, end_date, active, notes) "
+                               "VALUES (?,?,?,?,?,?)", vals).lastrowid
+        for product_id, qty, mode in comps:
+            conn.execute("INSERT INTO promo_package_items (package_id, product_id, qty, sale_mode) VALUES (?,?,?,?)",
+                         (pid, product_id, qty, mode))
+        audit(conn, "UPDATE" if request.method == "PUT" else "CREATE", "PACKAGES", pid,
+              f"{vals[0]} price={vals[1]:.2f} items=" + ", ".join(f"{q}x#{p} {m}" for p, q, m in comps))
+        conn.commit()
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(id=pid), (200 if request.method == "PUT" else 201)
+
+
+@app.post("/api/packages")
+@roles_required("ADMIN", "MANAGER")
+def create_package():
+    return _save_package()
+
+
+@app.put("/api/packages/<int:pid>")
+@roles_required("ADMIN", "MANAGER")
+def update_package(pid):
+    return _save_package(pid)
+
+
+@app.delete("/api/packages/<int:pid>")
+@roles_required("ADMIN", "MANAGER")
+def delete_package(pid):
+    conn = get_db()
+    row = conn.execute("SELECT name FROM promo_packages WHERE id=?", (pid,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Package not found"), 404
+    # Past sales keep their own copy of the package name and amounts.
+    conn.execute("DELETE FROM promo_package_items WHERE package_id=?", (pid,))
+    conn.execute("DELETE FROM promo_packages WHERE id=?", (pid,))
+    audit(conn, "DELETE", "PACKAGES", pid, row["name"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+def _expand_package(conn, it, lock):
+    """Turns one package cart line into its product lines. Returns
+    (lines, lock) where each line is (prod, qty, unit_price, sale_mode,
+    savings) and lock is what a For Delivery order keeps."""
+    try:
+        n = int(it.get("qty"))
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        raise ValueError("Quantity must be positive")
+    if lock and lock.get("package_id"):
+        name, price, comps = lock["package_name"], float(lock["package_price"]), lock["components"]
+    else:
+        pkg = conn.execute("SELECT * FROM promo_packages WHERE id=?", (it.get("package_id"),)).fetchone()
+        if not pkg:
+            raise ValueError("Selected package no longer exists")
+        if not _discount_is_live(pkg):
+            raise ValueError(f"Package '{pkg['name']}' is not active today")
+        rows = _package_components(conn, pkg["id"])
+        if not rows:
+            raise ValueError(f"Package '{pkg['name']}' has no items")
+        name, price = pkg["name"], float(pkg["price"])
+        comps = [{"product_id": c["product_id"], "qty": c["qty"], "sale_mode": c["sale_mode"],
+                  "unit_price": _component_unit_price(c)} for c in rows]
+    regular = round(sum(c["unit_price"] * c["qty"] for c in comps), 2)
+    if price > regular + 0.009:
+        raise ValueError(f"Package '{name}' costs more than its items at today's prices — update the package")
+    savings_total = round((regular - price) * n, 2)
+    lines, given = [], 0.0
+    for idx, c in enumerate(comps):
+        prod = conn.execute("SELECT * FROM products WHERE id=?", (c["product_id"],)).fetchone()
+        if not prod:
+            raise ValueError(f"A product in package '{name}' no longer exists")
+        line_regular = c["unit_price"] * c["qty"] * n
+        if idx == len(comps) - 1:
+            save = round(savings_total - given, 2)
+        else:
+            save = round(savings_total * (line_regular / (regular * n)) if regular else 0, 2)
+            given = round(given + save, 2)
+        lines.append((prod, c["qty"] * n, float(c["unit_price"]), c["sale_mode"], save))
+    new_lock = {"package_id": it.get("package_id") or (lock or {}).get("package_id"), "package_name": name,
+                "package_price": price, "components": comps}
+    return lines, new_lock
 
 
 # ---------------------------------------------------------------- system reset (go live)
@@ -2719,12 +2911,16 @@ def system_reset():
 
         if wipe_discounts:
             conn.execute("DELETE FROM discounts")
+            conn.execute("DELETE FROM promo_package_items")
+            conn.execute("DELETE FROM promo_packages")
 
         if wipe_products:
             # All history pointing at products was cleared above.
             conn.execute("DELETE FROM inventory")
             conn.execute("DELETE FROM empty_cylinder_inventory")
             conn.execute("DELETE FROM discounts WHERE product_id IS NOT NULL")
+            conn.execute("DELETE FROM promo_package_items")
+            conn.execute("UPDATE promo_packages SET active=0")
             conn.execute("DELETE FROM products")
 
         # Restart auto-number counters for every emptied table.
@@ -2774,9 +2970,12 @@ def system_reset():
 
 # ---------------------------------------------------------------- POS / sales
 
-def _price_sale_items(conn, items, customer, sale_type, locked=None):
+def _price_sale_items(conn, items, customer, sale_type, locked=None, locks_out=None):
     """Server-side pricing for a POS cart. `locked` (For Delivery) carries
-    the per-line prices and discounts captured when the order was taken."""
+    the per-line prices and discounts captured when the order was taken;
+    pass a list as `locks_out` to get those for a new order (one per cart
+    line). A cart line with a package_id is a package promo: it becomes one
+    resolved line per product in the package."""
     if not items:
         raise ValueError("Cart is empty")
     # Commercial accounts: 50kg cylinders on a credit sale are only
@@ -2788,6 +2987,17 @@ def _price_sale_items(conn, items, customer, sale_type, locked=None):
     resolved_items = []
     for idx, it in enumerate(items):
         lock = locked[idx] if locked else None
+        if it.get("package_id") or (lock and lock.get("package_id")):
+            lines, pkg_lock = _expand_package(conn, it, lock)
+            pkg = (pkg_lock["package_id"], pkg_lock["package_name"])
+            for prod, qty, unit, mode, save in lines:
+                line_total = round(unit * qty, 2)
+                subtotal += line_total
+                resolved_items.append((prod, qty, unit, line_total, mode, None, pkg[1], save,
+                                       None, 0.0, False, None, None, None, None, pkg))
+            if locks_out is not None:
+                locks_out.append(pkg_lock)
+            continue
         prod = conn.execute("SELECT * FROM products WHERE id=?", (it["product_id"],)).fetchone()
         if not prod:
             raise ValueError(f"Unknown product {it['product_id']}")
@@ -2830,7 +3040,10 @@ def _price_sale_items(conn, items, customer, sale_type, locked=None):
             disc_amount = compute_item_discount(disc, prod["id"], gas_price, qty)
             disc_id, disc_name = disc["id"], disc["name"]
         resolved_items.append((prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
-                               swap_brand, swap_fee, bill_later, srp_price, swap_type, empty_pid, swap_valve))
+                               swap_brand, swap_fee, bill_later, srp_price, swap_type, empty_pid, swap_valve, None))
+        if locks_out is not None:
+            locks_out.append({"gas_price": float(prod["price"]), "deposit_price": float(prod["deposit_price"]),
+                              "discount_id": disc_id, "discount_name": disc_name, "discount_amount": disc_amount})
 
     subtotal = round(subtotal, 2)
     discount = round(sum(r[7] for r in resolved_items), 2)
@@ -2838,16 +3051,6 @@ def _price_sale_items(conn, items, customer, sale_type, locked=None):
     if total < 0:
         raise ValueError("Discount exceeds subtotal")
     return resolved_items, subtotal, discount, total
-
-
-def _locked_prices(resolved_items):
-    """What a For Delivery order keeps from the day it was taken."""
-    out = []
-    for (prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
-         swap_brand, swap_fee, bill_later, srp_price, swap_type, empty_pid, swap_valve) in resolved_items:
-        out.append({"gas_price": float(prod["price"]), "deposit_price": float(prod["deposit_price"]),
-                    "discount_id": disc_id, "discount_name": disc_name, "discount_amount": disc_amount})
-    return out
 
 
 def _record_sale(conn, u, location_id, d, locked=None, notes=None):
@@ -2913,18 +3116,20 @@ def _record_sale(conn, u, location_id, d, locked=None, notes=None):
     sale_id = cur.lastrowid
 
     for (prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
-         swap_brand, swap_fee, bill_later, srp_price, swap_type, empty_pid, swap_valve) in resolved_items:
+         swap_brand, swap_fee, bill_later, srp_price, swap_type, empty_pid, swap_valve, pkg) in resolved_items:
         conn.execute(
             """INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode,
                discount_id, discount_name, discount_amount, swap_brand, swap_fee, bill_later, srp_price,
-               swap_type, swap_empty_product_id, swap_valve)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               swap_type, swap_empty_product_id, swap_valve, package_id, package_name)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (sale_id, prod["id"], prod["name"], qty, price, line_total, sale_mode,
              disc_id, disc_name, disc_amount, swap_brand, swap_fee, 1 if bill_later else 0, srp_price,
-             swap_type, empty_pid, swap_valve),
+             swap_type, empty_pid, swap_valve, pkg[0] if pkg else None, pkg[1] if pkg else None),
         )
         swap_txt = swap_label({"swap_type": swap_type, "swap_brand": swap_brand, "swap_valve": swap_valve})
         mode_note = f"SWAP from {swap_txt}" if sale_mode == "SWAP" else sale_mode
+        if pkg:
+            mode_note += f", package {pkg[1]}"
         adjust_inventory(conn, location_id, prod["id"], -qty, "SALE", sale_no,
                           notes=f"Sold via {sale_no} ({mode_note})")
         if sale_mode == "REFILL":
@@ -3008,6 +3213,11 @@ def create_sale():
 PENDING_SALE_FIELDS = ("customer_id", "walkin_name", "sale_type", "withholding_tax", "notes", "items")
 
 
+def _product_name(conn, product_id):
+    row = conn.execute("SELECT name FROM products WHERE id=?", (product_id,)).fetchone()
+    return row["name"] if row else f"#{product_id}"
+
+
 def _pending_location_ok(u, row):
     return is_admin_like(u["role"]) or row["location_id"] == u["location_id"]
 
@@ -3018,12 +3228,19 @@ def _pending_sale_out(conn, r):
     locked = payload.get("locked") or []
     names = {}
     if raw_items:
-        ids = [it["product_id"] for it in raw_items]
+        ids = [it["product_id"] for it in raw_items if it.get("product_id")] or [0]
         names = {p["id"]: p["name"] for p in conn.execute(
             f"SELECT id, name FROM products WHERE id IN ({','.join('?' * len(ids))})", ids).fetchall()}
     items = []
     for idx, it in enumerate(raw_items):
         lock = locked[idx] if idx < len(locked) else {}
+        if lock.get("package_id"):
+            items.append({"package_id": lock["package_id"], "qty": it.get("qty"), "sale_mode": "PACKAGE",
+                          "product_name": f"PACKAGE: {lock['package_name']} (" + ", ".join(
+                              f"{c['qty']}x {_product_name(conn, c['product_id'])}" for c in lock["components"]) + ")",
+                          "gas_price": lock["package_price"],
+                          "discount_name": None, "discount_amount": 0})
+            continue
         items.append({**{k: it.get(k) for k in ("product_id", "qty", "sale_mode", "swap_brand", "swap_fee",
                                                  "swap_type")},
                       "product_name": names.get(it["product_id"], f"#{it['product_id']}"),
@@ -3059,16 +3276,19 @@ def create_pending_sale():
                 raise ValueError("Customer not found")
         if sale_type == "CREDIT" and not customer:
             raise ValueError("Credit sale requires a customer with approved terms")
-        resolved, subtotal, discount, total = _price_sale_items(conn, d.get("items") or [], customer, sale_type)
+        locks = []
+        resolved, subtotal, discount, total = _price_sale_items(conn, d.get("items") or [], customer, sale_type,
+                                                                locks_out=locks)
         wht = compute_withholding_tax(total) if d.get("withholding_tax") else 0.0
         payload = {k: d.get(k) for k in PENDING_SALE_FIELDS}
         payload["customer_id"] = customer_id
         payload["walkin_name"] = None if customer_id else ((d.get("walkin_name") or "").strip()[:120] or None)
-        payload["items"] = [{**{k: it[k] for k in ("discount_id", "swap_brand", "swap_fee", "swap_type")
+        payload["items"] = [{"package_id": int(it["package_id"]), "qty": int(it["qty"])} if it.get("package_id") else
+                            {**{k: it[k] for k in ("discount_id", "swap_brand", "swap_fee", "swap_type")
                                 if it.get(k) is not None},
                              "product_id": it["product_id"], "qty": int(it["qty"]),
                              "sale_mode": it.get("sale_mode") or "REFILL"} for it in d.get("items")]
-        payload["locked"] = _locked_prices(resolved)
+        payload["locked"] = locks
         pending_no = next_number(conn, "FD", "pending_sales", "pending_no")
         cur = conn.execute(
             """INSERT INTO pending_sales (pending_no, location_id, created_by, customer_id, walkin_name, sale_type,
@@ -3434,6 +3654,8 @@ def edit_sale(sale_id):
             resolved.append({"prod": prod, "qty": qty, "price": price, "line_total": line_total, "sale_mode": sale_mode,
                              "swap_brand": swap_brand, "swap_fee": swap_fee, "bill_later": bill_later,
                              "swap_type": swap_type, "swap_empty_product_id": empty_pid, "swap_valve": swap_valve,
+                             "package_id": it.get("package_id") or None,
+                             "package_name": (it.get("package_name") or None) if it.get("package_id") else None,
                              "srp_price": float(prod["price"]) if bill_later else None, "discount_amount": disc,
                              "discount_id": it.get("discount_id") if disc > 0 else None,
                              "discount_name": (it.get("discount_name") or ("Adjustment" if disc > 0 else None)) if disc > 0 else None})
@@ -3501,12 +3723,12 @@ def edit_sale(sale_id):
             conn.execute(
                 """INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode,
                    discount_id, discount_name, discount_amount, swap_brand, swap_fee, bill_later, srp_price,
-                   swap_type, swap_empty_product_id, swap_valve)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   swap_type, swap_empty_product_id, swap_valve, package_id, package_name)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (sale_id, r["prod"]["id"], r["prod"]["name"], r["qty"], r["price"], r["line_total"], r["sale_mode"],
                  r["discount_id"], r["discount_name"], r["discount_amount"], r["swap_brand"], r["swap_fee"],
                  1 if r["bill_later"] else 0, r["srp_price"], r["swap_type"], r["swap_empty_product_id"],
-                 r["swap_valve"]))
+                 r["swap_valve"], r["package_id"], r["package_name"]))
         pay_note = ""
         if pay_changes is not None:
             fmt_pays = lambda rows: ", ".join(f"{p['method']} {p['amount']:.2f}" for p in rows) or "none"

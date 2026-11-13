@@ -454,6 +454,16 @@ your existing data will carry forward untouched.
   Either way the full cylinder sold comes out of stock and the cashier types
   the swap fee (optional). Receipts, Edit Sale, Void, For Delivery, the sales
   report and the Swapped Cylinder Report show the swap as e.g. "Petron Gasul A/S to POL".
+- **Package promos** (Discounts & Promos → Package Promos, Admin/Manager): several
+  products sold together for one package price (e.g. 11kg refill + stove). Each
+  product line picks Refill or New/with deposit for cylinders; the form shows the
+  regular price and how much the customer saves, and the package price can't be
+  more than the regular price. At the POS the package shows as a tile (with how
+  many the stock can cover) and goes in the cart as one line. On checkout every
+  product in it comes out of inventory (empties / deposits follow its mode); the
+  sale records each product at its regular price with the package savings as that
+  line's discount, tagged with the package name on receipts and reports. For
+  Delivery orders keep the package price from the day they were taken.
 - Server-side validation: can't oversell inventory, can't exceed a customer's
   credit limit, can't complete a cash sale for less than the total, discounts can't
   exceed subtotal

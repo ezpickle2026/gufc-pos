@@ -422,6 +422,27 @@ CREATE TABLE IF NOT EXISTS discounts (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Package promos: several products sold together for one package price.
+-- Each component comes out of stock on its own when the package is sold.
+CREATE TABLE IF NOT EXISTS promo_packages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    price REAL NOT NULL,
+    start_date TEXT,
+    end_date TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS promo_package_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id INTEGER NOT NULL REFERENCES promo_packages(id) ON DELETE CASCADE,
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    qty INTEGER NOT NULL DEFAULT 1,
+    sale_mode TEXT NOT NULL DEFAULT 'REFILL'
+);
+
 CREATE TABLE IF NOT EXISTS incident_reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     report_no TEXT UNIQUE NOT NULL,
@@ -898,7 +919,9 @@ def migrate_schema():
     #     swap; VALVE_OTHER = other-brand empty of the other valve; VALVE_SOLANE
     #     = our own Solane empty of the other valve (goes to our empty stock).
     #     swap_empty_product_id is the product (size + valve) the empty is.
-    for col, decl in (("swap_type", "TEXT"), ("swap_empty_product_id", "INTEGER"), ("swap_valve", "TEXT")):
+    # 9g. Package promos: sale lines that came from a package keep which one.
+    for col, decl in (("swap_type", "TEXT"), ("swap_empty_product_id", "INTEGER"), ("swap_valve", "TEXT"),
+                      ("package_id", "INTEGER"), ("package_name", "TEXT")):
         if not _column_exists(conn, "sale_items", col):
             conn.execute(f"ALTER TABLE sale_items ADD COLUMN {col} {decl}")
     conn.commit()
