@@ -124,7 +124,8 @@ CREATE TABLE IF NOT EXISTS empty_cylinder_movements (
 );
 
 -- Empties of OTHER brands taken in on SWAP sales, broken down per brand.
--- product_id is the size it was swapped for (e.g. Solane LPG 11kg).
+-- product_id is the size it was swapped for (e.g. Solane LPG 11kg); on an
+-- A/S-POL swap it is the product of the empty's own size + valve.
 CREATE TABLE IF NOT EXISTS swapped_empty_inventory (
     location_id INTEGER NOT NULL REFERENCES locations(id),
     product_id INTEGER NOT NULL REFERENCES products(id),
@@ -891,6 +892,15 @@ def migrate_schema():
         conn.execute("ALTER TABLE sale_items ADD COLUMN bill_later INTEGER NOT NULL DEFAULT 0")
     if not _column_exists(conn, "sale_items", "srp_price"):
         conn.execute("ALTER TABLE sale_items ADD COLUMN srp_price REAL")
+    conn.commit()
+
+    # 9f. Valve swaps (11kg A/S <-> POL). swap_type: NULL = plain other-brand
+    #     swap; VALVE_OTHER = other-brand empty of the other valve; VALVE_SOLANE
+    #     = our own Solane empty of the other valve (goes to our empty stock).
+    #     swap_empty_product_id is the product (size + valve) the empty is.
+    for col, decl in (("swap_type", "TEXT"), ("swap_empty_product_id", "INTEGER"), ("swap_valve", "TEXT")):
+        if not _column_exists(conn, "sale_items", col):
+            conn.execute(f"ALTER TABLE sale_items ADD COLUMN {col} {decl}")
     conn.commit()
 
     # 17. Supervisor can view and void sales: give the built-in SUPERVISOR

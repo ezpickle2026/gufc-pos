@@ -127,6 +127,112 @@ def is_commercial_cylinder(prod):
     return size is not None and abs(size - 50.0) < 0.01
 
 
+# ---- valve swaps (11kg A/S <-> POL)
+# The same cylinder size comes as two products, one per valve (e.g.
+# "Solane LPG 11kg A/S" and "Solane LPG 11kg POL"). A valve swap is a SWAP
+# line where the customer's empty has the OTHER valve:
+#   VALVE_OTHER  - empty of another brand  -> Swapped Empties (per brand),
+#                  counted under the product of the empty's size + valve
+#   VALVE_SOLANE - our own Solane empty    -> our Empty Cylinders stock of
+#                  the other-valve product
+# A plain SWAP (swap_type empty) is the existing same-valve other-brand swap.
+VALVE_SWAP_TYPES = ("VALVE_OTHER", "VALVE_SOLANE")
+VALVE_AS_RE = re.compile(r"(?<![A-Za-z0-9])(?:[Aa]\s*/\s*[Ss]|AS)(?![A-Za-z0-9])")
+VALVE_POL_RE = re.compile(r"(?<![A-Za-z0-9])POL(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+def product_valve(prod):
+    """'A/S', 'POL' or None, read from the product name (then the SKU)."""
+    for text in (prod["name"], prod["sku"]):
+        t = text or ""
+        if VALVE_POL_RE.search(t):
+            return "POL"
+        if VALVE_AS_RE.search(t):
+            return "A/S"
+    return None
+
+
+def _strip_valve(name):
+    n = VALVE_POL_RE.sub(" ", VALVE_AS_RE.sub(" ", name or ""))
+    return " ".join(n.lower().split())
+
+
+def valve_counterpart(conn, prod, products=None):
+    """The active product of the same size with the other valve, or None."""
+    valve = product_valve(prod)
+    size = product_kg_size(prod["name"], prod["sku"])
+    if not valve or size is None:
+        return None
+    want = "POL" if valve == "A/S" else "A/S"
+    if products is None:
+        products = conn.execute("SELECT * FROM products WHERE active=1").fetchall()
+    cands = [p for p in products if p["id"] != prod["id"] and product_valve(p) == want
+             and product_kg_size(p["name"], p["sku"]) == size]
+    if len(cands) > 1:  # prefer the one whose name differs only by the valve
+        same = [p for p in cands if _strip_valve(p["name"]) == _strip_valve(prod["name"])]
+        cands = same or cands
+    return cands[0] if cands else None
+
+
+def resolve_swap(conn, prod, it, line=""):
+    """Validates a SWAP line. Returns (swap_brand, swap_fee, swap_type,
+    swap_empty_product_id, swap_valve). Raises ValueError."""
+    swap_type = (it.get("swap_type") or "").strip().upper() or None
+    if swap_type and swap_type not in VALVE_SWAP_TYPES:
+        raise ValueError(f"{line}Unknown swap type {swap_type}")
+    swap_brand = (it.get("swap_brand") or "").strip()
+    empty_pid, swap_valve = None, None
+    if swap_type:
+        pair = valve_counterpart(conn, prod)
+        if not pair:
+            raise ValueError(f"{line}{prod['name']} has no A/S or POL counterpart product, so it can't be "
+                             "swapped A/S to POL. Use the product names with A/S and POL for the same size.")
+        empty_pid = pair["id"]
+        swap_valve = f"{product_valve(pair)} to {product_valve(prod)}"
+        if swap_type == "VALVE_SOLANE":
+            swap_brand = "Solane"
+        elif swap_brand.lower() == "solane":
+            raise ValueError(f"{line}For a Solane empty, choose Swap A/S-POL (Solane)")
+    if not swap_brand:
+        raise ValueError(f"{line}Choose the LPG brand being swapped for {prod['name']}")
+    raw = it.get("swap_fee")
+    try:
+        swap_fee = round(float(raw), 2) if raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        raise ValueError(f"{line}Swap fee must be a number")
+    if swap_fee < 0:
+        raise ValueError(f"{line}Swap fee cannot be negative")
+    return swap_brand, swap_fee, swap_type, empty_pid, swap_valve
+
+
+def swap_label(it):
+    """How a swap line reads on receipts and reports."""
+    if it["swap_type"] == "VALVE_SOLANE":
+        return f"Solane {it['swap_valve'] or 'A/S-POL'}"
+    if it["swap_type"] == "VALVE_OTHER":
+        return f"{it['swap_brand'] or ''} {it['swap_valve'] or 'A/S-POL'}".strip()
+    return it["swap_brand"] or ""
+
+
+def swap_empty_in(conn, location_id, product_id, swap_brand, swap_type, empty_pid, qty, mtype, ref, notes):
+    """The empty the customer handed over on a swap line comes into stock."""
+    if swap_type == "VALVE_SOLANE":
+        add_empty_cylinders(conn, location_id, empty_pid, qty, mtype, reference=ref, notes=notes)
+    elif swap_brand:
+        add_swapped_empties(conn, location_id, empty_pid or product_id, swap_brand, qty, mtype,
+                            reference=ref, notes=notes)
+
+
+def swap_empty_reverse(conn, location_id, it, mtype, ref, notes):
+    """Undo swap_empty_in for a stored sale_items row (void / edit)."""
+    if it["swap_type"] == "VALVE_SOLANE" and it["swap_empty_product_id"]:
+        remove_empty_cylinders(conn, location_id, it["swap_empty_product_id"], it["qty"], mtype, ref,
+                               notes=notes, allow_negative=True)
+    elif it["swap_brand"]:
+        remove_swapped_empties(conn, location_id, it["swap_empty_product_id"] or it["product_id"], it["swap_brand"],
+                               it["qty"], mtype, ref, notes=notes, allow_negative=True)
+
+
 def login_required(fn):
     @functools.wraps(fn)
     def wrapper(*a, **kw):
@@ -464,7 +570,12 @@ def list_products():
     conn = get_db()
     rows = conn.execute("SELECT * FROM products WHERE active=1 ORDER BY name").fetchall()
     conn.close()
-    return jsonify([dict(r) for r in rows])
+    out = []
+    for r in rows:
+        pair = valve_counterpart(None, r, rows)
+        out.append({**dict(r), "valve": product_valve(r), "valve_pair_id": pair["id"] if pair else None,
+                    "valve_pair_valve": product_valve(pair) if pair else None})
+    return jsonify(out)
 
 
 @app.post("/api/products")
@@ -2696,19 +2807,11 @@ def _price_sale_items(conn, items, customer, sale_type, locked=None):
         if bill_later:
             gas_price = 0.0  # charged later in 50kg Commercial Billing
         price = gas_price
-        swap_brand, swap_fee = None, 0.0
+        swap_brand, swap_fee, swap_type, empty_pid, swap_valve = None, 0.0, None, None, None
         if sale_mode == "DEPOSIT":
             price += float(lock["deposit_price"]) if lock else float(prod["deposit_price"])
         elif sale_mode == "SWAP":
-            swap_brand = (it.get("swap_brand") or "").strip()
-            if not swap_brand:
-                raise ValueError(f"Choose the LPG brand being swapped for {prod['name']}")
-            try:
-                swap_fee = round(float(it.get("swap_fee") or 0), 2)
-            except (TypeError, ValueError):
-                raise ValueError("Swap fee must be a number")
-            if swap_fee < 0:
-                raise ValueError("Swap fee cannot be negative")
+            swap_brand, swap_fee, swap_type, empty_pid, swap_valve = resolve_swap(conn, prod, it)
             price += swap_fee
         line_total = round(price * qty, 2)
         subtotal += line_total
@@ -2727,7 +2830,7 @@ def _price_sale_items(conn, items, customer, sale_type, locked=None):
             disc_amount = compute_item_discount(disc, prod["id"], gas_price, qty)
             disc_id, disc_name = disc["id"], disc["name"]
         resolved_items.append((prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
-                               swap_brand, swap_fee, bill_later, srp_price))
+                               swap_brand, swap_fee, bill_later, srp_price, swap_type, empty_pid, swap_valve))
 
     subtotal = round(subtotal, 2)
     discount = round(sum(r[7] for r in resolved_items), 2)
@@ -2741,7 +2844,7 @@ def _locked_prices(resolved_items):
     """What a For Delivery order keeps from the day it was taken."""
     out = []
     for (prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
-         swap_brand, swap_fee, bill_later, srp_price) in resolved_items:
+         swap_brand, swap_fee, bill_later, srp_price, swap_type, empty_pid, swap_valve) in resolved_items:
         out.append({"gas_price": float(prod["price"]), "deposit_price": float(prod["deposit_price"]),
                     "discount_id": disc_id, "discount_name": disc_name, "discount_amount": disc_amount})
     return out
@@ -2810,15 +2913,18 @@ def _record_sale(conn, u, location_id, d, locked=None, notes=None):
     sale_id = cur.lastrowid
 
     for (prod, qty, price, line_total, sale_mode, disc_id, disc_name, disc_amount,
-         swap_brand, swap_fee, bill_later, srp_price) in resolved_items:
+         swap_brand, swap_fee, bill_later, srp_price, swap_type, empty_pid, swap_valve) in resolved_items:
         conn.execute(
             """INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode,
-               discount_id, discount_name, discount_amount, swap_brand, swap_fee, bill_later, srp_price)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               discount_id, discount_name, discount_amount, swap_brand, swap_fee, bill_later, srp_price,
+               swap_type, swap_empty_product_id, swap_valve)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (sale_id, prod["id"], prod["name"], qty, price, line_total, sale_mode,
-             disc_id, disc_name, disc_amount, swap_brand, swap_fee, 1 if bill_later else 0, srp_price),
+             disc_id, disc_name, disc_amount, swap_brand, swap_fee, 1 if bill_later else 0, srp_price,
+             swap_type, empty_pid, swap_valve),
         )
-        mode_note = f"SWAP from {swap_brand}" if sale_mode == "SWAP" else sale_mode
+        swap_txt = swap_label({"swap_type": swap_type, "swap_brand": swap_brand, "swap_valve": swap_valve})
+        mode_note = f"SWAP from {swap_txt}" if sale_mode == "SWAP" else sale_mode
         adjust_inventory(conn, location_id, prod["id"], -qty, "SALE", sale_no,
                           notes=f"Sold via {sale_no} ({mode_note})")
         if sale_mode == "REFILL":
@@ -2827,10 +2933,11 @@ def _record_sale(conn, u, location_id, d, locked=None, notes=None):
             add_empty_cylinders(conn, location_id, prod["id"], qty, "REFILL SALE",
                                 reference=sale_no, notes=f"Empty returned on refill sale {sale_no}")
         elif sale_mode == "SWAP":
-            # SWAP: the customer hands over an empty of a different brand.
-            # It's kept apart from our own empties, counted per brand.
-            add_swapped_empties(conn, location_id, prod["id"], swap_brand, qty, "SWAP SALE",
-                                reference=sale_no, notes=f"{swap_brand} empty taken in on swap sale {sale_no}")
+            # SWAP: the customer hands over an empty of a different brand
+            # (kept apart from our own empties, counted per brand) or, on an
+            # A/S-POL Solane swap, our own empty of the other valve.
+            swap_empty_in(conn, location_id, prod["id"], swap_brand, swap_type, empty_pid, qty, "SWAP SALE",
+                          sale_no, f"{swap_txt} empty taken in on swap sale {sale_no}")
         else:
             # DEPOSIT: customer takes a full cylinder with no exchange — no
             # empty comes back, and the cylinder is now outstanding on loan
@@ -2917,7 +3024,8 @@ def _pending_sale_out(conn, r):
     items = []
     for idx, it in enumerate(raw_items):
         lock = locked[idx] if idx < len(locked) else {}
-        items.append({**{k: it.get(k) for k in ("product_id", "qty", "sale_mode", "swap_brand", "swap_fee")},
+        items.append({**{k: it.get(k) for k in ("product_id", "qty", "sale_mode", "swap_brand", "swap_fee",
+                                                 "swap_type")},
                       "product_name": names.get(it["product_id"], f"#{it['product_id']}"),
                       "gas_price": lock.get("gas_price"), "discount_name": lock.get("discount_name"),
                       "discount_amount": lock.get("discount_amount") or 0})
@@ -2956,7 +3064,8 @@ def create_pending_sale():
         payload = {k: d.get(k) for k in PENDING_SALE_FIELDS}
         payload["customer_id"] = customer_id
         payload["walkin_name"] = None if customer_id else ((d.get("walkin_name") or "").strip()[:120] or None)
-        payload["items"] = [{**{k: it[k] for k in ("discount_id", "swap_brand", "swap_fee") if it.get(k) is not None},
+        payload["items"] = [{**{k: it[k] for k in ("discount_id", "swap_brand", "swap_fee", "swap_type")
+                                if it.get(k) is not None},
                              "product_id": it["product_id"], "qty": int(it["qty"]),
                              "sale_mode": it.get("sale_mode") or "REFILL"} for it in d.get("items")]
         payload["locked"] = _locked_prices(resolved)
@@ -3097,7 +3206,8 @@ def get_sale_detail(sale_id):
     items = conn.execute("SELECT * FROM sale_items WHERE sale_id=?", (sale_id,)).fetchall()
     pays = conn.execute("SELECT * FROM payments WHERE sale_id=?", (sale_id,)).fetchall()
     conn.close()
-    return {"sale": dict(sale), "items": [dict(i) for i in items], "payments": [dict(p) for p in pays]}
+    items = [{**dict(i), "swap_label": swap_label(i) if i["sale_mode"] == "SWAP" else None} for i in items]
+    return {"sale": dict(sale), "items": items, "payments": [dict(p) for p in pays]}
 
 
 SALES_PAGE_SIZE_MAX = 500
@@ -3190,10 +3300,9 @@ def void_sale(sale_id):
             # case the empty was already dispatched; a negative count flags it.
             remove_empty_cylinders(conn, sale["location_id"], it["product_id"], it["qty"], "VOID REVERSAL",
                                    void_ref, notes="Empty returned on voided refill sale", allow_negative=True)
-        elif it["sale_mode"] == "SWAP" and it["swap_brand"]:
-            remove_swapped_empties(conn, sale["location_id"], it["product_id"], it["swap_brand"], it["qty"],
-                                   "VOID REVERSAL", void_ref, notes="Swapped empty reversed on voided sale",
-                                   allow_negative=True)
+        elif it["sale_mode"] == "SWAP":
+            swap_empty_reverse(conn, sale["location_id"], it, "VOID REVERSAL", void_ref,
+                               "Swapped empty reversed on voided sale")
         elif it["sale_mode"] == "DEPOSIT" and sale["customer_id"]:
             # DEPOSIT sale put cylinders on loan to the customer — undo that,
             # without going below zero if some were already returned.
@@ -3226,15 +3335,16 @@ def _reverse_sale_line_stock(conn, sale, it, ref, customer_id):
     if it["sale_mode"] == "REFILL":
         remove_empty_cylinders(conn, sale["location_id"], it["product_id"], it["qty"], "SALE EDIT", ref,
                                notes=f"Sale edit {sale['sale_no']}: old refill line reversed", allow_negative=True)
-    elif it["sale_mode"] == "SWAP" and it["swap_brand"]:
-        remove_swapped_empties(conn, sale["location_id"], it["product_id"], it["swap_brand"], it["qty"], "SALE EDIT",
-                               ref, notes=f"Sale edit {sale['sale_no']}: old swap line reversed", allow_negative=True)
+    elif it["sale_mode"] == "SWAP":
+        swap_empty_reverse(conn, sale["location_id"], it, "SALE EDIT", ref,
+                           f"Sale edit {sale['sale_no']}: old swap line reversed")
     elif it["sale_mode"] == "DEPOSIT" and customer_id:
         conn.execute("UPDATE cylinder_deposits SET qty_on_loan = MAX(qty_on_loan - ?, 0) WHERE customer_id=? AND product_id=?",
                      (it["qty"], customer_id, it["product_id"]))
 
 
-def _apply_sale_line_stock(conn, sale, prod, qty, sale_mode, swap_brand, ref, customer_id):
+def _apply_sale_line_stock(conn, sale, prod, qty, sale_mode, swap_brand, ref, customer_id,
+                           swap_type=None, empty_pid=None):
     have = conn.execute("SELECT quantity FROM inventory WHERE location_id=? AND product_id=?",
                         (sale["location_id"], prod["id"])).fetchone()
     if (have["quantity"] if have else 0) < qty:
@@ -3246,8 +3356,8 @@ def _apply_sale_line_stock(conn, sale, prod, qty, sale_mode, swap_brand, ref, cu
         add_empty_cylinders(conn, sale["location_id"], prod["id"], qty, "SALE EDIT", reference=ref,
                             notes=f"Empty returned on edited sale {sale['sale_no']}")
     elif sale_mode == "SWAP":
-        add_swapped_empties(conn, sale["location_id"], prod["id"], swap_brand, qty, "SALE EDIT", reference=ref,
-                            notes=f"{swap_brand} empty on edited sale {sale['sale_no']}")
+        swap_empty_in(conn, sale["location_id"], prod["id"], swap_brand, swap_type, empty_pid, qty, "SALE EDIT", ref,
+                      f"{swap_brand} empty on edited sale {sale['sale_no']}")
     elif customer_id:
         record_cylinder_deposit(conn, customer_id, prod["id"], qty)
 
@@ -3306,14 +3416,9 @@ def edit_sale(sale_id):
             sale_mode = it.get("sale_mode") or "REFILL"
             if sale_mode not in ("REFILL", "DEPOSIT", "SWAP"):
                 raise ValueError(f"Line {n}: mode must be REFILL, DEPOSIT or SWAP")
-            swap_brand, swap_fee = None, 0.0
+            swap_brand, swap_fee, swap_type, empty_pid, swap_valve = None, 0.0, None, None, None
             if sale_mode == "SWAP":
-                swap_brand = (it.get("swap_brand") or "").strip()
-                if not swap_brand:
-                    raise ValueError(f"Line {n}: type the LPG brand being swapped for {prod['name']}")
-                swap_fee = round(_num(it.get("swap_fee"), "Swap fee", allow_blank=True) or 0, 2)
-                if swap_fee < 0:
-                    raise ValueError("Swap fee cannot be negative")
+                swap_brand, swap_fee, swap_type, empty_pid, swap_valve = resolve_swap(conn, prod, it, f"Line {n}: ")
             bill_later = commercial_delivery and is_commercial_cylinder(prod)
             price = _num(it.get("price"), f"Line {n} unit price", allow_blank=True)
             if price is None:  # default the way the POS prices it
@@ -3328,6 +3433,7 @@ def edit_sale(sale_id):
                 raise ValueError(f"Line {n}: discount must be between 0 and the line total ({line_total:.2f})")
             resolved.append({"prod": prod, "qty": qty, "price": price, "line_total": line_total, "sale_mode": sale_mode,
                              "swap_brand": swap_brand, "swap_fee": swap_fee, "bill_later": bill_later,
+                             "swap_type": swap_type, "swap_empty_product_id": empty_pid, "swap_valve": swap_valve,
                              "srp_price": float(prod["price"]) if bill_later else None, "discount_amount": disc,
                              "discount_id": it.get("discount_id") if disc > 0 else None,
                              "discount_name": (it.get("discount_name") or ("Adjustment" if disc > 0 else None)) if disc > 0 else None})
@@ -3375,9 +3481,11 @@ def edit_sale(sale_id):
                              "Lower the payment or the amount paid.")
 
         old_items = conn.execute("SELECT * FROM sale_items WHERE sale_id=? ORDER BY id", (sale_id,)).fetchall()
-        sig = lambda rows: sorted((r[0], r[1], r[2], r[3] or "") for r in rows)
-        old_sig = sig([(i["product_id"], i["qty"], i["sale_mode"], i["swap_brand"]) for i in old_items])
-        new_sig = sig([(r["prod"]["id"], r["qty"], r["sale_mode"], r["swap_brand"]) for r in resolved])
+        sig = lambda rows: sorted((r[0], r[1], r[2], r[3] or "", r[4] or "", r[5] or 0) for r in rows)
+        old_sig = sig([(i["product_id"], i["qty"], i["sale_mode"], i["swap_brand"], i["swap_type"],
+                        i["swap_empty_product_id"]) for i in old_items])
+        new_sig = sig([(r["prod"]["id"], r["qty"], r["sale_mode"], r["swap_brand"], r["swap_type"],
+                        r["swap_empty_product_id"]) for r in resolved])
         has_deposit = any(i["sale_mode"] == "DEPOSIT" for i in old_items) or any(r["sale_mode"] == "DEPOSIT" for r in resolved)
         stock_changed = old_sig != new_sig or (has_deposit and customer_id != sale["customer_id"])
         ref = f"EDIT-{sale['sale_no']}"
@@ -3385,17 +3493,20 @@ def edit_sale(sale_id):
             for it in old_items:
                 _reverse_sale_line_stock(conn, sale, it, ref, sale["customer_id"])
             for r in resolved:
-                _apply_sale_line_stock(conn, sale, r["prod"], r["qty"], r["sale_mode"], r["swap_brand"], ref, customer_id)
+                _apply_sale_line_stock(conn, sale, r["prod"], r["qty"], r["sale_mode"], r["swap_brand"], ref, customer_id,
+                                       r["swap_type"], r["swap_empty_product_id"])
 
         conn.execute("DELETE FROM sale_items WHERE sale_id=?", (sale_id,))
         for r in resolved:
             conn.execute(
                 """INSERT INTO sale_items (sale_id, product_id, product_name, qty, price, subtotal, sale_mode,
-                   discount_id, discount_name, discount_amount, swap_brand, swap_fee, bill_later, srp_price)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   discount_id, discount_name, discount_amount, swap_brand, swap_fee, bill_later, srp_price,
+                   swap_type, swap_empty_product_id, swap_valve)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (sale_id, r["prod"]["id"], r["prod"]["name"], r["qty"], r["price"], r["line_total"], r["sale_mode"],
                  r["discount_id"], r["discount_name"], r["discount_amount"], r["swap_brand"], r["swap_fee"],
-                 1 if r["bill_later"] else 0, r["srp_price"]))
+                 1 if r["bill_later"] else 0, r["srp_price"], r["swap_type"], r["swap_empty_product_id"],
+                 r["swap_valve"]))
         pay_note = ""
         if pay_changes is not None:
             fmt_pays = lambda rows: ", ".join(f"{p['method']} {p['amount']:.2f}" for p in rows) or "none"
@@ -3984,7 +4095,9 @@ def _sales_report_rows(date_from, date_to):
                     CASE WHEN c.id IS NULL THEN 'Walk-in' ELSE COALESCE(NULLIF(c.category,''), 'Uncategorized') END customer_category,
                     s.sale_type, s.status, s.total sale_total, s.discount sale_discount,
                     si.product_name || CASE WHEN si.sale_mode='DEPOSIT' THEN ' (deposit)'
-                        WHEN si.sale_mode='SWAP' THEN ' (swap: ' || COALESCE(si.swap_brand,'') || ')' ELSE '' END item,
+                        WHEN si.sale_mode='SWAP' THEN ' (swap: ' || COALESCE(si.swap_brand,'')
+                             || CASE WHEN si.swap_valve IS NOT NULL THEN ' ' || si.swap_valve ELSE '' END || ')'
+                        ELSE '' END item,
                     si.qty, si.price,
                     COALESCE(si.subtotal, s.subtotal) amount,
                     COALESCE(si.discount_amount, CASE WHEN si.id IS NULL THEN s.discount ELSE 0 END) discount,
@@ -4116,7 +4229,7 @@ def _build_swapped_report(conn, date_from=None, date_to=None, location_id=None):
         f"""SELECT s.ts, s.sale_no, l.name location_name, u.name cashier, COALESCE(c.name, s.walkin_name) customer_name,
                    COALESCE(NULLIF(si.swap_brand,''), 'Unspecified') swap_brand, si.product_name,
                    si.qty, COALESCE(si.swap_fee,0) swap_fee, ROUND(COALESCE(si.swap_fee,0) * si.qty, 2) swap_fee_total,
-                   si.subtotal amount
+                   si.subtotal amount, si.swap_type, si.swap_valve
             FROM sale_items si JOIN sales s ON s.id = si.sale_id
             JOIN locations l ON l.id = s.location_id JOIN users u ON u.id = s.user_id
             LEFT JOIN customers c ON c.id = s.customer_id
@@ -4124,6 +4237,11 @@ def _build_swapped_report(conn, date_from=None, date_to=None, location_id=None):
         params,
     ).fetchall()
     rows = [dict(r) for r in rows]
+    for r in rows:  # A/S-POL swaps show which way the valve changed
+        r["swap_kind"] = ("A/S-POL (Solane)" if r["swap_type"] == "VALVE_SOLANE"
+                          else "A/S-POL (other brand)" if r["swap_type"] == "VALVE_OTHER" else "Other brand")
+        if r["swap_valve"]:
+            r["product_name"] = f"{r['product_name']} ({r['swap_valve']})"
 
     summary = {}
     for r in rows:

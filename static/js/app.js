@@ -361,6 +361,7 @@ async function renderPOS(c) {
     else state.cart.push({
       product_id: pid, name: prod.name, base_price: prod.price, deposit_price: prod.deposit_price || 0,
       is_cylinder: (prod.deposit_price || 0) > 0 || /cylinder|lpg/i.test(prod.category || ""),
+      valve: prod.valve || null, valve_pair_valve: prod.valve_pair_id ? prod.valve_pair_valve : null,
       sale_mode: "REFILL", price: prod.price, qty: 1,
     });
     drawCart(locationId);
@@ -385,19 +386,19 @@ async function renderPOS(c) {
   window.__posMode = (pid, oldMode, newMode) => {
     const item = state.cart.find(i => i.product_id === pid && i.sale_mode === oldMode);
     if (!item) return;
-    if (newMode === "SWAP") {
+    if (isSwapMode(newMode)) {
       drawCart(locationId); // keep the dropdown on the old mode until confirmed
       // ask which brand is being swapped in and the swap fee first; the line
-      // only switches to SWAP once the cashier confirms
-      openSwapDialog(item, (brand, fee) => {
-        const target = state.cart.find(i => i !== item && i.product_id === pid && i.sale_mode === "SWAP");
+      // only switches to the swap mode once the cashier confirms
+      openSwapDialog(item, newMode, (brand, fee) => {
+        const target = state.cart.find(i => i !== item && i.product_id === pid && i.sale_mode === newMode);
         if (target) {
           target.qty += item.qty;
           target.swap_brand = brand; target.swap_fee = fee;
           target.price = target.base_price + fee;
           state.cart = state.cart.filter(i => i !== item);
         } else {
-          item.sale_mode = "SWAP"; item.swap_brand = brand; item.swap_fee = fee;
+          item.sale_mode = newMode; item.swap_brand = brand; item.swap_fee = fee;
           item.price = item.base_price + fee;
         }
         drawCart(locationId);
@@ -416,10 +417,10 @@ async function renderPOS(c) {
     }
     drawCart(locationId);
   };
-  window.__posEditSwap = (pid) => {
-    const item = state.cart.find(i => i.product_id === pid && i.sale_mode === "SWAP");
+  window.__posEditSwap = (pid, mode) => {
+    const item = state.cart.find(i => i.product_id === pid && i.sale_mode === mode);
     if (!item) return;
-    openSwapDialog(item, (brand, fee) => {
+    openSwapDialog(item, mode, (brand, fee) => {
       item.swap_brand = brand; item.swap_fee = fee;
       item.price = item.base_price + fee;
       drawCart(locationId);
@@ -430,15 +431,56 @@ async function renderPOS(c) {
 // Common LPG brands a customer may bring in to swap for ours.
 const SWAP_BRANDS = ["Petron Gasul", "Shellane", "Prycegas", "Fiesta Gas", "Regasco", "Phoenix LPG", "Island Gas", "Total Gas"];
 
-// Modal for a brand swap: which brand the customer's empty is, and the swap
-// fee per cylinder (added on top of the gas price).
-function openSwapDialog(item, onOk, onCancel) {
-  const cur = item.swap_brand || "";
+// Cart swap modes. On the server they are all sale_mode SWAP; the A/S-POL
+// ones also send swap_type (the customer's empty has the other valve).
+//   SWAP              other brand, same valve (empty -> Swapped Empties)
+//   SWAP_VALVE_OTHER  other brand, A/S <-> POL (empty -> Swapped Empties)
+//   SWAP_VALVE_SOLANE Solane, A/S <-> POL     (empty -> our Empty Cylinders)
+const SWAP_TYPE_OF = { SWAP_VALVE_OTHER: "VALVE_OTHER", SWAP_VALVE_SOLANE: "VALVE_SOLANE" };
+function isSwapMode(m) { return m === "SWAP" || !!SWAP_TYPE_OF[m]; }
+function valveText(i) { return `${i.valve_pair_valve} to ${i.valve}`; }
+function swapModeLabel(i, m) {
+  if (m === "SWAP_VALVE_OTHER") return `Swap ${valveText(i)} (other brand)`;
+  if (m === "SWAP_VALVE_SOLANE") return `Swap ${valveText(i)} (Solane)`;
+  return "Swap (other brand)";
+}
+function swapLineText(i) {
+  if (i.sale_mode === "SWAP_VALVE_SOLANE") return `Solane ${valveText(i)}`;
+  if (i.sale_mode === "SWAP_VALVE_OTHER") return `${i.swap_brand} ${valveText(i)}`;
+  return i.swap_brand;
+}
+// What a cart line sends to the server.
+function cartItemPayload(i) {
+  const swap = isSwapMode(i.sale_mode);
+  return {
+    product_id: i.product_id, qty: i.qty, sale_mode: swap ? "SWAP" : i.sale_mode,
+    discount_id: lineDiscount(i) > 0 ? i.discount_id : null,
+    ...(swap ? { swap_brand: i.swap_brand, swap_fee: i.swap_fee } : {}),
+    ...(SWAP_TYPE_OF[i.sale_mode] ? { swap_type: SWAP_TYPE_OF[i.sale_mode] } : {}),
+  };
+}
+// Sale detail / receipt text for a stored swap line.
+function swapItemText(i) {
+  if (i.swap_label) return i.swap_label;
+  if (i.swap_type) return `${i.swap_type === "VALVE_SOLANE" ? "Solane" : i.swap_brand || ""} A/S-POL`.trim();
+  return i.swap_brand || "";
+}
+
+// Modal for a swap: which brand the customer's empty is (not asked for a
+// Solane A/S-POL swap), and the swap fee per cylinder (added on top of the
+// gas price).
+function openSwapDialog(item, mode, onOk, onCancel) {
+  const solane = mode === "SWAP_VALVE_SOLANE";
+  const valveSwap = !!SWAP_TYPE_OF[mode];
+  const cur = solane ? "" : (item.swap_brand && item.swap_brand !== "Solane" ? item.swap_brand : "");
   const isPreset = SWAP_BRANDS.includes(cur);
   const fee = item.swap_fee ? item.swap_fee : "";
-  openModal(`Swap &mdash; ${esc(item.name)}`, `
-    <p style="color:var(--muted);font-size:13px;margin-top:0">Customer hands over an empty cylinder of another brand in exchange for a full ${esc(item.name)}.</p>
-    <div class="field"><label>Brand of LPG being swapped</label>
+  const empty = valveSwap ? `${item.valve_pair_valve} empty` : "empty cylinder";
+  openModal(`${esc(swapModeLabel(item, mode))} &mdash; ${esc(item.name)}`, `
+    <p style="color:var(--muted);font-size:13px;margin-top:0">${solane
+      ? `Customer hands over a Solane ${esc(empty)} in exchange for a full ${esc(item.name)}. The ${esc(empty)} goes to our Empty Cylinders stock.`
+      : `Customer hands over an ${esc(empty)} of another brand in exchange for a full ${esc(item.name)}.`}</p>
+    <div class="field" style="${solane ? "display:none" : ""}"><label>Brand of LPG being swapped</label>
       <select id="swapBrand">
         <option value="">-- Select brand --</option>
         ${SWAP_BRANDS.map(b => `<option ${b === cur ? "selected" : ""}>${esc(b)}</option>`).join("")}
@@ -468,10 +510,11 @@ function openSwapDialog(item, onOk, onCancel) {
     preview();
     document.getElementById("swapCancel").addEventListener("click", () => { closeModal(); if (onCancel) onCancel(); });
     document.getElementById("swapOk").addEventListener("click", () => {
-      const brand = sel.value === "__other" ? document.getElementById("swapOther").value.trim() : sel.value;
+      const brand = solane ? "Solane" : (sel.value === "__other" ? document.getElementById("swapOther").value.trim() : sel.value);
       const raw = feeIn.value.trim();
       const f = raw === "" ? 0 : parseFloat(raw);
       if (!brand) { toast("Select the LPG brand being swapped", "error"); return; }
+      if (!solane && brand.toLowerCase() === "solane") { toast("For a Solane empty, choose the Solane swap option", "error"); return; }
       if (isNaN(f) || f < 0) { toast("Swapping fee must be a number (0 or more), or leave it blank", "error"); return; }
       const rounded = Math.round(f * 100) / 100;
       closeModal();
@@ -514,15 +557,16 @@ function drawCart(locationId) {
     <h3 style="margin-top:0">Cart</h3>
     <div id="cartLines">${state.cart.length ? state.cart.map(i => `
       <div class="cart-line">
-        <div class="cname">${esc(i.name)} ${i.sale_mode === 'DEPOSIT' ? '<span class="badge warn">DEPOSIT</span>' : ''}${i.sale_mode === 'SWAP' ? '<span class="badge blue">SWAP</span>' : ''}<br>
+        <div class="cname">${esc(i.name)} ${i.sale_mode === 'DEPOSIT' ? '<span class="badge warn">DEPOSIT</span>' : ''}${isSwapMode(i.sale_mode) ? `<span class="badge blue">${SWAP_TYPE_OF[i.sale_mode] ? "SWAP " + esc(valveText(i)) : "SWAP"}</span>` : ''}<br>
           <span style="color:var(--muted);font-size:12px">${money(i.price)} each</span>
           ${i.is_cylinder ? `<select style="margin-left:6px;font-size:11px;padding:2px 4px" onchange="__posMode(${i.product_id}, '${i.sale_mode}', this.value)">
             <option value="REFILL" ${i.sale_mode === 'REFILL' ? 'selected' : ''}>Refill (exchange empty)</option>
             ${i.deposit_price > 0 ? `<option value="DEPOSIT" ${i.sale_mode === 'DEPOSIT' ? 'selected' : ''}>New/Deposit (+${money(i.deposit_price)})</option>` : ""}
-            <option value="SWAP" ${i.sale_mode === 'SWAP' ? 'selected' : ''}>Swap (other brand)</option>
+            ${["SWAP"].concat(i.valve_pair_valve ? ["SWAP_VALVE_OTHER", "SWAP_VALVE_SOLANE"] : []).map(m =>
+              `<option value="${m}" ${i.sale_mode === m ? 'selected' : ''}>${esc(swapModeLabel(i, m))}</option>`).join("")}
           </select>` : ""}
-          ${i.sale_mode === 'SWAP' ? `<br><span style="font-size:12px">Swap from <b>${esc(i.swap_brand)}</b>${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : " &middot; no fee"}</span>
-            <button class="btn small" type="button" style="font-size:11px;padding:1px 6px" onclick="__posEditSwap(${i.product_id})">Edit</button>` : ""}
+          ${isSwapMode(i.sale_mode) ? `<br><span style="font-size:12px">Swap from <b>${esc(swapLineText(i))}</b>${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : " &middot; no fee"}</span>
+            <button class="btn small" type="button" style="font-size:11px;padding:1px 6px" onclick="__posEditSwap(${i.product_id}, '${i.sale_mode}')">Edit</button>` : ""}
           ${(() => {
             const opts = discountsFor(i);
             if (!opts.length) return "";
@@ -686,11 +730,7 @@ async function openCheckout(locationId) {
           sale_type: document.getElementById("saleType").value,
           delivery_address: document.getElementById("fdAddress").value.trim(),
           notes: document.getElementById("fdNotes").value.trim(),
-          items: state.cart.map(i => ({
-            product_id: i.product_id, qty: i.qty, sale_mode: i.sale_mode,
-            discount_id: lineDiscount(i) > 0 ? i.discount_id : null,
-            ...(i.sale_mode === "SWAP" ? { swap_brand: i.swap_brand, swap_fee: i.swap_fee } : {}),
-          })),
+          items: state.cart.map(cartItemPayload),
         };
         try {
           const o = await api("/pending-sales", { method: "POST", body });
@@ -714,11 +754,7 @@ async function openCheckout(locationId) {
         walkin_name: document.getElementById("custSelect").value ? "" : document.getElementById("walkinName").value.trim(),
         withholding_tax: document.getElementById("whtCheck").checked,
         sale_type: document.getElementById("saleType").value,
-        items: state.cart.map(i => ({
-          product_id: i.product_id, qty: i.qty, sale_mode: i.sale_mode,
-          discount_id: lineDiscount(i) > 0 ? i.discount_id : null,
-          ...(i.sale_mode === "SWAP" ? { swap_brand: i.swap_brand, swap_fee: i.swap_fee } : {}),
-        })),
+        items: state.cart.map(cartItemPayload),
         payments,
       };
       try {
@@ -759,7 +795,7 @@ function printReceipt(result) {
       <div>Txn: ${sale.sale_no}<br>Date: ${sale.ts}<br>Cashier: ${esc(sale.cashier_name)}<br>
       Customer: ${esc(sale.customer_name || "Walk-in")} ${sale.account_no ? "(" + sale.account_no + ")" : ""}</div>
       ${hr}
-      ${items.map(i => `<div class="r58-item">${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}${i.sale_mode === 'SWAP' ? `<div class="r58-sub">SWAP from ${esc(i.swap_brand)}${i.swap_fee > 0 ? ` (fee ${money(i.swap_fee)}/cyl)` : ""}</div>` : ''}
+      ${items.map(i => `<div class="r58-item">${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}${i.sale_mode === 'SWAP' ? `<div class="r58-sub">SWAP from ${esc(swapItemText(i))}${i.swap_fee > 0 ? ` (fee ${money(i.swap_fee)}/cyl)` : ""}</div>` : ''}
         <div class="r58-sub">${row(`${i.qty} x ${money(i.price)}`, money(i.subtotal))}</div>${i.discount_amount > 0 ? `<div class="r58-sub">${row(`Less: ${esc(i.discount_name)}`, `-${money(i.discount_amount)}`)}</div>` : ""}</div>`).join("")}
       ${hr}
       ${row("Subtotal:", money(sale.subtotal))}
@@ -958,7 +994,7 @@ function printDeliveryReceipt(result) {
     const notes = [];
     if (i.sale_mode === "REFILL") notes.push("Refill — empty returned");
     if (i.sale_mode === "DEPOSIT") notes.push("With cylinder deposit");
-    if (i.sale_mode === "SWAP") notes.push(`Swap from ${esc(i.swap_brand || "")}${i.swap_fee > 0 && !noAmounts ? `, fee ${money(i.swap_fee)}/cyl` : ""}`);
+    if (i.sale_mode === "SWAP") notes.push(`Swap from ${esc(swapItemText(i))}${i.swap_fee > 0 && !noAmounts ? `, fee ${money(i.swap_fee)}/cyl` : ""}`);
     if (i.discount_amount > 0 && !noAmounts) notes.push(`Less ${esc(i.discount_name || "discount")}: −${money(i.discount_amount)}`);
     if (i.bill_later && !noAmounts) notes.push("Gas billed separately (commercial billing)");
     const priceCell = i.bill_later && !i.price ? "For billing" : money(i.price);
@@ -1248,9 +1284,12 @@ window.openEditSale = async (saleId) => {
       row.className = "pay-row";
       row.dataset.discountId = it.discount_id || "";
       row.dataset.discountName = it.discount_name || "";
+      row.dataset.swapFee = it.swap_fee || "";
       row.innerHTML = `<select class="esProd" style="flex:2.2;min-width:0;width:auto">${prodOpts(it.product_id, it.product_name)}</select>
         <select class="esMode" style="flex:1.1;min-width:0;width:auto">
-          ${["REFILL", "DEPOSIT", "SWAP"].map(m => `<option ${m === (it.sale_mode || "REFILL") ? "selected" : ""}>${m}</option>`).join("")}</select>
+          ${[["REFILL", "REFILL"], ["DEPOSIT", "DEPOSIT"], ["SWAP", "SWAP (other brand)"],
+             ["SWAP|VALVE_OTHER", "SWAP A/S-POL (other brand)"], ["SWAP|VALVE_SOLANE", "SWAP A/S-POL (Solane)"]].map(([v, l]) =>
+            `<option value="${v}" ${v === ((it.sale_mode || "REFILL") + (it.swap_type ? "|" + it.swap_type : "")) ? "selected" : ""}>${l}</option>`).join("")}</select>
         <input type="number" class="esQty" min="1" step="1" value="${it.qty || 1}" style="width:64px;flex:none">
         <input type="number" class="esPrice" min="0" step="0.01" value="${it.price ?? ""}" style="flex:1;min-width:0">
         <input type="number" class="esDisc" min="0" step="0.01" value="${it.discount_amount || 0}" style="flex:1;min-width:0">
@@ -1300,7 +1339,8 @@ window.openEditSale = async (saleId) => {
           amount: r.querySelector(".esPayAmt").value, reference: r.querySelector(".esPayRef").value,
         })),
         items: [...rowsEl.querySelectorAll(".pay-row")].map(r => ({
-          product_id: parseInt(r.querySelector(".esProd").value), sale_mode: r.querySelector(".esMode").value,
+          product_id: parseInt(r.querySelector(".esProd").value), sale_mode: r.querySelector(".esMode").value.split("|")[0],
+          swap_type: r.querySelector(".esMode").value.split("|")[1] || null, swap_fee: r.dataset.swapFee || null,
           qty: r.querySelector(".esQty").value, price: r.querySelector(".esPrice").value,
           discount_amount: r.querySelector(".esDisc").value, swap_brand: r.querySelector(".esBrand").value,
           discount_id: r.dataset.discountId ? parseInt(r.dataset.discountId) : null, discount_name: r.dataset.discountName || null,
@@ -1407,7 +1447,7 @@ window.viewSale = async (id) => {
       ${sale.dr_no ? ` &nbsp; <b>Delivery Receipt:</b> ${esc(sale.dr_no)}` : ""}
       ${sale.edited_at ? `<br><span style="font-size:12.5px;color:var(--muted)">Adjusted ${esc(sale.edited_at)}${sale.edited_by_name ? " by " + esc(sale.edited_by_name) : ""} (see Audit Log for the details)</span>` : ""}</div>
     <div class="table-wrap"><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Subtotal</th></tr></thead><tbody>
-      ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}${i.sale_mode === 'SWAP' ? ` <span class="badge blue">SWAP</span><br><span style="font-size:12px">from ${esc(i.swap_brand)}${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : ""}</span>` : ''}${i.discount_amount > 0 ? `<br><span style="font-size:12px;color:var(--green-dark)">${esc(i.discount_name)} &minus;${money(i.discount_amount)}</span>` : ""}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
+      ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}${i.sale_mode === 'SWAP' ? ` <span class="badge blue">SWAP</span><br><span style="font-size:12px">from ${esc(swapItemText(i))}${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : ""}</span>` : ''}${i.discount_amount > 0 ? `<br><span style="font-size:12px;color:var(--green-dark)">${esc(i.discount_name)} &minus;${money(i.discount_amount)}</span>` : ""}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
     </tbody></table></div>
     <div style="margin-top:10px">
       <div class="cart-total-row"><span>Subtotal</span><span>${money(sale.subtotal)}</span></div>
@@ -1974,7 +2014,7 @@ async function renderInventory(c) {
         ${Object.entries(brandTotals).sort((a, b) => a[0].localeCompare(b[0])).map(([b, q]) =>
           `<div class="card" style="padding:8px 12px;min-width:120px"><div style="font-size:12px;color:var(--muted)">${esc(b)}</div><div style="font-size:20px;font-weight:800">${q}</div></div>`).join("")}
       </div>` : ""}
-      <div class="table-wrap"><table><thead><tr><th>Location</th><th>Brand</th><th>Size (swapped for)</th><th>Empty Qty</th></tr></thead><tbody>
+      <div class="table-wrap"><table><thead><tr><th>Location</th><th>Brand</th><th>Cylinder (size / valve)</th><th>Empty Qty</th></tr></thead><tbody>
         ${swapped.length ? swapped.map(e => `<tr>
           <td>${esc(e.location_name)}</td><td><b>${esc(e.brand)}</b></td><td>${esc(e.product_name)}</td>
           <td><b${e.quantity < 0 ? ' style="color:var(--danger)" title="Negative — a voided swap sale reversed an empty that was already dispatched. Recount and adjust."' : ""}>${e.quantity}</b></td></tr>`).join("")
@@ -1995,7 +2035,7 @@ async function renderInventory(c) {
       <div class="field"><label>Brand</label><select id="sBrand">
         ${SWAP_BRANDS.map(b => `<option>${esc(b)}</option>`).join("")}<option value="__other">Other (type below)</option></select></div>
       <div class="field hidden" id="sOtherWrap"><label>Other brand</label><input type="text" id="sOther" placeholder="Brand name"></div>
-      <div class="field"><label>Size (swapped for)</label><select id="sProd">${prodOpts}</select></div>
+      <div class="field"><label>Cylinder (size / valve)</label><select id="sProd">${prodOpts}</select></div>
       <div class="field"><label>Quantity Change</label><input type="number" id="sDelta" placeholder="e.g. 10 or -5" value="0">
         <div style="font-size:11.5px;color:var(--muted);margin-top:3px">Positive to add, negative to remove (e.g. damaged / written off).</div></div>
       <div class="field"><label>Reason (required)</label><input type="text" id="sReason" placeholder="e.g. Physical count correction"></div>
@@ -2471,7 +2511,7 @@ function printSwappedReport(d) {
       <div>Solane LPG Distributor</div><h3 style="margin:8px 0 2px">SWAPPED CYLINDER REPORT</h3>
       <div>${d.date_from || "All dates"} to ${d.date_to || "present"}${d.location_name ? " — " + esc(d.location_name) : ""}</div></div>
     <h4>Summary by Brand / Size</h4>
-    <table ${tbl}><tr><th align="left">Brand Swapped</th><th align="left">Size (swapped for)</th><th align="right">Qty</th><th align="right">Swap Fees</th><th align="right">Amount</th></tr>
+    <table ${tbl}><tr><th align="left">Brand Swapped</th><th align="left">Cylinder (size / valve)</th><th align="right">Qty</th><th align="right">Swap Fees</th><th align="right">Amount</th></tr>
       ${d.summary.map(r => `<tr><td>${esc(r.swap_brand)}</td><td>${esc(r.product_name)}</td><td align="right">${r.qty}</td><td align="right">${money(r.swap_fees)}</td><td align="right">${money(r.amount)}</td></tr>`).join("")}
       <tr style="font-weight:700"><td>TOTAL</td><td></td><td align="right">${t.qty}</td><td align="right">${money(t.swap_fees)}</td><td align="right">${money(t.amount)}</td></tr></table>
     <h4>Swap Transactions</h4>
