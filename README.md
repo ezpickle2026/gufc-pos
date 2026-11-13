@@ -444,6 +444,16 @@ your existing data will carry forward untouched.
   (leave blank for no fee) — it's added to the line price and the total. The brand and fee show on the receipt,
   sale details and sales report. Swapped-in empties of other brands are not added
   to our empty-cylinder stock.
+- **A/S ↔ POL valve swaps (11kg)**: when a product has an A/S and a POL version of
+  the same size (e.g. *Solane LPG 11kg A/S* and *Solane LPG 11kg POL*, matched by
+  the "A/S" / "POL" in the name or SKU), the cart line offers two more modes:
+  - *Swap A/S to POL (other brand)* (or POL to A/S): pick the brand. The empty goes
+    to Swapped Empties under that brand, counted as the **other-valve** product.
+  - *Swap A/S to POL (Solane)* (or POL to A/S): the customer's own Solane empty of
+    the other valve goes into **our Empty Cylinders stock** of that valve.
+  Either way the full cylinder sold comes out of stock and the cashier types
+  the swap fee (optional). Receipts, Edit Sale, Void, For Delivery, the sales
+  report and the Swapped Cylinder Report show the swap as e.g. "Petron Gasul A/S to POL".
 - Server-side validation: can't oversell inventory, can't exceed a customer's
   credit limit, can't complete a cash sale for less than the total, discounts can't
   exceed subtotal

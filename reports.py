@@ -468,7 +468,7 @@ def swapped_pdf_response(data, subtitle, filename):
     t = data["totals"]
 
     flow.append(Paragraph("Summary by Brand / Size", h3))
-    rows = [["Brand Swapped", "Size (swapped for)", "Qty", "Swap Fees", "Sales Amount"]]
+    rows = [["Brand Swapped", "Cylinder (size / valve)", "Qty", "Swap Fees", "Sales Amount"]]
     for r in data["summary"]:
         rows.append([r["swap_brand"], r["product_name"], str(r["qty"]), m(r["swap_fees"]), m(r["amount"])])
     rows.append(["TOTAL", "", str(t["qty"]), m(t["swap_fees"]), m(t["amount"])])
@@ -484,7 +484,7 @@ def swapped_pdf_response(data, subtitle, filename):
     flow.append(_styled_table(rows, [68, 92, 80, 74, 82, 56, 82, 26, 46, 50, 64], right_from=7))
 
     flow.append(Paragraph("Swapped Empties On Hand (not yet dispatched)", h3))
-    rows = [["Location", "Brand", "Size (swapped for)", "Qty on Hand"]]
+    rows = [["Location", "Brand", "Cylinder (size / valve)", "Qty on Hand"]]
     for r in data["on_hand"]:
         rows.append([r["location_name"], r["brand"], r["product_name"], str(r["quantity"])])
     rows.append(["TOTAL", "", "", str(t["on_hand"])])
@@ -516,12 +516,12 @@ def swapped_xlsx_response(data, subtitle, filename):
     ws.append(["Swapped Cylinder Report"]); ws["A1"].font = Font(bold=True, size=14)
     ws.append([subtitle])
     ws.append([])
-    header(ws, ["Brand Swapped", "Size (swapped for)", "Qty", "Swap Fees", "Sales Amount"])
+    header(ws, ["Brand Swapped", "Cylinder (size / valve)", "Qty", "Swap Fees", "Sales Amount"])
     for r in data["summary"]:
         ws.append([r["swap_brand"], r["product_name"], r["qty"], r["swap_fees"], r["amount"]])
     ws.append(["TOTAL", "", t["qty"], t["swap_fees"], t["amount"]]); bold_last(ws)
     ws.append([])
-    header(ws, ["On Hand: Location", "Brand", "Size (swapped for)", "Qty on Hand"])
+    header(ws, ["On Hand: Location", "Brand", "Cylinder (size / valve)", "Qty on Hand"])
     for r in data["on_hand"]:
         ws.append([r["location_name"], r["brand"], r["product_name"], r["quantity"]])
     ws.append(["TOTAL", "", "", t["on_hand"]]); bold_last(ws)
