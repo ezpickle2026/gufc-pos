@@ -2027,28 +2027,95 @@ def get_inventory():
     return jsonify([dict(r) for r in rows])
 
 
+LEDGER_STOCKS = {
+    "FULL": ("inventory_movements", "inventory", "Full"),
+    "EMPTY": ("empty_cylinder_movements", "empty_cylinder_inventory", "Empty"),
+    "SWAPPED": ("swapped_empty_movements", "swapped_empty_inventory", "Swapped"),
+}
+
+
+def _ledger_query(args):
+    """Movements of full cylinders, empties and swapped (other-brand) empties,
+    one stock or all of them together, filtered and with the balance after
+    each line. The balance is anchored on the count on hand now, so it always
+    ends at what the Inventory page shows."""
+    stock = (args.get("stock") or "ALL").upper()
+    stocks = [stock] if stock in LEDGER_STOCKS else list(LEDGER_STOCKS)
+    parts = []
+    for key in stocks:
+        mtable, itable, label = LEDGER_STOCKS[key]
+        brand = "m.brand" if key == "SWAPPED" else "NULL"
+        brand_join = " AND i.brand=m.brand" if key == "SWAPPED" else ""
+        parts.append(f"""
+            SELECT '{key}' stock, '{label}' stock_label, m.id, m.ts, m.location_id, m.product_id, {brand} brand,
+                   m.qty_change, m.type, m.reference, m.notes, m.user_id,
+                   COALESCE((SELECT i.quantity FROM {itable} i WHERE i.location_id=m.location_id
+                             AND i.product_id=m.product_id{brand_join}), 0)
+                   - SUM(m.qty_change) OVER (PARTITION BY m.location_id, m.product_id, {brand})
+                   + SUM(m.qty_change) OVER (PARTITION BY m.location_id, m.product_id, {brand}
+                                              ORDER BY m.ts, m.id ROWS UNBOUNDED PRECEDING) balance
+            FROM {mtable} m""")
+    tz = f"'{APP_TZ_OFFSET_HOURS:+g} hours'"
+    sql = ("SELECT x.*, p.name product_name, l.name location_name, u.name user_name FROM ("
+           + " UNION ALL ".join(parts) +
+           ") x JOIN products p ON p.id=x.product_id JOIN locations l ON l.id=x.location_id "
+           "LEFT JOIN users u ON u.id=x.user_id WHERE 1=1")
+    params = []
+    for col, name in (("x.product_id", "product_id"), ("x.location_id", "location_id")):
+        v = args.get(name, type=int)
+        if v:
+            sql += f" AND {col}=?"; params.append(v)
+    if args.get("type"):
+        sql += " AND x.type=?"; params.append(args.get("type"))
+    if args.get("date_from"):
+        sql += f" AND date(x.ts, {tz}) >= date(?)"; params.append(args.get("date_from"))
+    if args.get("date_to"):
+        sql += f" AND date(x.ts, {tz}) <= date(?)"; params.append(args.get("date_to"))
+    q = (args.get("q") or "").strip()
+    if q:
+        sql += " AND (x.reference LIKE ? OR x.notes LIKE ? OR x.type LIKE ? OR x.brand LIKE ?)"
+        params += [f"%{q}%"] * 4
+    direction = "ASC" if (args.get("order") or "").lower() == "asc" else "DESC"
+    sql += f" ORDER BY x.ts {direction}, x.stock, x.id {direction}"
+    return sql, params
+
+
+def _ledger_row(r):
+    d = dict(r)
+    d["ts"] = _local_ts(d["ts"])
+    for k in ("qty_change", "balance"):
+        if isinstance(d[k], float):
+            d[k] = round(d[k], 3)
+            if d[k].is_integer():
+                d[k] = int(d[k])
+    return d
+
+
 @app.get("/api/inventory/movements")
 @login_required
 def inventory_movements():
-    product_id = request.args.get("product_id", type=int)
-    location_id = request.args.get("location_id", type=int)
-    mtype = request.args.get("type")
-    stock = request.args.get("stock")
-    table = {"EMPTY": "empty_cylinder_movements", "SWAPPED": "swapped_empty_movements"}.get(stock, "inventory_movements")
+    limit = max(1, min(request.args.get("limit", 100, type=int), 1000))
+    offset = max(0, request.args.get("offset", 0, type=int))
+    sql, params = _ledger_query(request.args)
     conn = get_db()
-    sql = f"SELECT m.*, p.name product_name, l.name location_name FROM {table} m " \
-          "JOIN products p ON p.id=m.product_id JOIN locations l ON l.id=m.location_id WHERE 1=1"
-    params = []
-    if product_id:
-        sql += " AND m.product_id=?"; params.append(product_id)
-    if location_id:
-        sql += " AND m.location_id=?"; params.append(location_id)
-    if mtype:
-        sql += " AND m.type=?"; params.append(mtype)
-    sql += " ORDER BY m.ts DESC LIMIT 200"
-    rows = conn.execute(sql, params).fetchall()
+    total = conn.execute(f"SELECT COUNT(*) FROM ({sql})", params).fetchone()[0]
+    rows = conn.execute(sql + " LIMIT ? OFFSET ?", params + [limit, offset]).fetchall()
     conn.close()
-    return jsonify([dict(r) for r in rows])
+    return jsonify(rows=[_ledger_row(r) for r in rows], total=total, offset=offset, limit=limit)
+
+
+@app.get("/api/inventory/movements/export")
+@login_required
+def export_inventory_movements():
+    sql, params = _ledger_query(request.args)
+    conn = get_db()
+    rows = [_ledger_row(r) for r in conn.execute(sql, params).fetchall()]
+    conn.close()
+    headers = ["Date", "Stock", "Location", "Product", "Brand", "Change", "Balance", "Type", "Reference", "Notes", "User"]
+    data = [(r["ts"], r["stock_label"], r["location_name"], r["product_name"], r["brand"] or "", r["qty_change"],
+             r["balance"], r["type"], r["reference"] or "", r["notes"] or "", r["user_name"] or "") for r in rows]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    return xlsx_response(headers, data, f"inventory-ledger-{stamp}.xlsx", "Inventory Ledger")
 
 
 @app.get("/api/inventory/empties")
