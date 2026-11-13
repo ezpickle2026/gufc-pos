@@ -2080,7 +2080,7 @@ async function renderInventory(c) {
         ${SWAP_BRANDS.map(b => `<option>${esc(b)}</option>`).join("")}<option value="__other">Other (type below)</option></select></div>
       <div class="field hidden" id="sOtherWrap"><label>Other brand</label><input type="text" id="sOther" placeholder="Brand name"></div>
       <div class="field"><label>Cylinder (size / valve)</label><select id="sProd">${prodOpts}</select></div>
-      <div class="field"><label>Quantity Change</label><input type="number" id="sDelta" placeholder="e.g. 10 or -5" value="0">
+      <div class="field"><label>Quantity Change</label><input type="number" id="sDelta" placeholder="e.g. 10 or -5" value="0" step="any">
         <div style="font-size:11.5px;color:var(--muted);margin-top:3px">Positive to add, negative to remove (e.g. damaged / written off).</div></div>
       <div class="field"><label>Reason (required)</label><input type="text" id="sReason" placeholder="e.g. Physical count correction"></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
@@ -2089,7 +2089,7 @@ async function renderInventory(c) {
       const sel = document.getElementById("sBrand");
       sel.addEventListener("change", () => document.getElementById("sOtherWrap").classList.toggle("hidden", sel.value !== "__other"));
       document.getElementById("sSaveBtn").addEventListener("click", async () => {
-        const delta = parseInt(document.getElementById("sDelta").value, 10);
+        const delta = parseFloat(document.getElementById("sDelta").value);
         const reason = document.getElementById("sReason").value.trim();
         const brand = sel.value === "__other" ? document.getElementById("sOther").value.trim() : sel.value;
         if (!brand) { toast("Enter the brand", "error"); return; }
@@ -2112,14 +2112,14 @@ async function renderInventory(c) {
     openModal("Adjust Empty Cylinders", `
       <div class="field"><label>Location</label><select id="eLoc">${locOpts}</select></div>
       <div class="field"><label>Product</label><select id="eProd">${prodOpts}</select></div>
-      <div class="field"><label>Quantity Change</label><input type="number" id="eDelta" placeholder="e.g. 10 or -5" value="0">
+      <div class="field"><label>Quantity Change</label><input type="number" id="eDelta" placeholder="e.g. 10 or -5" value="0" step="any">
         <div style="font-size:11.5px;color:var(--muted);margin-top:3px">Positive to add empties, negative to remove (e.g. damaged / written off).</div></div>
       <div class="field"><label>Reason (required)</label><input type="text" id="eReason" placeholder="e.g. Physical count correction"></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
         <button class="btn green" id="eSaveBtn">Save Adjustment</button></div>
     `, () => {
       document.getElementById("eSaveBtn").addEventListener("click", async () => {
-        const delta = parseInt(document.getElementById("eDelta").value, 10);
+        const delta = parseFloat(document.getElementById("eDelta").value);
         const reason = document.getElementById("eReason").value.trim();
         if (!delta) { toast("Enter a non-zero quantity change", "error"); return; }
         if (!reason) { toast("A reason is required", "error"); return; }
@@ -2140,7 +2140,7 @@ async function renderInventory(c) {
     openModal("Adjust Stock", `
       <div class="field"><label>Location</label><select id="aLoc">${locOpts}</select></div>
       <div class="field"><label>Product</label><select id="aProd">${prodOpts}</select></div>
-      <div class="field"><label>Quantity Change</label><input type="number" id="aDelta" placeholder="e.g. 10 or -5" value="0">
+      <div class="field"><label>Quantity Change</label><input type="number" id="aDelta" placeholder="e.g. 10 or -5" value="0" step="any">
         <div style="font-size:11.5px;color:var(--muted);margin-top:3px">Positive to add stock, negative to remove.</div></div>
       <div class="field"><label>Reason (required)</label><input type="text" id="aReason" placeholder="e.g. Physical count correction"></div>
       <div class="field"><label style="display:flex;align-items:center;gap:6px;font-weight:400">
@@ -2149,7 +2149,7 @@ async function renderInventory(c) {
         <button class="btn green" id="aSaveBtn">Save Adjustment</button></div>
     `, () => {
       document.getElementById("aSaveBtn").addEventListener("click", async () => {
-        const delta = parseInt(document.getElementById("aDelta").value, 10);
+        const delta = parseFloat(document.getElementById("aDelta").value);
         const reason = document.getElementById("aReason").value.trim();
         if (!delta) { toast("Enter a non-zero quantity change", "error"); return; }
         if (!reason) { toast("A reason is required", "error"); return; }
