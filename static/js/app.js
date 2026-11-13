@@ -316,6 +316,7 @@ async function renderPOS(c) {
   state.cart = [];
   state.products = await api("/products");
   try { state.discounts = await api("/discounts?live=1"); } catch (e) { state.discounts = []; }
+  try { state.packages = await api("/packages?live=1"); } catch (e) { state.packages = []; }
   const locationId = isAdminLike() ? (state.locations[0] && state.locations[0].id) : state.user.location_id;
   const inv = await api(`/inventory?location_id=${locationId}`);
   const stockMap = {};
@@ -334,7 +335,17 @@ async function renderPOS(c) {
     const grid = document.getElementById("productGrid");
     const f = filter.toLowerCase();
     const items = state.products.filter(p => p.name.toLowerCase().includes(f) || p.sku.toLowerCase().includes(f));
-    grid.innerHTML = items.map(p => {
+    const pkgs = (state.packages || []).filter(k => k.name.toLowerCase().includes(f)
+      || k.items.some(i => i.product_name.toLowerCase().includes(f)));
+    grid.innerHTML = pkgs.map(k => {
+      const avail = packageStock(k);
+      return `<div class="product-tile" data-pkg="${k.id}" style="border-color:var(--green);background:#f1faf4">
+        <div class="pname"><span class="badge green" style="font-size:10px">PACKAGE</span> ${esc(k.name)}</div>
+        <div class="pprice">${money(k.price)} <span style="font-size:11px;color:var(--muted);text-decoration:line-through;font-weight:400">${money(k.regular_price)}</span></div>
+        <div style="font-size:11px;color:var(--muted)">${k.items.map(i => `${i.qty} x ${esc(i.product_name)}`).join("<br>")}</div>
+        <div class="pstock ${avail <= 0 ? 'low' : ''}">${avail} available</div>
+      </div>`;
+    }).join("") + items.map(p => {
       const stock = stockMap[p.id] ?? 0;
       const low = stock <= 0;
       return `<div class="product-tile" data-pid="${p.id}">
@@ -344,12 +355,36 @@ async function renderPOS(c) {
       </div>`;
     }).join("") || `<p style="color:var(--muted)">No products found.</p>`;
     grid.querySelectorAll(".product-tile").forEach(t => t.addEventListener("click", () => {
-      addToCart(parseInt(t.dataset.pid), stockMap);
+      if (t.dataset.pkg) addPackageToCart(parseInt(t.dataset.pkg));
+      else addToCart(parseInt(t.dataset.pid), stockMap);
     }));
   }
   document.getElementById("posSearch").addEventListener("input", e => drawProducts(e.target.value));
   drawProducts();
   drawCart(locationId);
+
+  // How many of a package the stock here can cover, after what's already in
+  // the cart (other lines use the same products).
+  function packageStock(k, skip) {
+    const used = {};
+    state.cart.forEach(i => {
+      if (i === skip) return;
+      if (i.package_id) i.components.forEach(c => used[c.product_id] = (used[c.product_id] || 0) + c.qty * i.qty);
+      else used[i.product_id] = (used[i.product_id] || 0) + i.qty;
+    });
+    return Math.max(0, Math.min(...k.items.map(c => Math.floor(((stockMap[c.product_id] ?? 0) - (used[c.product_id] || 0)) / c.qty))));
+  }
+  function addPackageToCart(id) {
+    const k = state.packages.find(x => x.id === id);
+    const existing = state.cart.find(i => i.package_id === id);
+    if (packageStock(k, existing) < (existing ? existing.qty : 0) + 1) { toast(`Not enough stock for the package ${k.name}`, "error"); return; }
+    if (existing) existing.qty += 1;
+    else state.cart.push({
+      product_id: -id, package_id: id, name: k.name, base_price: k.price, deposit_price: 0, is_cylinder: false,
+      sale_mode: "PACKAGE", price: k.price, regular_price: k.regular_price, qty: 1, components: k.items,
+    });
+    drawCart(locationId);
+  }
 
   function addToCart(pid, stockMap) {
     const prod = state.products.find(p => p.id === pid);
@@ -370,7 +405,8 @@ async function renderPOS(c) {
   window.__posRemove = (pid, mode) => { state.cart = state.cart.filter(i => !(i.product_id === pid && i.sale_mode === mode)); drawCart(locationId); };
   window.__posQty = (pid, mode, val) => {
     const item = state.cart.find(i => i.product_id === pid && i.sale_mode === mode);
-    const stock = stockMap[pid] ?? 0;
+    const stock = item && item.package_id ? packageStock(state.packages.find(k => k.id === item.package_id), item)
+      : (stockMap[pid] ?? 0);
     let q = parseInt(val) || 0;
     if (q > stock) { toast(`Only ${stock} in stock`, "error"); q = stock; }
     if (q <= 0) { state.cart = state.cart.filter(i => !(i.product_id === pid && i.sale_mode === mode)); }
@@ -451,6 +487,7 @@ function swapLineText(i) {
 }
 // What a cart line sends to the server.
 function cartItemPayload(i) {
+  if (i.package_id) return { package_id: i.package_id, qty: i.qty };
   const swap = isSwapMode(i.sale_mode);
   return {
     product_id: i.product_id, qty: i.qty, sale_mode: swap ? "SWAP" : i.sale_mode,
@@ -525,6 +562,7 @@ function openSwapDialog(item, mode, onOk, onCancel) {
 
 // Discounts usable on a cart line (all-items promos + ones for this product).
 function discountsFor(item) {
+  if (item.package_id) return [];
   return (state.discounts || []).filter(d => !d.product_id || d.product_id === item.product_id);
 }
 
@@ -557,8 +595,10 @@ function drawCart(locationId) {
     <h3 style="margin-top:0">Cart</h3>
     <div id="cartLines">${state.cart.length ? state.cart.map(i => `
       <div class="cart-line">
-        <div class="cname">${esc(i.name)} ${i.sale_mode === 'DEPOSIT' ? '<span class="badge warn">DEPOSIT</span>' : ''}${isSwapMode(i.sale_mode) ? `<span class="badge blue">${SWAP_TYPE_OF[i.sale_mode] ? "SWAP " + esc(valveText(i)) : "SWAP"}</span>` : ''}<br>
+        <div class="cname">${i.package_id ? '<span class="badge green">PACKAGE</span> ' : ""}${esc(i.name)} ${i.sale_mode === 'DEPOSIT' ? '<span class="badge warn">DEPOSIT</span>' : ''}${isSwapMode(i.sale_mode) ? `<span class="badge blue">${SWAP_TYPE_OF[i.sale_mode] ? "SWAP " + esc(valveText(i)) : "SWAP"}</span>` : ''}<br>
           <span style="color:var(--muted);font-size:12px">${money(i.price)} each</span>
+          ${i.package_id ? `<br><span style="font-size:11.5px;color:var(--muted)">${i.components.map(c => `${c.qty * i.qty} x ${esc(c.product_name)}${c.sale_mode === "DEPOSIT" ? " (deposit)" : ""}`).join(", ")}</span>
+            <br><span style="font-size:12px;color:var(--green-dark);font-weight:600">You save ${money((i.regular_price - i.price) * i.qty)}</span>` : ""}
           ${i.is_cylinder ? `<select style="margin-left:6px;font-size:11px;padding:2px 4px" onchange="__posMode(${i.product_id}, '${i.sale_mode}', this.value)">
             <option value="REFILL" ${i.sale_mode === 'REFILL' ? 'selected' : ''}>Refill (exchange empty)</option>
             ${i.deposit_price > 0 ? `<option value="DEPOSIT" ${i.sale_mode === 'DEPOSIT' ? 'selected' : ''}>New/Deposit (+${money(i.deposit_price)})</option>` : ""}
@@ -795,7 +835,7 @@ function printReceipt(result) {
       <div>Txn: ${sale.sale_no}<br>Date: ${sale.ts}<br>Cashier: ${esc(sale.cashier_name)}<br>
       Customer: ${esc(sale.customer_name || "Walk-in")} ${sale.account_no ? "(" + sale.account_no + ")" : ""}</div>
       ${hr}
-      ${items.map(i => `<div class="r58-item">${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}${i.sale_mode === 'SWAP' ? `<div class="r58-sub">SWAP from ${esc(swapItemText(i))}${i.swap_fee > 0 ? ` (fee ${money(i.swap_fee)}/cyl)` : ""}</div>` : ''}
+      ${items.map(i => `<div class="r58-item">${esc(i.product_name)}${i.package_name ? ` <span class="r58-sub">[${esc(i.package_name)}]</span>` : ""}${i.sale_mode === 'DEPOSIT' ? ' (DEPOSIT)' : ''}${i.sale_mode === 'SWAP' ? `<div class="r58-sub">SWAP from ${esc(swapItemText(i))}${i.swap_fee > 0 ? ` (fee ${money(i.swap_fee)}/cyl)` : ""}</div>` : ''}
         <div class="r58-sub">${row(`${i.qty} x ${money(i.price)}`, money(i.subtotal))}</div>${i.discount_amount > 0 ? `<div class="r58-sub">${row(`Less: ${esc(i.discount_name)}`, `-${money(i.discount_amount)}`)}</div>` : ""}</div>`).join("")}
       ${hr}
       ${row("Subtotal:", money(sale.subtotal))}
@@ -995,7 +1035,8 @@ function printDeliveryReceipt(result) {
     if (i.sale_mode === "REFILL") notes.push("Refill — empty returned");
     if (i.sale_mode === "DEPOSIT") notes.push("With cylinder deposit");
     if (i.sale_mode === "SWAP") notes.push(`Swap from ${esc(swapItemText(i))}${i.swap_fee > 0 && !noAmounts ? `, fee ${money(i.swap_fee)}/cyl` : ""}`);
-    if (i.discount_amount > 0 && !noAmounts) notes.push(`Less ${esc(i.discount_name || "discount")}: −${money(i.discount_amount)}`);
+    if (i.package_name) notes.push(`Package: ${esc(i.package_name)}`);
+    if (i.discount_amount > 0 && !noAmounts) notes.push(`Less ${esc(i.package_name ? "package savings" : i.discount_name || "discount")}: −${money(i.discount_amount)}`);
     if (i.bill_later && !noAmounts) notes.push("Gas billed separately (commercial billing)");
     const priceCell = i.bill_later && !i.price ? "For billing" : money(i.price);
     const amtCell = i.bill_later && !i.subtotal ? "—" : money(i.subtotal - (i.discount_amount || 0));
@@ -1285,6 +1326,8 @@ window.openEditSale = async (saleId) => {
       row.dataset.discountId = it.discount_id || "";
       row.dataset.discountName = it.discount_name || "";
       row.dataset.swapFee = it.swap_fee || "";
+      row.dataset.packageId = it.package_id || "";
+      row.dataset.packageName = it.package_name || "";
       row.innerHTML = `<select class="esProd" style="flex:2.2;min-width:0;width:auto">${prodOpts(it.product_id, it.product_name)}</select>
         <select class="esMode" style="flex:1.1;min-width:0;width:auto">
           ${[["REFILL", "REFILL"], ["DEPOSIT", "DEPOSIT"], ["SWAP", "SWAP (other brand)"],
@@ -1344,6 +1387,7 @@ window.openEditSale = async (saleId) => {
           qty: r.querySelector(".esQty").value, price: r.querySelector(".esPrice").value,
           discount_amount: r.querySelector(".esDisc").value, swap_brand: r.querySelector(".esBrand").value,
           discount_id: r.dataset.discountId ? parseInt(r.dataset.discountId) : null, discount_name: r.dataset.discountName || null,
+          package_id: r.dataset.packageId ? parseInt(r.dataset.packageId) : null, package_name: r.dataset.packageName || null,
         })),
       };
       if (!body.reason) { toast("Type the reason for the adjustment", "error"); return; }
@@ -1447,7 +1491,7 @@ window.viewSale = async (id) => {
       ${sale.dr_no ? ` &nbsp; <b>Delivery Receipt:</b> ${esc(sale.dr_no)}` : ""}
       ${sale.edited_at ? `<br><span style="font-size:12.5px;color:var(--muted)">Adjusted ${esc(sale.edited_at)}${sale.edited_by_name ? " by " + esc(sale.edited_by_name) : ""} (see Audit Log for the details)</span>` : ""}</div>
     <div class="table-wrap"><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Subtotal</th></tr></thead><tbody>
-      ${items.map(i => `<tr><td>${esc(i.product_name)}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}${i.sale_mode === 'SWAP' ? ` <span class="badge blue">SWAP</span><br><span style="font-size:12px">from ${esc(swapItemText(i))}${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : ""}</span>` : ''}${i.discount_amount > 0 ? `<br><span style="font-size:12px;color:var(--green-dark)">${esc(i.discount_name)} &minus;${money(i.discount_amount)}</span>` : ""}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
+      ${items.map(i => `<tr><td>${esc(i.product_name)}${i.package_name ? ` <span class="badge green">${esc(i.package_name)}</span>` : ""}${i.sale_mode === 'DEPOSIT' ? ' <span class="badge warn">DEPOSIT</span>' : ''}${i.sale_mode === 'SWAP' ? ` <span class="badge blue">SWAP</span><br><span style="font-size:12px">from ${esc(swapItemText(i))}${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : ""}</span>` : ''}${i.discount_amount > 0 ? `<br><span style="font-size:12px;color:var(--green-dark)">${esc(i.discount_name)} &minus;${money(i.discount_amount)}</span>` : ""}</td><td>${i.qty}</td><td>${money(i.price)}</td><td>${money(i.subtotal)}</td></tr>`).join("")}
     </tbody></table></div>
     <div style="margin-top:10px">
       <div class="cart-total-row"><span>Subtotal</span><span>${money(sale.subtotal)}</span></div>
@@ -3170,7 +3214,12 @@ async function renderDiscounts(c) {
   c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
     <button class="btn green" id="newDiscBtn">+ New Discount / Promo</button>
     <span style="font-size:12.5px;color:var(--muted)">Discounts apply per item. The cashier picks one (optional) for each cart line in POS.</span>
-  </div><div id="discTable">Loading...</div>`;
+  </div><div id="discTable">Loading...</div>
+  <div style="margin:26px 0 12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <h3 style="margin:0">Package Promos</h3>
+    <button class="btn green" id="newPkgBtn">+ New Package Promo</button>
+    <span style="font-size:12.5px;color:var(--muted)">Several products for one price. The cashier adds the package in POS; each product comes out of inventory.</span>
+  </div><div id="pkgTable">Loading...</div>`;
   let rows = [];
   const today = new Date().toISOString().slice(0, 10);
   function statusOf(d) {
@@ -3238,6 +3287,103 @@ async function renderDiscounts(c) {
     });
   }
   document.getElementById("newDiscBtn").addEventListener("click", () => openForm(null));
+
+  // ---- package promos
+  let pkgs = [];
+  async function loadPkgs() {
+    pkgs = await api("/packages");
+    document.getElementById("pkgTable").innerHTML = pkgs.length ? `<div class="table-wrap"><table><thead><tr>
+      <th>Package</th><th>Items</th><th>Regular</th><th>Package Price</th><th>Savings</th><th>Valid</th><th>Status</th><th></th>
+    </tr></thead><tbody>
+      ${pkgs.map(k => `<tr>
+        <td><b>${esc(k.name)}</b>${k.notes ? `<br><span style="font-size:12px;color:var(--muted)">${esc(k.notes)}</span>` : ""}</td>
+        <td>${k.items.map(i => `${i.qty} x ${esc(i.product_name)}${i.sale_mode === "DEPOSIT" ? " (deposit)" : ""}${i.active ? "" : ' <span class="badge danger">archived</span>'}`).join("<br>")}</td>
+        <td>${money(k.regular_price)}</td><td><b>${money(k.price)}</b></td>
+        <td style="color:${k.savings < 0 ? "var(--danger)" : "var(--green-dark)"}">${money(k.savings)}</td>
+        <td>${k.start_date || k.end_date ? `${k.start_date || "…"} to ${k.end_date || "…"}` : "Always"}</td>
+        <td>${statusOf(k)}</td>
+        <td style="display:flex;gap:6px">
+          <button class="btn small" onclick="editPackage(${k.id})">Edit</button>
+          <button class="btn small danger" onclick="deletePackage(${k.id})">Delete</button>
+        </td></tr>`).join("")}
+    </tbody></table></div>` : `<p style="color:var(--muted)">No package promos yet. Click "+ New Package Promo" to add one.</p>`;
+  }
+  function openPkgForm(k) {
+    k = k || { items: [] };
+    const prodOpts = sel => state.products.map(p => `<option value="${p.id}" ${p.id === sel ? "selected" : ""}>${esc(p.name)} (${money(p.price)})</option>`).join("");
+    openModal(k.id ? "Edit Package Promo" : "New Package Promo", `
+      <div class="field"><label>Package name (shown on POS and receipt)</label><input id="kName" value="${esc(k.name || "")}" placeholder="e.g. 11kg Refill + Stove Bundle"></div>
+      <div class="field"><label>Products in the package</label>
+        <div style="display:flex;gap:6px;font-size:11.5px;color:var(--muted);font-weight:600">
+          <span style="flex:2.4">Product</span><span style="width:70px">Qty</span><span style="flex:1.2">Mode (cylinders)</span><span style="width:30px"></span></div>
+        <div id="kRows"></div>
+        <button class="btn small" id="kAdd" type="button">+ Add Product</button>
+      </div>
+      <div class="field"><label>Package price (₱)</label><input type="number" min="0" step="0.01" id="kPrice" value="${k.price ?? ""}"></div>
+      <div class="field" id="kSummary" style="background:var(--bg);padding:10px;border-radius:8px;font-size:13.5px"></div>
+      <div class="field"><label>Start date (optional)</label><input type="date" id="kStart" value="${k.start_date || ""}"></div>
+      <div class="field"><label>End date (optional)</label><input type="date" id="kEnd" value="${k.end_date || ""}"></div>
+      <div class="field"><label>Notes</label><input id="kNotes" value="${esc(k.notes || "")}"></div>
+      <label style="font-size:13px;display:flex;gap:6px;align-items:center;margin-bottom:10px"><input type="checkbox" id="kActive" ${k.active === 0 ? "" : "checked"}> Active</label>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="kSave">Save</button></div>`, () => {
+      document.querySelector("#modalRoot .modal").style.width = "640px";
+      const rowsEl = document.getElementById("kRows");
+      const recalc = () => {
+        let regular = 0;
+        rowsEl.querySelectorAll(".pay-row").forEach(r => {
+          const p = state.products.find(x => x.id === parseInt(r.querySelector(".kProd").value)) || {};
+          const q = parseInt(r.querySelector(".kQty").value) || 0;
+          regular += (Number(p.price || 0) + (r.querySelector(".kMode").value === "DEPOSIT" ? Number(p.deposit_price || 0) : 0)) * q;
+        });
+        const price = parseFloat(document.getElementById("kPrice").value) || 0;
+        const save = regular - price;
+        document.getElementById("kSummary").innerHTML = `Regular price of the items: <b>${money(regular)}</b> &middot; Package price: <b>${money(price)}</b> &middot;
+          Customer saves: <b style="color:${save < 0 ? "var(--danger)" : "var(--green-dark)"}">${money(save)}</b>
+          ${save < 0 ? `<br><span style="color:var(--danger)">The package price can't be more than the regular price.</span>` : ""}`;
+      };
+      const addRow = (it = {}) => {
+        const row = document.createElement("div");
+        row.className = "pay-row";
+        row.innerHTML = `<select class="kProd" style="flex:2.4;min-width:0;width:auto">${prodOpts(it.product_id)}</select>
+          <input type="number" class="kQty" min="1" step="1" value="${it.qty || 1}" style="width:70px;flex:none">
+          <select class="kMode" style="flex:1.2;min-width:0;width:auto">
+            <option value="REFILL" ${it.sale_mode !== "DEPOSIT" ? "selected" : ""}>Refill / regular</option>
+            <option value="DEPOSIT" ${it.sale_mode === "DEPOSIT" ? "selected" : ""}>New / with deposit</option></select>
+          <button class="btn small danger" type="button">&times;</button>`;
+        row.querySelectorAll("select,input").forEach(i => i.addEventListener("input", recalc));
+        row.querySelector("button").addEventListener("click", () => { row.remove(); recalc(); });
+        rowsEl.appendChild(row);
+      };
+      (k.items.length ? k.items : [{}, {}]).forEach(addRow);
+      document.getElementById("kAdd").addEventListener("click", () => { addRow(); recalc(); });
+      document.getElementById("kPrice").addEventListener("input", recalc);
+      recalc();
+      document.getElementById("kSave").addEventListener("click", async (ev) => {
+        const body = {
+          name: document.getElementById("kName").value, price: document.getElementById("kPrice").value,
+          start_date: document.getElementById("kStart").value, end_date: document.getElementById("kEnd").value,
+          notes: document.getElementById("kNotes").value, active: document.getElementById("kActive").checked,
+          items: [...rowsEl.querySelectorAll(".pay-row")].map(r => ({
+            product_id: parseInt(r.querySelector(".kProd").value), qty: r.querySelector(".kQty").value,
+            sale_mode: r.querySelector(".kMode").value })),
+        };
+        ev.target.disabled = true;
+        try {
+          if (k.id) await api(`/packages/${k.id}`, { method: "PUT", body });
+          else await api("/packages", { method: "POST", body });
+          closeModal(); toast("Package saved", "success"); loadPkgs();
+        } catch (e) { ev.target.disabled = false; }
+      });
+    });
+  }
+  document.getElementById("newPkgBtn").addEventListener("click", () => openPkgForm(null));
+  window.editPackage = (id) => openPkgForm(pkgs.find(k => k.id === id));
+  window.deletePackage = async (id) => {
+    if (!confirm("Delete this package promo? Past sales keep their recorded items and amounts.")) return;
+    try { await api(`/packages/${id}`, { method: "DELETE" }); toast("Package deleted", "success"); loadPkgs(); } catch (e) {}
+  };
+  loadPkgs();
   window.editDiscount = (id) => openForm(rows.find(r => r.id === id));
   window.deleteDiscount = async (id) => {
     if (!confirm("Delete this discount? Past sales keep their recorded discount.")) return;
