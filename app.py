@@ -6468,6 +6468,13 @@ def _create_dr_billing(d, location_id, source_sale=None):
 
         delivered_kg = round(delivered_qty * kg_per_cyl, 2)
         total_residual = round(sum(p[3] for p in pullouts), 2)
+        # Billing from a POS sale may give just the overall residual (no per-cylinder rows).
+        if not pullouts:
+            overall = _num(d.get("total_residual_kg"), "Total residual kg", allow_blank=True)
+            if overall is not None:
+                if overall < 0:
+                    raise ValueError("Total residual can't be negative")
+                total_residual = round(overall, 2)
         billable_kg = round(delivered_kg - total_residual, 2)
         if billable_kg <= 0:
             raise ValueError("Residual is equal to or more than what was delivered — nothing to bill")
@@ -6497,7 +6504,7 @@ def _create_dr_billing(d, location_id, source_sale=None):
         desc = (f"Commercial DR billing {delivery_no}" + (f" (DR {dr_ref})" if dr_ref else "") +
                 (f" for {source_sale['sale_no']}" if source_sale is not None else "") +
                 f": {delivered_qty} x {kg_per_cyl:g}kg = {delivered_kg}kg delivered - {total_residual}kg residual "
-                f"({len(pullouts)} pulled out) = {billable_kg}kg @ {money_fmt(price_per_kg)}/kg")
+                f"{f'({len(pullouts)} pulled out) ' if pullouts else ''}= {billable_kg}kg @ {money_fmt(price_per_kg)}/kg")
         sale_id, sale_no, dr_no = _bill_delivery_as_credit_sale(
             conn, did, customer, product, location_id, billable_kg, price_per_kg, desc,
             f"{product['name']} (DR billing)", with_dr_no=source_sale is None)
@@ -6753,6 +6760,7 @@ def sale_generate_commercial_billing(sale_id):
         # one size per billing record (mixed sizes are averaged so the kg stays exact)
         "kg_per_cylinder": delivered_kg / delivered_qty,
         "pullouts": d.get("pullouts") or [], "notes": d.get("notes", ""), "dr_ref": d.get("dr_ref") or "",
+        "total_residual_kg": d.get("total_residual_kg"),
     }
     return _create_dr_billing(body, location_id, source_sale=sale)
 
