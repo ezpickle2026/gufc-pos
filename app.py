@@ -4052,6 +4052,63 @@ def pay_receivable(rid):
     return jsonify(ok=True, paid=new_paid, balance=new_balance)
 
 
+@app.put("/api/receivables/<int:rid>")
+@roles_required("ADMIN")  # Admin (super admin) and Operation Head only
+def update_receivable(rid):
+    """Correct a receivable's invoice #, invoice date and due date. The amount
+    can be changed only on previous-arrears entries — a regular invoice's
+    amount follows its sale (edit the sale instead) so the two never drift."""
+    d = request.get_json(force=True)
+    conn = get_db()
+    r = conn.execute(
+        "SELECT r.*, s.is_opening_balance FROM receivables r JOIN sales s ON s.id=r.sale_id WHERE r.id=?", (rid,)
+    ).fetchone()
+    if not r:
+        conn.close(); return jsonify(error="Not found"), 404
+    try:
+        invoice_no = (d.get("invoice_no") or r["invoice_no"]).strip()
+        if invoice_no != r["invoice_no"] and conn.execute(
+                "SELECT 1 FROM receivables WHERE invoice_no=? AND id!=?", (invoice_no, rid)).fetchone():
+            raise ValueError(f"Invoice # '{invoice_no}' already exists")
+        invoice_date = _parse_date(d.get("invoice_date") or r["invoice_date"], "invoice_date")
+        due_date = _parse_date(d.get("due_date") or r["due_date"], "due_date")
+        if due_date < invoice_date:
+            raise ValueError("Due date can't be before the invoice date")
+        amount = r["amount"]
+        if d.get("amount") not in (None, ""):
+            try:
+                amount = round(float(d["amount"]), 2)
+            except (TypeError, ValueError):
+                raise ValueError("amount must be a number")
+            if abs(amount - r["amount"]) > 0.009:
+                if not r["is_opening_balance"]:
+                    raise ValueError("The amount of a regular invoice follows its sale — edit the sale instead")
+                if amount <= 0:
+                    raise ValueError("Amount must be greater than zero")
+                if amount < r["paid"] - 0.009:
+                    raise ValueError(f"Amount can't be less than what's already paid ({r['paid']:.2f})")
+        balance = round(amount - r["paid"], 2)
+        conn.execute("UPDATE receivables SET invoice_no=?, invoice_date=?, due_date=?, amount=?, balance=? WHERE id=?",
+                     (invoice_no, str(invoice_date), str(due_date), amount, balance, rid))
+        if r["is_opening_balance"]:
+            conn.execute("UPDATE sales SET ts=?, subtotal=?, total=? WHERE id=?",
+                         (f"{invoice_date} 00:00:00", amount, amount, r["sale_id"]))
+            conn.execute("UPDATE sales SET balance=total-paid WHERE id=?", (r["sale_id"],))
+        recompute_receivable_status(conn, rid)
+        changes = []
+        for label, old, new in (("invoice #", r["invoice_no"], invoice_no), ("invoice date", r["invoice_date"], str(invoice_date)),
+                                ("due date", r["due_date"], str(due_date)), ("amount", f"{r['amount']:.2f}", f"{amount:.2f}")):
+            if str(old) != str(new):
+                changes.append(f"{label} {old} -> {new}")
+        audit(conn, "UPDATE", "RECEIVABLES", rid, f"{r['invoice_no']}: " + ("; ".join(changes) or "no changes"))
+        conn.commit()
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(ok=True)
+
+
 # ---------------------------------------------------------------- previous arrears (opening balances)
 # Lets Admin/Accounting load a customer's unpaid balance from before this
 # system went live. Each one is stored as a zero-item "opening balance" credit
@@ -4274,19 +4331,19 @@ def _parse_transfer_payload(d):
     return int(from_location), (int(to_location) if to_location else None), to_external, clean
 
 
-def _dispatch_out(conn, from_location, items, transfer_no, dest_label, reverse=False):
+def _dispatch_out(conn, from_location, items, transfer_no, dest_label, reverse=False, mtype="DISPATCH EDIT"):
     """Take the items out of the origin location (or, with reverse=True, put
     them back — used when a dispatch is edited)."""
     for it in items:
         pid, qty, state, brand = it["product_id"], it["qty"], it["cylinder_state"], it["swap_brand"]
         if reverse:
-            note = f"Reversed for edit of {transfer_no}"
+            note = f"Reversed ({mtype.split()[-1].lower()}) — {transfer_no}"
             if state == "SWAPPED":
-                add_swapped_empties(conn, from_location, pid, brand, qty, "DISPATCH EDIT", transfer_no, notes=note)
+                add_swapped_empties(conn, from_location, pid, brand, qty, mtype, transfer_no, notes=note)
             elif state == "EMPTY":
-                add_empty_cylinders(conn, from_location, pid, qty, "DISPATCH EDIT", transfer_no, notes=note)
+                add_empty_cylinders(conn, from_location, pid, qty, mtype, transfer_no, notes=note)
             else:
-                adjust_inventory(conn, from_location, pid, qty, "DISPATCH EDIT", transfer_no, notes=note)
+                adjust_inventory(conn, from_location, pid, qty, mtype, transfer_no, notes=note)
         elif state == "SWAPPED":
             remove_swapped_empties(conn, from_location, pid, brand, qty, "DISPATCH OUT", transfer_no,
                                    notes=f"{brand} empties dispatched to {dest_label}")
@@ -4298,7 +4355,7 @@ def _dispatch_out(conn, from_location, items, transfer_no, dest_label, reverse=F
                              notes=f"Full cylinders dispatched to {dest_label}")
 
 
-def _dispatch_in(conn, to_location, items, transfer_no, reverse=False):
+def _dispatch_in(conn, to_location, items, transfer_no, reverse=False, mtype="DISPATCH EDIT"):
     """Add received items to the destination location (or, with reverse=True,
     take them back out — used when a received dispatch is edited)."""
     if not to_location:
@@ -4306,13 +4363,13 @@ def _dispatch_in(conn, to_location, items, transfer_no, reverse=False):
     for it in items:
         pid, qty, state, brand = it["product_id"], it["qty"], it["cylinder_state"], it["swap_brand"]
         if reverse:
-            note = f"Reversed for edit of {transfer_no}"
+            note = f"Reversed ({mtype.split()[-1].lower()}) — {transfer_no}"
             if state == "SWAPPED":
-                remove_swapped_empties(conn, to_location, pid, brand, qty, "DISPATCH EDIT", transfer_no, notes=note)
+                remove_swapped_empties(conn, to_location, pid, brand, qty, mtype, transfer_no, notes=note)
             elif state == "EMPTY":
-                remove_empty_cylinders(conn, to_location, pid, qty, "DISPATCH EDIT", transfer_no, notes=note)
+                remove_empty_cylinders(conn, to_location, pid, qty, mtype, transfer_no, notes=note)
             else:
-                adjust_inventory(conn, to_location, pid, -qty, "DISPATCH EDIT", transfer_no, notes=note)
+                adjust_inventory(conn, to_location, pid, -qty, mtype, transfer_no, notes=note)
         elif state == "SWAPPED":
             add_swapped_empties(conn, to_location, pid, brand, qty, "DISPATCH IN", transfer_no,
                                 notes="Swapped empties received from dispatch")
@@ -4400,6 +4457,38 @@ def update_transfer(tid):
                          (tid, it["product_id"], it["qty"], it["cylinder_state"], it["swap_brand"]))
         summary = ", ".join(f"{i['cylinder_state']} #{i['product_id']} x{i['qty']}" for i in items)
         audit(conn, "UPDATE", "TRANSFERS", tid, f"{no} edited: {summary}")
+        conn.commit()
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/transfers/<int:tid>/cancel")
+@roles_required("ADMIN")  # Admin (super admin) and Operation Head only
+def cancel_transfer(tid):
+    """Cancel a dispatch: the cylinders go back to the origin location. If it
+    was already received, they're taken back out of the destination first."""
+    conn = get_db()
+    t = conn.execute("SELECT * FROM transfers WHERE id=?", (tid,)).fetchone()
+    if not t:
+        conn.close(); return jsonify(error="Not found"), 404
+    if t["status"] == "CANCELLED":
+        conn.close(); return jsonify(error="Dispatch is already cancelled"), 400
+    items = [
+        {"product_id": r["product_id"], "qty": r["qty"], "cylinder_state": r["cylinder_state"] or "FULL",
+         "swap_brand": r["swap_brand"]}
+        for r in conn.execute("SELECT * FROM transfer_items WHERE transfer_id=?", (tid,)).fetchall()
+    ]
+    reason = ((request.get_json(silent=True) or {}).get("reason") or "").strip()
+    no = t["transfer_no"]
+    try:
+        if t["status"] == "RECEIVED":
+            _dispatch_in(conn, t["to_location"], items, no, reverse=True, mtype="DISPATCH CANCEL")
+        _dispatch_out(conn, t["from_location"], items, no, None, reverse=True, mtype="DISPATCH CANCEL")
+        conn.execute("UPDATE transfers SET status='CANCELLED' WHERE id=?", (tid,))
+        audit(conn, "CANCEL", "TRANSFERS", tid, no + (f" — {reason}" if reason else ""))
         conn.commit()
     except ValueError as e:
         conn.rollback(); conn.close()

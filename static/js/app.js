@@ -1831,25 +1831,78 @@ async function renderReceivables(c) {
   const role = state.user.role;
   const canExport = ["ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING"].includes(role);
   const canArrears = ["ADMIN", "OPERATION_HEAD", "ACCOUNTING"].includes(role);
+  const canEdit = isAdminLike();
   const statusColor = s => ({ PAID: "green", CURRENT: "blue", "DUE SOON": "warn", OVERDUE: "danger", "PARTIALLY PAID": "warn" }[s] || "gray");
-  c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
+  c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <input id="recvSearch" placeholder="Search invoice #, customer, account #, sale #..." style="flex:1;min-width:220px;max-width:380px">
+    <select id="recvStatus" style="width:auto">
+      <option value="">All statuses</option><option value="UNPAID">Unpaid (with balance)</option>
+      ${["CURRENT", "DUE SOON", "OVERDUE", "PARTIALLY PAID", "PAID"].map(s => `<option>${s}</option>`).join("")}
+    </select>
     <button class="btn" id="agingBtn">Aging Report</button>
     ${canArrears ? `<button class="btn green" id="addArrearsBtn">+ Add Previous Arrears</button>
       <button class="btn" id="uploadArrearsBtn">Upload Previous Arrears (CSV)</button>` : ""}
   </div>
   <div class="table-wrap"><table><thead><tr>
     <th>Invoice #</th><th>Customer</th><th>Sale #</th><th>Invoice Date</th><th>Due Date</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Status</th><th></th>
-  </tr></thead><tbody>
-    ${rows.map(r => `<tr>
+  </tr></thead><tbody id="recvBody"></tbody></table></div>
+  <div id="recvCount" style="font-size:12.5px;color:var(--muted);margin-top:6px"></div>`;
+  const rowHtml = r => `<tr>
       <td>${esc(r.invoice_no)}</td><td>${esc(r.customer_name)} (${r.account_no})</td>
       <td>${r.is_opening_balance ? '<span class="badge gray">PREV. ARREARS</span>' : esc(r.sale_no)}</td>
       <td>${r.invoice_date}</td><td>${r.due_date}</td><td>${money(r.amount)}</td><td>${money(r.paid)}</td><td>${money(r.balance)}</td>
       <td><span class="badge ${statusColor(r.status)}">${r.status}</span></td>
       <td style="display:flex;gap:6px">${r.balance > 0.009 ? `<button class="btn small green" onclick="payReceivable(${r.id}, ${r.balance})">Record Payment</button>` : ""}
+        ${canEdit ? `<button class="btn small" onclick="editReceivable(${r.id})">Edit</button>` : ""}
         ${canArrears && r.is_opening_balance && r.paid <= 0 ? `<button class="btn small danger" onclick="deleteArrears(${r.id})">Remove</button>` : ""}</td>
-    </tr>`).join("")}
-  </tbody></table></div>`;
+    </tr>`;
+  function applyFilter() {
+    const q = document.getElementById("recvSearch").value.trim().toLowerCase();
+    const st = document.getElementById("recvStatus").value;
+    const shown = rows.filter(r => {
+      if (st === "UNPAID" ? !(r.balance > 0.009) : st && r.status !== st) return false;
+      if (!q) return true;
+      return [r.invoice_no, r.customer_name, r.account_no, r.sale_no, r.invoice_date, r.due_date]
+        .some(v => String(v ?? "").toLowerCase().includes(q));
+    });
+    document.getElementById("recvBody").innerHTML = shown.length ? shown.map(rowHtml).join("")
+      : `<tr><td colspan="10" style="color:var(--muted)">No receivables match your search.</td></tr>`;
+    const bal = shown.reduce((a, r) => a + (r.balance || 0), 0);
+    document.getElementById("recvCount").textContent = `${shown.length} of ${rows.length} shown · balance ${money(bal)}`;
+  }
+  document.getElementById("recvSearch").addEventListener("input", applyFilter);
+  document.getElementById("recvStatus").addEventListener("change", applyFilter);
+  applyFilter();
   document.getElementById("agingBtn").addEventListener("click", () => openAgingReport(canExport));
+  window.editReceivable = (id) => {
+    const r = rows.find(x => x.id === id);
+    if (!r) return;
+    openModal(`Edit Receivable ${esc(r.invoice_no)}`, `
+      <p style="font-size:12.5px;color:var(--muted);margin-top:0">${esc(r.customer_name)} (${esc(r.account_no)}) · Paid so far: <b>${money(r.paid)}</b></p>
+      <div class="field"><label>Invoice #</label><input id="erInv" value="${esc(r.invoice_no)}"></div>
+      <div class="field"><label>Invoice Date</label><input type="date" id="erDate" value="${r.invoice_date}"></div>
+      <div class="field"><label>Due Date</label><input type="date" id="erDue" value="${r.due_date}"></div>
+      <div class="field"><label>Amount</label>
+        <input type="number" id="erAmt" min="0" step="0.01" value="${r.amount}" ${r.is_opening_balance ? "" : "disabled"}>
+        ${r.is_opening_balance ? "" : `<div style="font-size:11.5px;color:var(--muted);margin-top:4px">The amount of a regular invoice follows its sale — edit the sale to change it.</div>`}</div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="erSaveBtn">Save Changes</button></div>
+    `, () => {
+      document.getElementById("erSaveBtn").addEventListener("click", async () => {
+        const body = {
+          invoice_no: document.getElementById("erInv").value.trim(),
+          invoice_date: document.getElementById("erDate").value,
+          due_date: document.getElementById("erDue").value,
+        };
+        if (r.is_opening_balance) body.amount = document.getElementById("erAmt").value;
+        if (!body.invoice_no) { toast("Invoice # is required", "error"); return; }
+        try {
+          await api(`/receivables/${id}`, { method: "PUT", body });
+          closeModal(); toast("Receivable updated", "success"); renderReceivables(document.getElementById("content"));
+        } catch (e) {}
+      });
+    });
+  };
   if (!canArrears) return;
 
   const reload = () => renderReceivables(document.getElementById("content"));
@@ -2287,7 +2340,8 @@ async function renderTransfers(c) {
         <td>${t.items.map(i => `${i.cylinder_state === 'SWAPPED' ? `${esc(i.swap_brand)} empty (${esc(i.product_name)})` : esc(i.product_name)} x${i.qty}${i.cylinder_state === 'EMPTY' ? ' <span class="badge gray">EMPTY</span>' : i.cylinder_state === 'SWAPPED' ? ' <span class="badge warn">SWAPPED</span>' : ' <span class="badge green">FULL</span>'}`).join(", ")}</td>
         <td><span class="badge ${t.status === 'RECEIVED' ? 'green' : t.status === 'CANCELLED' ? 'danger' : 'warn'}">${t.status}</span></td>
         <td style="white-space:nowrap">${t.status === 'RELEASED' ? `<button class="btn small green" onclick="receiveXfer(${t.id})">Mark Received</button>` : ""}
-          ${isAdminLike() && t.status !== 'CANCELLED' ? `<button class="btn small" onclick="editXfer(${t.id})">Edit</button>` : ""}</td>
+          ${isAdminLike() && t.status !== 'CANCELLED' ? `<button class="btn small" onclick="editXfer(${t.id})">Edit</button>
+            <button class="btn small danger" onclick="cancelXfer(${t.id})">Cancel</button>` : ""}</td>
       </tr>`).join("")}
     </tbody></table></div>`;
   }
@@ -2433,6 +2487,18 @@ async function renderTransfers(c) {
       });
     });
   }
+  window.cancelXfer = async (id) => {
+    const t = lastRows.find(r => r.id === id);
+    if (!t) return;
+    const msg = t.status === "RECEIVED"
+      ? `Cancel ${t.transfer_no}? It was already received — the cylinders will be taken back out of ${t.to_name} and returned to ${t.from_name}.`
+      : `Cancel ${t.transfer_no}? The cylinders will be returned to ${t.from_name}'s stock.`;
+    if (!confirm(msg)) return;
+    const reason = prompt("Reason for cancelling (optional):") ?? null;
+    if (reason === null) return;
+    try { await api(`/transfers/${id}/cancel`, { method: "POST", body: { reason } }); toast("Dispatch cancelled", "success"); load(); }
+    catch (e) {}
+  };
   window.editXfer = (id) => {
     const ex = lastRows.find(r => r.id === id);
     if (ex) openXferModal(ex);
