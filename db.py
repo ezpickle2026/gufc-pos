@@ -915,6 +915,12 @@ def migrate_schema():
         conn.execute("ALTER TABLE sale_items ADD COLUMN srp_price REAL")
     conn.commit()
 
+    # Hauling plan vs actual: qty is the planned qty; actual_qty is what was
+    # really hauled (NULL until recorded).
+    if not _column_exists(conn, "hauling_schedule_items", "actual_qty"):
+        conn.execute("ALTER TABLE hauling_schedule_items ADD COLUMN actual_qty INTEGER")
+        conn.commit()
+
     # 9f. Valve swaps (11kg A/S <-> POL). swap_type: NULL = plain other-brand
     #     swap; VALVE_OTHER = other-brand empty of the other valve; VALVE_SOLANE
     #     = our own Solane empty of the other valve (goes to our empty stock).

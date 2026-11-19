@@ -651,7 +651,10 @@ steps([
 ])
 section("7.3 Hauling schedule and vehicles")
 P("In <b>Hauling Schedule</b> tap <b>+ Schedule Hauling</b> to plan a trip to the supplier plant: "
-  "scheduled date, plant name, vehicle, driver, destination location and products (<b>+ Add Product</b> for several). In <b>Vehicles</b> keep "
+  "scheduled date, plant name, vehicle, driver, destination location and products (<b>+ Add Product</b> for several). After the trip, tap <b>Actual Qty</b> "
+  "(or set the status to COMPLETED) to enter the qty really hauled per product. The month's <b>Total Plan Qty</b>, "
+  "<b>Actual Haul Qty</b>, <b>Difference</b> and <b>Variance %</b> show above the list and on the upper right of "
+  "the printed calendar. In <b>Vehicles</b> keep "
   "each truck's maintenance, registration and insurance dates up to date with <b>+ New Vehicle</b> "
   "and <b>Edit</b>.")
 section("7.4 Staff: employees, schedule and KPI")

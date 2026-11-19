@@ -3735,6 +3735,26 @@ async function renderVehicles(c) {
 }
 
 // ================================================================== HAULING SCHEDULE
+// Plan vs actual totals for a set of hauling trips. Plan = scheduled qty;
+// Actual = qty recorded as really hauled (unrecorded lines count as 0).
+function haulingSummary(rows) {
+  let plan = 0, actual = 0, pending = 0;
+  rows.forEach(h => {
+    let missing = false;
+    h.items.forEach(i => {
+      plan += Number(i.qty) || 0;
+      if (i.actual_qty == null) missing = true; else actual += Number(i.actual_qty) || 0;
+    });
+    if (missing && h.status !== "CANCELLED") pending++;
+  });
+  const diff = actual - plan;
+  const pct = plan ? (diff / plan) * 100 : 0;
+  return { plan, actual, diff, pct, pending };
+}
+const fmtSigned = n => (n > 0 ? "+" : "") + n.toLocaleString();
+const fmtPct = n => (n > 0 ? "+" : "") + n.toFixed(1) + "%";
+const haulItemText = i => `${esc(i.product_name)} — Plan ${i.qty}` + (i.actual_qty == null ? " / Actual —" : ` / Actual ${i.actual_qty}`);
+
 function printHaulingCalendar(rows, month) {
   const [y, m] = month.split("-").map(Number);
   const first = new Date(y, m - 1, 1);
@@ -3744,6 +3764,11 @@ function printHaulingCalendar(rows, month) {
   rows.filter(h => (h.scheduled_date || "").slice(0, 7) === month)
     .forEach(h => (byDay[parseInt(h.scheduled_date.slice(8, 10))] ||= []).push(h));
   const total = Object.values(byDay).reduce((a, l) => a + l.length, 0);
+  const sum = haulingSummary(Object.values(byDay).flat());
+  const varColor = sum.diff < 0 ? "#c0392b" : sum.diff > 0 ? "#1e9e5a" : "#333";
+  const sumCell = (label, val, color = "#0b3d66") => `<td style="border:1px solid #bbb;padding:2px 6px;text-align:center">
+      <div style="font-size:8px;color:#555;text-transform:uppercase">${label}</div>
+      <div style="font-size:12px;font-weight:700;color:${color}">${val}</div></td>`;
   const cells = [];
   for (let i = 0; i < first.getDay(); i++) cells.push(null);
   for (let d = 1; d <= daysInMonth; d++) cells.push(d);
@@ -3756,7 +3781,7 @@ function printHaulingCalendar(rows, month) {
     <b>${esc(h.hauling_no)}</b> · ${esc(h.status)}<br>
     ${esc(h.plant_name)}${h.destination_name ? " → " + esc(h.destination_name) : ""}<br>
     ${h.plate_number ? esc(h.plate_number) : "No vehicle"}${h.driver ? " · " + esc(h.driver) : ""}<br>
-    ${h.items.map(i => `${esc(i.product_name)} x${i.qty}`).join(", ")}</div>`;
+    ${h.items.map(haulItemText).join("<br>")}</div>`;
   printDocument(`<style>@page{size:letter landscape;margin:8mm}
     .haul-cal, .haul-cal *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
     .haul-cal td div{overflow-wrap:anywhere;word-break:break-word}
@@ -3766,7 +3791,16 @@ function printHaulingCalendar(rows, month) {
       <img src="/images/logo.png" style="height:36px">
       <div style="flex:1"><div style="font-weight:700;font-size:14px">GREAT UNLI FOOD CORP. — Hauling Schedule</div>
         <div style="font-size:11px;color:#555">Solane LPG Distributor · ${total} trip${total === 1 ? "" : "s"}</div></div>
-      <div style="font-size:20px;font-weight:700;color:#0b3d66">${monthName}</div>
+      <div style="text-align:right">
+        <div style="font-size:20px;font-weight:700;color:#0b3d66">${monthName}</div>
+        <table style="border-collapse:collapse;margin-top:2px;margin-left:auto"><tr>
+          ${sumCell("Total Plan Qty", sum.plan.toLocaleString())}
+          ${sumCell("Actual Haul Qty", sum.actual.toLocaleString())}
+          ${sumCell("Difference", fmtSigned(sum.diff), varColor)}
+          ${sumCell("Variance %", fmtPct(sum.pct), varColor)}
+        </tr></table>
+        ${sum.pending ? `<div style="font-size:8px;color:#888;margin-top:1px">${sum.pending} trip${sum.pending === 1 ? "" : "s"} without actual qty yet</div>` : ""}
+      </div>
     </div>
     <table style="width:100%;border-collapse:collapse;table-layout:fixed">
       <tr>${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(d => `<th style="background:#0b3d66;color:#fff;font-size:11px;padding:4px;border:1px solid #0b3d66">${d}</th>`).join("")}</tr>
@@ -3785,7 +3819,8 @@ async function renderHauling(c) {
       <input type="month" id="haulMonth" value="${thisMonth}">
       <label style="font-size:13px;display:flex;gap:4px;align-items:center"><input type="checkbox" id="haulInclCancelled"> Include cancelled</label>
       <button class="btn" id="haulPrintCal">Print Calendar</button>
-    </div><div id="haulTable">Loading...</div>`;
+    </div><div id="haulSummary" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px"></div>
+    <div id="haulTable">Loading...</div>`;
   const statusColor = s => ({ SCHEDULED: "blue", LOADING: "warn", "IN TRANSIT": "warn", COMPLETED: "green", CANCELLED: "danger" }[s] || "gray");
   let haulRows = [];
   document.getElementById("haulPrintCal").addEventListener("click", () => {
@@ -3793,19 +3828,35 @@ async function renderHauling(c) {
     const incl = document.getElementById("haulInclCancelled").checked;
     printHaulingCalendar(haulRows.filter(h => incl || h.status !== "CANCELLED"), month);
   });
+  function renderSummary() {
+    const month = document.getElementById("haulMonth").value || thisMonth;
+    const incl = document.getElementById("haulInclCancelled").checked;
+    const s = haulingSummary(haulRows.filter(h => (h.scheduled_date || "").slice(0, 7) === month && (incl || h.status !== "CANCELLED")));
+    const vc = s.diff < 0 ? "var(--danger, #c0392b)" : s.diff > 0 ? "var(--green, #1e9e5a)" : "inherit";
+    const card = (label, val, color = "inherit") => `<div class="card" style="padding:8px 14px;min-width:120px">
+      <div style="font-size:11px;color:var(--muted)">${label}</div><div style="font-size:20px;font-weight:700;color:${color}">${val}</div></div>`;
+    document.getElementById("haulSummary").innerHTML =
+      card("Total Plan Qty", s.plan.toLocaleString()) + card("Actual Haul Qty", s.actual.toLocaleString()) +
+      card("Difference (Actual − Plan)", fmtSigned(s.diff), vc) + card("Variance %", fmtPct(s.pct), vc) +
+      (s.pending ? `<div style="align-self:center;font-size:12px;color:var(--muted)">${s.pending} trip${s.pending === 1 ? "" : "s"} this month without actual qty yet</div>` : "");
+  }
+  document.getElementById("haulMonth").addEventListener("change", renderSummary);
+  document.getElementById("haulInclCancelled").addEventListener("change", renderSummary);
   async function load() {
     const rows = haulRows = await api("/hauling");
+    renderSummary();
     document.getElementById("haulTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
       <th>Hauling #</th><th>Date</th><th>Plant</th><th>Destination</th><th>Vehicle</th><th>Products</th><th>Status</th><th></th>
     </tr></thead><tbody>
       ${rows.length ? rows.map(h => `<tr><td>${h.hauling_no}</td><td>${h.scheduled_date}</td><td>${esc(h.plant_name)}</td>
         <td>${esc(h.destination_name || "")}</td><td>${esc(h.plate_number || "")}</td>
-        <td>${h.items.map(i => `${esc(i.product_name)} x${i.qty}`).join(", ")}</td>
+        <td>${h.items.map(haulItemText).join("<br>")}</td>
         <td><span class="badge ${statusColor(h.status)}">${h.status}</span></td>
         <td style="display:flex;gap:6px">
           <select onchange="updateHaulingStatus(${h.id}, this.value)" style="font-size:12px;padding:4px">
             ${["SCHEDULED", "LOADING", "IN TRANSIT", "COMPLETED", "CANCELLED"].map(s => `<option value="${s}" ${h.status === s ? "selected" : ""}>${s}</option>`).join("")}
           </select>
+          <button class="btn small" onclick="recordHaulingActual(${h.id})">Actual Qty</button>
           <button class="btn small danger" onclick="deleteHauling(${h.id})">Delete</button>
         </td></tr>`).join("")
         : `<tr><td colspan="8" style="color:var(--muted)">No hauling trips scheduled.</td></tr>`}
@@ -3864,7 +3915,47 @@ async function renderHauling(c) {
       });
     });
   });
+  window.recordHaulingActual = (id, newStatus) => {
+    const h = haulRows.find(r => r.id === id);
+    if (!h) return;
+    openModal(`Actual Haul Qty — ${esc(h.hauling_no)}`, `
+      <p style="font-size:13px;color:var(--muted);margin-top:0">Enter the qty actually hauled for each product.${newStatus ? ` Status will be set to <b>${esc(newStatus)}</b>.` : ""}</p>
+      <div class="table-wrap"><table><thead><tr><th>Product</th><th>Plan Qty</th><th>Actual Qty</th><th>Difference</th></tr></thead><tbody>
+        ${h.items.map(i => `<tr><td>${esc(i.product_name)}</td><td>${i.qty}</td>
+          <td><input type="number" min="0" class="hActQty" data-id="${i.id}" data-plan="${i.qty}" value="${i.actual_qty ?? i.qty}" style="width:90px"></td>
+          <td class="hActDiff"></td></tr>`).join("")}
+      </tbody></table></div>
+      <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn green" id="hActSave">Save</button></div>
+    `, () => {
+      const inputs = [...document.querySelectorAll(".hActQty")];
+      const refresh = () => inputs.forEach(inp => {
+        const d = (parseInt(inp.value) || 0) - parseInt(inp.dataset.plan);
+        const cell = inp.closest("tr").querySelector(".hActDiff");
+        cell.textContent = fmtSigned(d);
+        cell.style.color = d < 0 ? "var(--danger, #c0392b)" : d > 0 ? "var(--green, #1e9e5a)" : "";
+      });
+      inputs.forEach(inp => inp.addEventListener("input", refresh));
+      refresh();
+      document.getElementById("hActSave").addEventListener("click", async () => {
+        if (inputs.some(inp => inp.value === "" || parseInt(inp.value) < 0)) { toast("Enter an actual qty (0 or more) for each product", "error"); return; }
+        try {
+          await api(`/hauling/${id}/actual`, { method: "PUT", body: {
+            items: inputs.map(inp => ({ id: Number(inp.dataset.id), actual_qty: parseInt(inp.value) })),
+            ...(newStatus ? { status: newStatus } : {}),
+          }});
+          closeModal(); toast("Actual qty saved", "success"); load();
+        } catch (e) {}
+      });
+    });
+  };
   window.updateHaulingStatus = async (id, status) => {
+    const h = haulRows.find(r => r.id === id);
+    if (status === "COMPLETED" && h && h.items.some(i => i.actual_qty == null)) {
+      load();  // reset the dropdown; the modal saves the status with the actuals
+      window.recordHaulingActual(id, status);
+      return;
+    }
     try {
       await api(`/hauling/${id}`, { method: "PUT", body: { status } });
       toast("Status updated", "success"); load();
