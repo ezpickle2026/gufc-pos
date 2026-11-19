@@ -132,8 +132,13 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase}
   /* #receiptArea is display:none on screen (.print-only). Toggling only
      `visibility` isn't enough — a display:none element never renders, so the
      page prints blank. Restore display here, then hide everything else. */
-  body *{visibility:hidden}
-  #receiptArea{display:block !important;visibility:visible;position:absolute;top:0;left:0;width:100%;padding:20px}
+  /* Take everything else OUT of the layout (display:none, not just
+     visibility:hidden). Hidden-but-present app content still takes up
+     height, and at 58mm width it reflows into several blank pages. With it
+     gone, the page is only as tall as the receipt itself. */
+  html, body{height:auto !important;min-height:0 !important;margin:0 !important;padding:0 !important;background:#fff !important;overflow:visible !important}
+  body > *:not(#receiptArea){display:none !important}
+  #receiptArea{display:block !important;visibility:visible;position:static;width:100%;padding:20px}
   #receiptArea *{visibility:visible}
   /* Keep overlays out of the printout entirely */
   .modal-backdrop, .toast-wrap, .bottom-nav, .sidebar, .topbar{display:none !important}
