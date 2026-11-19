@@ -3735,24 +3735,53 @@ async function renderVehicles(c) {
 }
 
 // ================================================================== HAULING SCHEDULE
-// Plan vs actual totals for a set of hauling trips. Plan = scheduled qty;
-// Actual = qty recorded as really hauled (unrecorded lines count as 0).
+// Plan vs actual totals in KG for a set of hauling trips, split into
+// Domestic (cylinders under 50kg: 11kg, 1.4kg, ...) and Commercial (50kg).
+// kg = cylinders x kg size. Plan = scheduled qty; Actual = qty recorded as
+// really hauled (unrecorded lines count as 0).
 function haulingSummary(rows) {
-  let plan = 0, actual = 0, pending = 0;
+  const sizes = { 11: { plan: 0, actual: 0 }, 1.4: { plan: 0, actual: 0 }, 50: { plan: 0, actual: 0 } };
+  let pending = 0;
   rows.forEach(h => {
     let missing = false;
     h.items.forEach(i => {
-      plan += Number(i.qty) || 0;
-      if (i.actual_qty == null) missing = true; else actual += Number(i.actual_qty) || 0;
+      if (i.actual_qty == null) missing = true;
+      const kg = Number(i.kg_size);
+      if (!kg) return;
+      const b = (sizes[kg] ||= { plan: 0, actual: 0 });
+      b.plan += (Number(i.qty) || 0) * kg;
+      b.actual += (Number(i.actual_qty) || 0) * kg;
     });
     if (missing && h.status !== "CANCELLED") pending++;
   });
-  const diff = actual - plan;
-  const pct = plan ? (diff / plan) * 100 : 0;
-  return { plan, actual, diff, pct, pending };
+  const calc = (plan, actual) => ({ plan, actual, diff: actual - plan, pct: plan ? ((actual - plan) / plan) * 100 : 0 });
+  const group = (label, test) => {
+    const list = Object.keys(sizes).map(Number).filter(test).sort((a, b) => b - a)
+      .map(kg => ({ label: `${kg}kg`, ...calc(sizes[kg].plan, sizes[kg].actual) }));
+    return { label, ...calc(list.reduce((a, x) => a + x.plan, 0), list.reduce((a, x) => a + x.actual, 0)), sizes: list };
+  };
+  return { groups: [group("Domestic", kg => kg < 50), group("Commercial", kg => kg >= 50)], pending };
 }
-const fmtSigned = n => (n > 0 ? "+" : "") + n.toLocaleString();
+const fmtKgQty = n => Number(n.toFixed(2)).toLocaleString();
+const fmtSigned = n => (n > 0 ? "+" : "") + Number(n.toFixed(2)).toLocaleString();
 const fmtPct = n => (n > 0 ? "+" : "") + n.toFixed(1) + "%";
+// Plan vs actual kg table. print=true uses fixed colors/sizes for the calendar printout.
+function haulingSummaryTable(sum, print) {
+  const red = print ? "#c0392b" : "var(--danger)", green = print ? "#1e9e5a" : "var(--green)";
+  const fs = print ? "9px" : "13px", pad = print ? "1px 6px" : "6px 10px";
+  const td = (v, extra = "") => `<td style="border:1px solid ${print ? "#bbb" : "var(--border)"};padding:${pad};text-align:right;${extra}">${v}</td>`;
+  const row = (r, isGroup) => {
+    const c = r.diff < 0 ? red : r.diff > 0 ? green : "inherit";
+    const st = isGroup ? `font-weight:700;background:${print ? "#e8eef4" : "var(--bg)"};` : "";
+    return `<tr>${td(isGroup ? r.label.toUpperCase() : "&nbsp;&nbsp;" + r.label, "text-align:left;" + st)}${td(fmtKgQty(r.plan), st)}${td(fmtKgQty(r.actual), st)}
+      ${td(fmtSigned(r.diff), st + `color:${c};`)}${td(fmtPct(r.pct), st + `color:${c};`)}</tr>`;
+  };
+  const th = h => `<th style="border:1px solid ${print ? "#0b3d66" : "var(--border)"};padding:${pad};${print ? "background:#0b3d66;color:#fff;" : ""}text-align:right;white-space:nowrap">${h}</th>`;
+  return `<table style="border-collapse:collapse;font-size:${fs};${print ? "margin-left:auto;margin-top:2px" : ""}">
+    <tr>${th("")}${th("Total Plan (kg)")}${th("Actual Haul (kg)")}${th("Difference (kg)")}${th("Variance %")}</tr>
+    ${sum.groups.map(g => row(g, true) + g.sizes.map(x => row(x, false)).join("")).join("")}
+  </table>`;
+}
 const haulItemText = i => `${esc(i.product_name)} — Plan ${i.qty}` + (i.actual_qty == null ? " / Actual —" : ` / Actual ${i.actual_qty}`);
 
 function printHaulingCalendar(rows, month) {
@@ -3765,10 +3794,6 @@ function printHaulingCalendar(rows, month) {
     .forEach(h => (byDay[parseInt(h.scheduled_date.slice(8, 10))] ||= []).push(h));
   const total = Object.values(byDay).reduce((a, l) => a + l.length, 0);
   const sum = haulingSummary(Object.values(byDay).flat());
-  const varColor = sum.diff < 0 ? "#c0392b" : sum.diff > 0 ? "#1e9e5a" : "#333";
-  const sumCell = (label, val, color = "#0b3d66") => `<td style="border:1px solid #bbb;padding:2px 6px;text-align:center">
-      <div style="font-size:8px;color:#555;text-transform:uppercase">${label}</div>
-      <div style="font-size:12px;font-weight:700;color:${color}">${val}</div></td>`;
   const cells = [];
   for (let i = 0; i < first.getDay(); i++) cells.push(null);
   for (let d = 1; d <= daysInMonth; d++) cells.push(d);
@@ -3793,12 +3818,7 @@ function printHaulingCalendar(rows, month) {
         <div style="font-size:11px;color:#555">Solane LPG Distributor · ${total} trip${total === 1 ? "" : "s"}</div></div>
       <div style="text-align:right">
         <div style="font-size:20px;font-weight:700;color:#0b3d66">${monthName}</div>
-        <table style="border-collapse:collapse;margin-top:2px;margin-left:auto"><tr>
-          ${sumCell("Total Plan Qty", sum.plan.toLocaleString())}
-          ${sumCell("Actual Haul Qty", sum.actual.toLocaleString())}
-          ${sumCell("Difference", fmtSigned(sum.diff), varColor)}
-          ${sumCell("Variance %", fmtPct(sum.pct), varColor)}
-        </tr></table>
+        ${haulingSummaryTable(sum, true)}
         ${sum.pending ? `<div style="font-size:8px;color:#888;margin-top:1px">${sum.pending} trip${sum.pending === 1 ? "" : "s"} without actual qty yet</div>` : ""}
       </div>
     </div>
@@ -3832,13 +3852,9 @@ async function renderHauling(c) {
     const month = document.getElementById("haulMonth").value || thisMonth;
     const incl = document.getElementById("haulInclCancelled").checked;
     const s = haulingSummary(haulRows.filter(h => (h.scheduled_date || "").slice(0, 7) === month && (incl || h.status !== "CANCELLED")));
-    const vc = s.diff < 0 ? "var(--danger, #c0392b)" : s.diff > 0 ? "var(--green, #1e9e5a)" : "inherit";
-    const card = (label, val, color = "inherit") => `<div class="card" style="padding:8px 14px;min-width:120px">
-      <div style="font-size:11px;color:var(--muted)">${label}</div><div style="font-size:20px;font-weight:700;color:${color}">${val}</div></div>`;
-    document.getElementById("haulSummary").innerHTML =
-      card("Total Plan Qty", s.plan.toLocaleString()) + card("Actual Haul Qty", s.actual.toLocaleString()) +
-      card("Difference (Actual − Plan)", fmtSigned(s.diff), vc) + card("Variance %", fmtPct(s.pct), vc) +
-      (s.pending ? `<div style="align-self:center;font-size:12px;color:var(--muted)">${s.pending} trip${s.pending === 1 ? "" : "s"} this month without actual qty yet</div>` : "");
+    document.getElementById("haulSummary").innerHTML = `<div class="card" style="padding:10px;overflow-x:auto">
+      <div style="font-weight:700;margin-bottom:6px">Plan vs Actual Haul (kg)</div>${haulingSummaryTable(s, false)}
+      ${s.pending ? `<div style="font-size:12px;color:var(--muted);margin-top:6px">${s.pending} trip${s.pending === 1 ? "" : "s"} this month without actual qty yet</div>` : ""}</div>`;
   }
   document.getElementById("haulMonth").addEventListener("change", renderSummary);
   document.getElementById("haulInclCancelled").addEventListener("change", renderSummary);

@@ -6172,10 +6172,11 @@ def list_hauling():
     out = []
     for h in rows:
         items = conn.execute(
-            "SELECT hsi.*, p.name product_name FROM hauling_schedule_items hsi JOIN products p ON p.id=hsi.product_id WHERE hauling_id=?",
+            "SELECT hsi.*, p.name product_name, p.sku FROM hauling_schedule_items hsi JOIN products p ON p.id=hsi.product_id WHERE hauling_id=?",
             (h["id"],),
         ).fetchall()
-        out.append({**dict(h), "items": [dict(i) for i in items]})
+        out.append({**dict(h), "items": [{**dict(i), "kg_size": product_kg_size(i["product_name"], i["sku"])}
+                                         for i in items]})
     conn.close()
     return jsonify(out)
 
