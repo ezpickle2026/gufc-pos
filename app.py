@@ -6172,10 +6172,11 @@ def list_hauling():
     out = []
     for h in rows:
         items = conn.execute(
-            "SELECT hsi.*, p.name product_name FROM hauling_schedule_items hsi JOIN products p ON p.id=hsi.product_id WHERE hauling_id=?",
+            "SELECT hsi.*, p.name product_name, p.sku FROM hauling_schedule_items hsi JOIN products p ON p.id=hsi.product_id WHERE hauling_id=?",
             (h["id"],),
         ).fetchall()
-        out.append({**dict(h), "items": [dict(i) for i in items]})
+        out.append({**dict(h), "items": [{**dict(i), "kg_size": product_kg_size(i["product_name"], i["sku"])}
+                                         for i in items]})
     conn.close()
     return jsonify(out)
 
@@ -6239,9 +6240,44 @@ def update_hauling(hid):
                 conn.rollback()
                 conn.close()
                 return jsonify(error="Quantities must be positive"), 400
-            conn.execute("INSERT INTO hauling_schedule_items (hauling_id, product_id, qty) VALUES (?,?,?)",
-                         (hid, it["product_id"], qty))
+            conn.execute("INSERT INTO hauling_schedule_items (hauling_id, product_id, qty, actual_qty) VALUES (?,?,?,?)",
+                         (hid, it["product_id"], qty, it.get("actual_qty")))
     audit(conn, "UPDATE", "HAULING", hid, existing["hauling_no"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.put("/api/hauling/<int:hid>/actual")
+@roles_or_module_required("ADMIN", "MANAGER", module="hauling")
+def record_hauling_actual(hid):
+    """Record the qty actually hauled per product line (plan vs actual)."""
+    d = request.get_json(force=True)
+    conn = get_db()
+    existing = conn.execute("SELECT * FROM hauling_schedule WHERE id=?", (hid,)).fetchone()
+    if not existing:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    for it in d.get("items") or []:
+        raw = it.get("actual_qty")
+        if raw in (None, ""):
+            actual = None
+        else:
+            try:
+                actual = int(raw)
+            except (TypeError, ValueError):
+                conn.rollback()
+                conn.close()
+                return jsonify(error="Actual qty must be a whole number"), 400
+            if actual < 0:
+                conn.rollback()
+                conn.close()
+                return jsonify(error="Actual qty can't be negative"), 400
+        conn.execute("UPDATE hauling_schedule_items SET actual_qty=? WHERE id=? AND hauling_id=?",
+                     (actual, it["id"], hid))
+    if d.get("status"):
+        conn.execute("UPDATE hauling_schedule SET status=? WHERE id=?", (d["status"], hid))
+    audit(conn, "UPDATE", "HAULING", hid, f"{existing['hauling_no']} actual qty")
     conn.commit()
     conn.close()
     return jsonify(ok=True)
