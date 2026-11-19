@@ -1874,9 +1874,21 @@ async function renderReceivables(c) {
   document.getElementById("recvStatus").addEventListener("change", applyFilter);
   applyFilter();
   document.getElementById("agingBtn").addEventListener("click", () => openAgingReport(canExport));
-  window.editReceivable = (id) => {
+  window.editReceivable = async (id) => {
     const r = rows.find(x => x.id === id);
     if (!r) return;
+    let pays = [];
+    try { pays = await api(`/receivables/${id}/payments`); } catch (e) { return; }
+    const methods = ["Cash", "GCash", "Bank Transfer", "Maya", "Cheque", "Other"];
+    const methodOpts = cur => [...new Set([...methods, cur])].map(m => `<option ${m === cur ? "selected" : ""}>${esc(m)}</option>`).join("");
+    const paysHtml = pays.length ? `<div class="field"><label>Payments</label>
+        ${pays.map(p => `<div class="erPay" data-id="${p.id}" style="display:flex;gap:6px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+          <span style="font-size:12px;color:var(--muted);min-width:150px">${esc(String(p.ts).slice(0, 10))} · <b>${money(p.amount)}</b>${p.payment_source === "AR_COLLECTION" ? "" : " (POS)"}</span>
+          <select class="erPayMethod" style="flex:1;min-width:110px">${methodOpts(p.method)}</select>
+          <input class="erPayRef" placeholder="Reference #" value="${esc(p.reference || "")}" style="flex:1;min-width:110px">
+        </div>`).join("")}
+        <div style="font-size:11.5px;color:var(--muted)">Only the method and reference can be changed here — not the amount.</div></div>`
+      : `<p style="font-size:12px;color:var(--muted)">No payments recorded yet.</p>`;
     openModal(`Edit Receivable ${esc(r.invoice_no)}`, `
       <p style="font-size:12.5px;color:var(--muted);margin-top:0">${esc(r.customer_name)} (${esc(r.account_no)}) · Paid so far: <b>${money(r.paid)}</b></p>
       <div class="field"><label>Invoice #</label><input id="erInv" value="${esc(r.invoice_no)}"></div>
@@ -1885,6 +1897,7 @@ async function renderReceivables(c) {
       <div class="field"><label>Amount</label>
         <input type="number" id="erAmt" min="0" step="0.01" value="${r.amount}" ${r.is_opening_balance ? "" : "disabled"}>
         ${r.is_opening_balance ? "" : `<div style="font-size:11.5px;color:var(--muted);margin-top:4px">The amount of a regular invoice follows its sale — edit the sale to change it.</div>`}</div>
+      ${paysHtml}
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
         <button class="btn green" id="erSaveBtn">Save Changes</button></div>
     `, () => {
@@ -1895,6 +1908,9 @@ async function renderReceivables(c) {
           due_date: document.getElementById("erDue").value,
         };
         if (r.is_opening_balance) body.amount = document.getElementById("erAmt").value;
+        body.payments = [...document.querySelectorAll(".erPay")].map(el => ({
+          id: el.dataset.id, method: el.querySelector(".erPayMethod").value, reference: el.querySelector(".erPayRef").value.trim(),
+        }));
         if (!body.invoice_no) { toast("Invoice # is required", "error"); return; }
         try {
           await api(`/receivables/${id}`, { method: "PUT", body });
