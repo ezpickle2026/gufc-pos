@@ -4238,26 +4238,104 @@ def list_transfers():
     return jsonify(out)
 
 
+def _parse_transfer_payload(d):
+    """Validate a create/edit dispatch payload. Returns
+    (from_location, to_location, to_external, items) or raises ValueError."""
+    items = d.get("items") or []
+    if not items:
+        raise ValueError("No items to transfer")
+    from_location = d.get("from_location")
+    to_location = d.get("to_location") or None
+    to_external = (d.get("to_external") or "").strip() or None
+    if not from_location:
+        raise ValueError("Origin location is required")
+    if not to_location and not to_external:
+        raise ValueError("Choose a destination location or enter the plant name")
+    if to_location and str(to_location) == str(from_location):
+        raise ValueError("Origin and destination must differ")
+    if to_location:
+        to_external = None
+    clean = []
+    for it in items:
+        try:
+            qty = int(it["qty"])
+            product_id = int(it["product_id"])
+        except (TypeError, ValueError, KeyError):
+            raise ValueError("Each item needs a product and a whole-number quantity")
+        if qty <= 0:
+            raise ValueError("Quantities must be positive")
+        state = (it.get("cylinder_state") or "FULL").upper()
+        if state not in ("FULL", "EMPTY", "SWAPPED"):
+            raise ValueError("cylinder_state must be FULL, EMPTY or SWAPPED")
+        brand = (it.get("swap_brand") or "").strip() if state == "SWAPPED" else None
+        if state == "SWAPPED" and not brand:
+            raise ValueError("Choose the brand of the swapped empties to dispatch")
+        clean.append({"product_id": product_id, "qty": qty, "cylinder_state": state, "swap_brand": brand})
+    return int(from_location), (int(to_location) if to_location else None), to_external, clean
+
+
+def _dispatch_out(conn, from_location, items, transfer_no, dest_label, reverse=False):
+    """Take the items out of the origin location (or, with reverse=True, put
+    them back — used when a dispatch is edited)."""
+    for it in items:
+        pid, qty, state, brand = it["product_id"], it["qty"], it["cylinder_state"], it["swap_brand"]
+        if reverse:
+            note = f"Reversed for edit of {transfer_no}"
+            if state == "SWAPPED":
+                add_swapped_empties(conn, from_location, pid, brand, qty, "DISPATCH EDIT", transfer_no, notes=note)
+            elif state == "EMPTY":
+                add_empty_cylinders(conn, from_location, pid, qty, "DISPATCH EDIT", transfer_no, notes=note)
+            else:
+                adjust_inventory(conn, from_location, pid, qty, "DISPATCH EDIT", transfer_no, notes=note)
+        elif state == "SWAPPED":
+            remove_swapped_empties(conn, from_location, pid, brand, qty, "DISPATCH OUT", transfer_no,
+                                   notes=f"{brand} empties dispatched to {dest_label}")
+        elif state == "EMPTY":
+            remove_empty_cylinders(conn, from_location, pid, qty, "DISPATCH OUT", transfer_no,
+                                   notes=f"Empties dispatched to {dest_label}")
+        else:
+            adjust_inventory(conn, from_location, pid, -qty, "TRANSFER OUT", transfer_no,
+                             notes=f"Full cylinders dispatched to {dest_label}")
+
+
+def _dispatch_in(conn, to_location, items, transfer_no, reverse=False):
+    """Add received items to the destination location (or, with reverse=True,
+    take them back out — used when a received dispatch is edited)."""
+    if not to_location:
+        return  # plant dispatches leave the system
+    for it in items:
+        pid, qty, state, brand = it["product_id"], it["qty"], it["cylinder_state"], it["swap_brand"]
+        if reverse:
+            note = f"Reversed for edit of {transfer_no}"
+            if state == "SWAPPED":
+                remove_swapped_empties(conn, to_location, pid, brand, qty, "DISPATCH EDIT", transfer_no, notes=note)
+            elif state == "EMPTY":
+                remove_empty_cylinders(conn, to_location, pid, qty, "DISPATCH EDIT", transfer_no, notes=note)
+            else:
+                adjust_inventory(conn, to_location, pid, -qty, "DISPATCH EDIT", transfer_no, notes=note)
+        elif state == "SWAPPED":
+            add_swapped_empties(conn, to_location, pid, brand, qty, "DISPATCH IN", transfer_no,
+                                notes="Swapped empties received from dispatch")
+        elif state == "EMPTY":
+            add_empty_cylinders(conn, to_location, pid, qty, "DISPATCH IN", transfer_no,
+                                notes="Empties received from dispatch")
+        else:
+            adjust_inventory(conn, to_location, pid, qty, "TRANSFER IN", transfer_no)
+
+
+def _dest_label(to_location, to_external):
+    return to_external and f"plant {to_external}" or f"location {to_location}"
+
+
 @app.post("/api/transfers")
 @roles_or_module_required("ADMIN", "DISPATCHER", module="transfers")
 def create_transfer():
     """Dispatch full, empty and/or swapped (other-brand) empty cylinders from
     one location to another location, or out to a plant (to_external)."""
-    d = request.get_json(force=True)
-    items = d.get("items") or []
-    if not items:
-        return jsonify(error="No items to transfer"), 400
-    from_location = d.get("from_location")
-    to_location = d.get("to_location") or None
-    to_external = (d.get("to_external") or "").strip() or None
-    if not from_location:
-        return jsonify(error="Origin location is required"), 400
-    if not to_location and not to_external:
-        return jsonify(error="Choose a destination location or enter the plant name"), 400
-    if to_location and str(to_location) == str(from_location):
-        return jsonify(error="Origin and destination must differ"), 400
-    if to_location:
-        to_external = None
+    try:
+        from_location, to_location, to_external, items = _parse_transfer_payload(request.get_json(force=True))
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
 
     conn = get_db()
     try:
@@ -4267,31 +4345,10 @@ def create_transfer():
             (transfer_no, from_location, to_location, to_external, "RELEASED", session["user"]["id"]),
         )
         tid = cur.lastrowid
-        dest_label = to_external and f"plant {to_external}" or f"location {to_location}"
         for it in items:
-            try:
-                qty = int(it["qty"])
-            except (TypeError, ValueError, KeyError):
-                raise ValueError("Each item needs a whole-number quantity")
-            if qty <= 0:
-                raise ValueError("Quantities must be positive")
-            state = (it.get("cylinder_state") or "FULL").upper()
-            if state not in ("FULL", "EMPTY", "SWAPPED"):
-                raise ValueError("cylinder_state must be FULL, EMPTY or SWAPPED")
-            brand = (it.get("swap_brand") or "").strip() if state == "SWAPPED" else None
-            if state == "SWAPPED" and not brand:
-                raise ValueError("Choose the brand of the swapped empties to dispatch")
             conn.execute("INSERT INTO transfer_items (transfer_id, product_id, qty, cylinder_state, swap_brand) VALUES (?,?,?,?,?)",
-                         (tid, it["product_id"], qty, state, brand))
-            if state == "SWAPPED":
-                remove_swapped_empties(conn, from_location, it["product_id"], brand, qty, "DISPATCH OUT", transfer_no,
-                                       notes=f"{brand} empties dispatched to {dest_label}")
-            elif state == "EMPTY":
-                remove_empty_cylinders(conn, from_location, it["product_id"], qty, "DISPATCH OUT", transfer_no,
-                                       notes=f"Empties dispatched to {dest_label}")
-            else:
-                adjust_inventory(conn, from_location, it["product_id"], -qty, "TRANSFER OUT", transfer_no,
-                                 notes=f"Full cylinders dispatched to {dest_label}")
+                         (tid, it["product_id"], it["qty"], it["cylinder_state"], it["swap_brand"]))
+        _dispatch_out(conn, from_location, items, transfer_no, _dest_label(to_location, to_external))
         audit(conn, "CREATE", "TRANSFERS", tid, transfer_no + (f" to plant {to_external}" if to_external else ""))
         conn.commit()
     except ValueError as e:
@@ -4299,6 +4356,56 @@ def create_transfer():
         return jsonify(error=str(e)), 400
     conn.close()
     return jsonify(id=tid, transfer_no=transfer_no), 201
+
+
+@app.put("/api/transfers/<int:tid>")
+@roles_required("ADMIN")  # Admin (super admin) and Operation Head only
+def update_transfer(tid):
+    """Edit a dispatch record (origin, destination/plant, items). The old
+    stock movements are reversed and the new ones applied in one transaction,
+    so inventory stays consistent. A received dispatch stays received: its
+    destination stock is re-applied with the corrected items."""
+    try:
+        from_location, to_location, to_external, items = _parse_transfer_payload(request.get_json(force=True))
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+
+    conn = get_db()
+    t = conn.execute("SELECT * FROM transfers WHERE id=?", (tid,)).fetchone()
+    if not t:
+        conn.close(); return jsonify(error="Not found"), 404
+    if t["status"] == "CANCELLED":
+        conn.close(); return jsonify(error="Cancelled dispatches can't be edited"), 400
+    old_items = [
+        {"product_id": r["product_id"], "qty": r["qty"], "cylinder_state": r["cylinder_state"] or "FULL",
+         "swap_brand": r["swap_brand"]}
+        for r in conn.execute("SELECT * FROM transfer_items WHERE transfer_id=?", (tid,)).fetchall()
+    ]
+    received = t["status"] == "RECEIVED"
+    no = t["transfer_no"]
+    try:
+        # Undo the original record's stock effects...
+        if received:
+            _dispatch_in(conn, t["to_location"], old_items, no, reverse=True)
+        _dispatch_out(conn, t["from_location"], old_items, no, None, reverse=True)
+        # ...then apply the corrected one.
+        _dispatch_out(conn, from_location, items, no, _dest_label(to_location, to_external))
+        if received:
+            _dispatch_in(conn, to_location, items, no)
+        conn.execute("UPDATE transfers SET from_location=?, to_location=?, to_external=? WHERE id=?",
+                     (from_location, to_location, to_external, tid))
+        conn.execute("DELETE FROM transfer_items WHERE transfer_id=?", (tid,))
+        for it in items:
+            conn.execute("INSERT INTO transfer_items (transfer_id, product_id, qty, cylinder_state, swap_brand) VALUES (?,?,?,?,?)",
+                         (tid, it["product_id"], it["qty"], it["cylinder_state"], it["swap_brand"]))
+        summary = ", ".join(f"{i['cylinder_state']} #{i['product_id']} x{i['qty']}" for i in items)
+        audit(conn, "UPDATE", "TRANSFERS", tid, f"{no} edited: {summary}")
+        conn.commit()
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(ok=True)
 
 
 @app.post("/api/transfers/<int:tid>/receive")
@@ -4310,19 +4417,14 @@ def receive_transfer(tid):
         conn.close(); return jsonify(error="Not found"), 404
     if t["status"] != "RELEASED":
         conn.close(); return jsonify(error=f"Transfer already {t['status']}"), 400
-    items = conn.execute("SELECT * FROM transfer_items WHERE transfer_id=?", (tid,)).fetchall()
+    items = [
+        {"product_id": r["product_id"], "qty": r["qty"], "cylinder_state": r["cylinder_state"] or "FULL",
+         "swap_brand": r["swap_brand"]}
+        for r in conn.execute("SELECT * FROM transfer_items WHERE transfer_id=?", (tid,)).fetchall()
+    ]
     # A dispatch to a plant leaves the system — "received" only confirms the
     # plant got the cylinders; nothing is added to any of our locations.
-    if t["to_location"]:
-        for it in items:
-            if it["cylinder_state"] == "SWAPPED":
-                add_swapped_empties(conn, t["to_location"], it["product_id"], it["swap_brand"], it["qty"],
-                                    "DISPATCH IN", t["transfer_no"], notes="Swapped empties received from dispatch")
-            elif it["cylinder_state"] == "EMPTY":
-                add_empty_cylinders(conn, t["to_location"], it["product_id"], it["qty"], "DISPATCH IN",
-                                    t["transfer_no"], notes="Empties received from dispatch")
-            else:
-                adjust_inventory(conn, t["to_location"], it["product_id"], it["qty"], "TRANSFER IN", t["transfer_no"])
+    _dispatch_in(conn, t["to_location"], items, t["transfer_no"])
     conn.execute("UPDATE transfers SET status='RECEIVED', received_by=?, received_ts=datetime('now') WHERE id=?",
                  (session["user"]["id"], tid))
     audit(conn, "RECEIVE", "TRANSFERS", tid, t["transfer_no"])

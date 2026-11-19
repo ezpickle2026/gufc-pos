@@ -2277,24 +2277,30 @@ async function renderTransfers(c) {
     <button class="btn green" id="newXferBtn">+ New Transfer / Dispatch</button>
     ${hasModule("stock_import") ? `<button class="btn" id="importStockBtn">+ Import Stock from Supplier</button>` : ""}
   </div><div id="xferTable">Loading...</div>`;
+  let lastRows = [];
   async function load() {
-    const rows = await api("/transfers");
+    const rows = lastRows = await api("/transfers");
     document.getElementById("xferTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
       <th>Dispatch #</th><th>Date</th><th>From</th><th>To</th><th>Items</th><th>Status</th><th></th>
     </tr></thead><tbody>
       ${rows.map(t => `<tr><td>${t.transfer_no}</td><td>${t.ts}</td><td>${esc(t.from_name)}</td><td>${esc(t.to_name)}</td>
         <td>${t.items.map(i => `${i.cylinder_state === 'SWAPPED' ? `${esc(i.swap_brand)} empty (${esc(i.product_name)})` : esc(i.product_name)} x${i.qty}${i.cylinder_state === 'EMPTY' ? ' <span class="badge gray">EMPTY</span>' : i.cylinder_state === 'SWAPPED' ? ' <span class="badge warn">SWAPPED</span>' : ' <span class="badge green">FULL</span>'}`).join(", ")}</td>
         <td><span class="badge ${t.status === 'RECEIVED' ? 'green' : t.status === 'CANCELLED' ? 'danger' : 'warn'}">${t.status}</span></td>
-        <td>${t.status === 'RELEASED' ? `<button class="btn small green" onclick="receiveXfer(${t.id})">Mark Received</button>` : ""}</td>
+        <td style="white-space:nowrap">${t.status === 'RELEASED' ? `<button class="btn small green" onclick="receiveXfer(${t.id})">Mark Received</button>` : ""}
+          ${isAdminLike() && t.status !== 'CANCELLED' ? `<button class="btn small" onclick="editXfer(${t.id})">Edit</button>` : ""}</td>
       </tr>`).join("")}
     </tbody></table></div>`;
   }
   const importBtn = document.getElementById("importStockBtn");
   if (importBtn) importBtn.addEventListener("click", () => openImportStockModal(load));
-  document.getElementById("newXferBtn").addEventListener("click", () => {
+  document.getElementById("newXferBtn").addEventListener("click", () => openXferModal(null));
+  // `ex` is an existing dispatch record when editing (Admin / Operation Head
+  // only); null for a new dispatch.
+  function openXferModal(ex) {
     const locOpts = state.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join("");
     const prodOpts = state.products.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
-    openModal("New Transfer / Dispatch", `
+    openModal(ex ? `Edit Dispatch ${esc(ex.transfer_no)}` : "New Transfer / Dispatch", `
+      ${ex && ex.status === 'RECEIVED' ? `<p style="font-size:12px;color:var(--muted);margin-top:0">This dispatch is already received — the destination's stock will be corrected too.</p>` : ""}
       <div class="field"><label>From</label><select id="xFrom">${locOpts}</select></div>
       <div class="field"><label>To</label><select id="xTo">${locOpts}<option value="PLANT">Plant</option></select></div>
       <div class="field hidden" id="xPlantWrap"><label>Plant Name</label><input id="xPlant" placeholder="e.g. Solane Plant"></div>
@@ -2302,7 +2308,7 @@ async function renderTransfers(c) {
         <button class="btn small" id="xAddRow" type="button">+ Add Item</button>
         <div style="font-size:11.5px;color:var(--muted);margin-top:4px" id="xHint"></div></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
-        <button class="btn green" id="xSaveBtn">Dispatch</button></div>
+        <button class="btn green" id="xSaveBtn">${ex ? "Save Changes" : "Dispatch"}</button></div>
     `, () => {
       const stock = { FULL: {}, EMPTY: {}, SWAPPED: {} };
       let swappedRows = [];
@@ -2331,7 +2337,7 @@ async function renderTransfers(c) {
           r.querySelector(".xAvail").textContent = `avail: ${stock[st][pid] ?? 0}`;
         });
       }
-      function addRow() {
+      function addRow(pre) {
         const row = document.createElement("div");
         row.className = "xRow";
         row.style.cssText = "display:flex;gap:6px;margin-bottom:6px;align-items:center;flex-wrap:wrap";
@@ -2343,6 +2349,13 @@ async function renderTransfers(c) {
         row.querySelector(".xDel").addEventListener("click", () => { row.remove(); });
         row.querySelectorAll("select").forEach(el => el.addEventListener("change", refreshHints));
         rowsEl.appendChild(row);
+        if (pre) {
+          const st = pre.cylinder_state || "FULL";
+          row.querySelector(".xState").value = st;
+          syncProd(row);
+          row.querySelector(".xProd").value = st === "SWAPPED" ? `${pre.product_id}|${pre.swap_brand}` : String(pre.product_id);
+          row.querySelector(".xQty").value = pre.qty;
+        }
         refreshHints();
       }
       async function loadStock() {
@@ -2354,6 +2367,19 @@ async function renderTransfers(c) {
         empty.forEach(r => stock.EMPTY[r.product_id] = r.quantity);
         swappedRows = swapped.filter(r => r.quantity > 0);
         swappedRows.forEach(r => stock.SWAPPED[`${r.product_id}|${r.brand}`] = r.quantity);
+        if (ex && String(ex.from_location) === String(from)) {
+          ex.items.forEach(i => {
+            const st = i.cylinder_state || "FULL";
+            if (st === "SWAPPED") {
+              const key = `${i.product_id}|${i.swap_brand}`;
+              if (!swappedRows.some(r => `${r.product_id}|${r.brand}` === key))
+                swappedRows.push({ product_id: i.product_id, brand: i.swap_brand, product_name: i.product_name, quantity: 0 });
+              stock.SWAPPED[key] = (stock.SWAPPED[key] || 0) + i.qty;
+            } else {
+              stock[st][i.product_id] = (stock[st][i.product_id] || 0) + i.qty;
+            }
+          });
+        }
         rowsEl.querySelectorAll(".xProd").forEach(sel => { if (sel.dataset.mode === "SWAPPED") sel.dataset.mode = ""; });
         refreshHints();
       }
@@ -2364,10 +2390,21 @@ async function renderTransfers(c) {
           ? "Full, empty and swapped (other-brand) empties can all go to the plant. Mark Received once the plant confirms delivery." : "";
         refreshHints();
       });
-      if (state.locations.length > 1) document.getElementById("xTo").selectedIndex = 1;
-      document.getElementById("xAddRow").addEventListener("click", addRow);
-      addRow();
-      loadStock();
+      document.getElementById("xAddRow").addEventListener("click", () => addRow());
+      if (ex) {
+        document.getElementById("xFrom").value = ex.from_location;
+        if (ex.to_location) document.getElementById("xTo").value = ex.to_location;
+        else {
+          document.getElementById("xTo").value = "PLANT";
+          document.getElementById("xPlant").value = ex.to_external || "";
+          document.getElementById("xPlantWrap").classList.remove("hidden");
+        }
+        loadStock().then(() => ex.items.forEach(i => addRow(i)));
+      } else {
+        if (state.locations.length > 1) document.getElementById("xTo").selectedIndex = 1;
+        addRow();
+        loadStock();
+      }
 
       document.getElementById("xSaveBtn").addEventListener("click", async () => {
         const from = document.getElementById("xFrom").value, to = document.getElementById("xTo").value;
@@ -2385,17 +2422,21 @@ async function renderTransfers(c) {
         if (items.some(i => i.cylinder_state === "SWAPPED" && !i.swap_brand)) { toast("No swapped empties to dispatch from this location", "error"); return; }
         if (items.some(i => !(i.qty > 0))) { toast("Quantities must be at least 1", "error"); return; }
         try {
-          await api("/transfers", { method: "POST", body: {
+          await api(ex ? `/transfers/${ex.id}` : "/transfers", { method: ex ? "PUT" : "POST", body: {
             from_location: from,
             to_location: to === "PLANT" ? null : to,
             to_external: to === "PLANT" ? plant : null,
             items,
           }});
-          closeModal(); toast("Dispatched", "success"); load();
+          closeModal(); toast(ex ? "Dispatch updated" : "Dispatched", "success"); load();
         } catch (e) {}
       });
     });
-  });
+  }
+  window.editXfer = (id) => {
+    const ex = lastRows.find(r => r.id === id);
+    if (ex) openXferModal(ex);
+  };
   load();
   window.receiveXfer = async (id) => {
     try { await api(`/transfers/${id}/receive`, { method: "POST" }); toast("Transfer received; inventory updated", "success"); load(); }
