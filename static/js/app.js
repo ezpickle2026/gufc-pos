@@ -212,7 +212,7 @@ function printDocument(html) {
   closeModal();
   const area = document.getElementById("receiptArea");
   area.innerHTML = html;
-  const doPrint = () => { fit58mmPage(area); window.print(); };
+  const doPrint = () => window.print();
 
   const images = [...area.querySelectorAll("img")];
   const pending = images.filter(img => !img.complete);
@@ -234,27 +234,6 @@ function printDocument(html) {
   });
   // Safety net: never block printing on a stuck image request.
   setTimeout(go, 2000);
-}
-
-// 58mm thermal receipts: make the page exactly as tall as the receipt.
-// `@page{size:58mm auto}` isn't valid CSS (Chrome drops it and falls back to
-// Letter/A4), so measure the rendered receipt and set an explicit height.
-function fit58mmPage(area) {
-  const r = area.querySelector(".r58");
-  if (!r) return;
-  area.querySelector("#r58PageSize")?.remove();
-  // #receiptArea is display:none on screen — lay it out off-screen at print
-  // width just long enough to measure.
-  const prev = area.getAttribute("style");
-  area.setAttribute("style", "display:block;position:absolute;left:-9999px;top:0;width:58mm;padding:2mm 5mm;box-sizing:border-box;visibility:hidden");
-  const pxPerMm = 96 / 25.4;
-  const mm = Math.ceil(area.getBoundingClientRect().height / pxPerMm) + 4; // + small tear-off margin
-  if (prev === null) area.removeAttribute("style"); else area.setAttribute("style", prev);
-  const st = document.createElement("style");
-  st.id = "r58PageSize";
-  st.textContent = `@page{size:58mm ${mm}mm;margin:0}
-    @media print{#receiptArea{box-sizing:border-box}}`;
-  area.appendChild(st);
 }
 
 // ================================================================== DASHBOARD
@@ -841,7 +820,8 @@ function printReceipt(result) {
   const hr = `<div class="r58-hr"></div>`;
   const row = (l, r, b) => `<div class="r58-row"${b ? ' style="font-weight:700"' : ""}><span>${l}</span><span>${r}</span></div>`;
   const html = `<style>
-      @media print{#receiptArea{width:58mm !important;padding:2mm 5mm !important}}
+      @page{margin:0}
+      @media print{#receiptArea{width:58mm !important;padding:2mm 5mm !important;box-sizing:border-box}}
       .r58{width:48mm;font-family:monospace;font-size:10px;line-height:1.3;color:#000;word-wrap:break-word;overflow-wrap:anywhere}
       .r58-hr{border-top:1px dashed #000;margin:3px 0}
       .r58-row{display:flex;justify-content:space-between;gap:4px}
@@ -882,7 +862,8 @@ function printDeliverySlip(o) {
   const hr = `<div class="r58-hr"></div>`;
   const row = (l, r, b) => `<div class="r58-row"${b ? ' style="font-weight:700"' : ""}><span>${l}</span><span>${r}</span></div>`;
   printDocument(`<style>
-      @media print{#receiptArea{width:58mm !important;padding:2mm 5mm !important}}
+      @page{margin:0}
+      @media print{#receiptArea{width:58mm !important;padding:2mm 5mm !important;box-sizing:border-box}}
       .r58{width:48mm;font-family:monospace;font-size:10px;line-height:1.3;color:#000;word-wrap:break-word;overflow-wrap:anywhere}
       .r58-hr{border-top:1px dashed #000;margin:3px 0}
       .r58-row{display:flex;justify-content:space-between;gap:4px}
