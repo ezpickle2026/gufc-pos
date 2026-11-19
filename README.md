@@ -32,6 +32,13 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 ## What's new in this update
 
+- **Delivery Driver role: 50kg delivery & pull-out record with the customer's signature.** A new built-in
+  role, **DELIVERY_DRIVER**, sees only **My Deliveries** on their phone: the 50kg orders of Commercial accounts
+  (For Delivery orders and POS sales not yet billed). At the customer the driver records the serial number, tare
+  and gross weight of each cylinder delivered and pulled out, and the recipient signs on the phone screen. In
+  Accounting's **Generate Billing** the signed record is already filled in (pull-out residual, serials, signature),
+  so Accounting only presses the button. Records can be viewed / printed from the sale (**✍ Signed**) and voided
+  by Admin / Manager / Accounting before billing so the driver can redo them.
 - **Customer Portal: latest rate and rate movement.** Commercial accounts (and any customer with a 50kg
   Commercial Billing) get a **My Rate** tab in the portal, and a rate card on Home. It shows the current rate
   per kg (the account rate set in Customers → Rate, or the 50kg product's standard price per kg when none is set),

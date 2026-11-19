@@ -351,6 +351,41 @@ CREATE TABLE IF NOT EXISTS commercial_meters (
     UNIQUE(customer_id, meter_label)
 );
 
+-- Delivery Driver's record of a 50kg Commercial delivery, made on the
+-- driver's phone at the customer: serial / tare / gross of each cylinder
+-- delivered and pulled out, acknowledged by the recipient's signature.
+-- Linked to the POS sale (sale_id) or to the For Delivery order (pending_id,
+-- whose sale_id is set once it is marked delivered). Accounting's Generate
+-- Billing uses the pull-outs recorded here. Locked once signed; a void
+-- (Admin / Manager / Accounting, before billing) lets the driver redo it.
+CREATE TABLE IF NOT EXISTS delivery_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_no TEXT UNIQUE NOT NULL,
+    sale_id INTEGER REFERENCES sales(id),
+    pending_id INTEGER REFERENCES pending_sales(id),
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    location_id INTEGER REFERENCES locations(id),
+    driver_id INTEGER NOT NULL REFERENCES users(id),
+    recorded_at TEXT DEFAULT (datetime('now')),
+    recipient_name TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'SIGNED' CHECK(status IN ('SIGNED','VOID')),
+    voided_by INTEGER REFERENCES users(id),
+    voided_at TEXT,
+    void_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS delivery_record_cylinders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_id INTEGER NOT NULL REFERENCES delivery_records(id),
+    kind TEXT NOT NULL CHECK(kind IN ('DELIVERED','PULLOUT')),
+    serial_no TEXT NOT NULL,
+    tare_weight REAL NOT NULL,
+    gross_weight REAL NOT NULL,
+    net_kg REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     migration_key TEXT PRIMARY KEY,
     applied_at TEXT DEFAULT (datetime('now'))
@@ -524,7 +559,7 @@ MODULE_KEYS = [
     "employees", "staff_schedule", "kpi", "reports", "audit",
     "booked_orders", "incident_reports", "commercial_deliveries",
     "eod_report", "receivables_summary", "customer_growth",
-    "stock_import", "sales_targets",
+    "stock_import", "sales_targets", "driver_deliveries",
 ]
 
 # Roles with Admin-level access. OPERATION_HEAD can do everything Admin can
@@ -561,6 +596,7 @@ DEFAULT_ROLE_PERMISSIONS = {
     "SUPERVISOR": [
         "dashboard", "sales", "inventory", "stock_import", "staff_schedule", "incident_reports",
     ],
+    "DELIVERY_DRIVER": ["driver_deliveries"],
 }
 
 
@@ -931,6 +967,15 @@ def migrate_schema():
         if not _column_exists(conn, "sale_items", col):
             conn.execute(f"ALTER TABLE sale_items ADD COLUMN {col} {decl}")
     conn.commit()
+
+    # 30. Delivery Driver built-in role (records 50kg Commercial deliveries
+    #     and pull-outs with the customer's signature). Runs once.
+    MIGRATION_KEY = "delivery_driver_role"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        conn.execute("INSERT OR IGNORE INTO roles (name, is_builtin) VALUES ('DELIVERY_DRIVER', 1)")
+        conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES ('DELIVERY_DRIVER', 'driver_deliveries')")
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
+        conn.commit()
 
     # 17. Supervisor can view and void sales: give the built-in SUPERVISOR
     #     role the Sales module. Runs once.
