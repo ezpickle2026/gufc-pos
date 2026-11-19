@@ -3440,7 +3440,9 @@ def list_pending_sales():
     conn = get_db()
     rows = conn.execute(
         f"""SELECT ps.*, COALESCE(c.name, ps.walkin_name) customer_name, c.account_no, l.name location_name,
-                   cu.name created_by_name, du.name delivered_by_name, xu.name cancelled_by_name, s.sale_no
+                   cu.name created_by_name, du.name delivered_by_name, xu.name cancelled_by_name, s.sale_no,
+                   (SELECT dr.id FROM delivery_records dr WHERE dr.pending_id=ps.id AND dr.status='SIGNED'
+                     ORDER BY dr.id DESC LIMIT 1) delivery_record_id
             FROM pending_sales ps JOIN locations l ON l.id=ps.location_id JOIN users cu ON cu.id=ps.created_by
             LEFT JOIN customers c ON c.id=ps.customer_id LEFT JOIN users du ON du.id=ps.delivered_by
             LEFT JOIN users xu ON xu.id=ps.cancelled_by LEFT JOIN sales s ON s.id=ps.sale_id
@@ -3585,6 +3587,8 @@ def list_sales():
     sql = f"""SELECT s.*, l.name location_name, u2.name cashier_name, COALESCE(c.name, s.walkin_name) customer_name,
                      c.account_no customer_account_no, s.customer_id IS NULL is_walkin,
                      (SELECT COALESCE(SUM(x.qty),0) FROM sale_items x WHERE x.sale_id=s.id AND x.bill_later=1) bill_later_qty,
+                     (SELECT dr.id FROM delivery_records dr WHERE dr.status='SIGNED' AND (dr.sale_id=s.id OR dr.pending_id IN
+                        (SELECT ps2.id FROM pending_sales ps2 WHERE ps2.sale_id=s.id)) ORDER BY dr.id DESC LIMIT 1) delivery_record_id,
                      (SELECT cd.id FROM commercial_deliveries cd WHERE cd.source_sale_id=s.id AND cd.status!='CANCELLED'
                        ORDER BY cd.id DESC LIMIT 1) billing_id,
                      (SELECT cd.delivery_no || '|' || COALESCE(cd.billed_amount,0) FROM commercial_deliveries cd
@@ -7002,8 +7006,11 @@ def sale_commercial_billing_preview(sale_id):
             """SELECT id, delivery_no, delivery_date, dr_ref, delivered_qty, billed_amount FROM commercial_deliveries
                WHERE customer_id=? AND source_sale_id IS NULL AND status='BILLED' AND billing_type='DR'
                      AND date(delivery_date) >= date(?) ORDER BY id LIMIT 10""", (customer["id"], sale["ts"])).fetchall()]
+    rec = _record_for_sale(conn, sale_id)
+    delivery_record = _record_out(conn, rec) if rec else None
     conn.close()
     return jsonify(
+        delivery_record=delivery_record,
         sale={"id": sale["id"], "sale_no": sale["sale_no"], "dr_no": sale["dr_no"], "ts": sale["ts"],
               "status": sale["status"], "sale_type": sale["sale_type"]},
         customer={"id": customer["id"], "name": customer["name"], "account_no": customer["account_no"],
@@ -7037,7 +7044,17 @@ def sale_generate_commercial_billing(sale_id):
     delivered_qty = sum(ln["qty"] for ln in lines)
     delivered_kg = sum(ln["qty"] * (product_kg_size(ln["p_name"], ln["sku"]) or 50.0) for ln in lines)
     location_id = sale["location_id"]
+    # The driver's signed record, when there is one, is what gets billed:
+    # its pull-outs (serial, gross, tare) replace anything typed in.
+    rec = _record_for_sale(conn, sale_id)
+    rec_pullouts = [{"serial_no": c["serial_no"], "gross_weight": c["gross_weight"], "tare_weight": c["tare_weight"]}
+                    for c in conn.execute("SELECT * FROM delivery_record_cylinders WHERE record_id=? AND kind='PULLOUT' "
+                                          "ORDER BY id", (rec["id"],)).fetchall()] if rec else None
     conn.close()
+    if rec:
+        d = {**d, "pullouts": rec_pullouts, "total_residual_kg": 0 if not rec_pullouts else None,
+             "notes": " ".join(x for x in (f"Driver record {rec['record_no']}, received by {rec['recipient_name']}.",
+                                          d.get("notes") or "") if x)}
     body = {
         "customer_id": customer["id"], "product_id": lines[0]["product_id"],
         "delivered_qty": delivered_qty,
@@ -7071,6 +7088,345 @@ def void_commercial_billing(did):
     audit(conn, "VOID", "COMMERCIAL_DELIVERIES", did,
           f"{cd['delivery_no']} billing voided ({money_fmt(cd['billed_amount'] or 0)})"
           + (f", invoice {r['invoice_no']}" if r else ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+
+# ---------------------------------------------------------------- Delivery Driver records (50kg Commercial)
+# On the driver's phone at the customer: serial / tare / gross of each 50kg
+# cylinder delivered and of each cylinder pulled out, signed by the
+# recipient on the phone. Accounting's Generate Billing then uses the
+# pull-outs recorded here, so all Accounting does is press the button.
+
+DELIVERY_RECORD_VIEW_ROLES = ("ADMIN", "MANAGER", "ACCOUNTING")
+DELIVERY_RECORD_VOID_ROLES = ("ADMIN", "MANAGER", "ACCOUNTING")
+MAX_SIGNATURE_LEN = 600_000  # data URL of a phone-sized PNG signature
+
+
+def _record_for_sale(conn, sale_id):
+    """The signed driver record of a POS sale: made on the sale itself, or
+    on the For Delivery order that became this sale."""
+    return conn.execute(
+        """SELECT * FROM delivery_records WHERE status='SIGNED' AND (sale_id=? OR pending_id IN
+               (SELECT id FROM pending_sales WHERE sale_id=?)) ORDER BY id DESC LIMIT 1""",
+        (sale_id, sale_id)).fetchone()
+
+
+def _record_out(conn, r, with_signature=True):
+    cyls = [dict(c) for c in conn.execute(
+        "SELECT * FROM delivery_record_cylinders WHERE record_id=? ORDER BY kind, id", (r["id"],)).fetchall()]
+    extra = conn.execute(
+        """SELECT c.name customer_name, c.account_no, u.name driver_name, l.name location_name,
+                  s.sale_no, s.dr_no, ps.pending_no, vu.name voided_by_name
+           FROM delivery_records dr JOIN customers c ON c.id=dr.customer_id JOIN users u ON u.id=dr.driver_id
+           LEFT JOIN locations l ON l.id=dr.location_id
+           LEFT JOIN pending_sales ps ON ps.id=dr.pending_id
+           LEFT JOIN sales s ON s.id=COALESCE(dr.sale_id, ps.sale_id)
+           LEFT JOIN users vu ON vu.id=dr.voided_by WHERE dr.id=?""", (r["id"],)).fetchone()
+    out = {**dict(r), **dict(extra)}
+    if not with_signature:
+        out.pop("signature", None)
+    out["recorded_at"] = _local_ts(r["recorded_at"])
+    out["voided_at"] = _local_ts(r["voided_at"])
+    out["delivered"] = [c for c in cyls if c["kind"] == "DELIVERED"]
+    out["pullouts"] = [c for c in cyls if c["kind"] == "PULLOUT"]
+    out["delivered_net_kg"] = round(sum(c["net_kg"] for c in out["delivered"]), 2)
+    out["total_residual_kg"] = round(sum(c["net_kg"] for c in out["pullouts"]), 2)
+    return out
+
+
+def _pending_commercial_qty(conn, row):
+    """50kg cylinders on a For Delivery order of a Commercial account."""
+    payload = json.loads(row["payload"] or "{}")
+    qty = 0
+    for it in payload.get("items") or []:
+        if not it.get("product_id"):
+            continue
+        prod = conn.execute("SELECT name, sku FROM products WHERE id=?", (it["product_id"],)).fetchone()
+        if prod and is_commercial_cylinder(prod):
+            qty += int(it.get("qty") or 0)
+    return qty
+
+
+def _sale_commercial_qty(conn, sale_id):
+    return conn.execute("SELECT COALESCE(SUM(qty),0) q FROM sale_items WHERE sale_id=? AND COALESCE(bill_later,0)=1",
+                        (sale_id,)).fetchone()["q"]
+
+
+def _open_commercial_deliveries(conn, loc):
+    """Commercial 50kg deliveries with no signed record yet: For Delivery
+    orders and POS sales (last 30 days) not yet billed. With the driver
+    each one is assigned to (driver_id / driver_name, None if unassigned)."""
+    todo = []
+    sql = """SELECT ps.*, c.name customer_name, c.account_no, c.address customer_address, c.category
+             FROM pending_sales ps JOIN customers c ON c.id=ps.customer_id
+             WHERE ps.status='PENDING' AND LOWER(TRIM(COALESCE(c.category,'')))=?
+                   AND NOT EXISTS (SELECT 1 FROM delivery_records dr WHERE dr.pending_id=ps.id AND dr.status='SIGNED')"""
+    params = [COMMERCIAL_CATEGORY]
+    if loc:
+        sql += " AND ps.location_id=?"; params.append(loc)
+    for r in conn.execute(sql + " ORDER BY ps.ts", params).fetchall():
+        qty = _pending_commercial_qty(conn, r)
+        if qty:
+            todo.append({"source": "PENDING", "id": r["id"], "ref": r["pending_no"], "ts": _local_ts(r["ts"]),
+                         "customer_name": r["customer_name"], "account_no": r["account_no"],
+                         "address": r["delivery_address"] or r["customer_address"], "notes": r["notes"], "qty": qty})
+    sql = """SELECT s.id, s.sale_no, s.dr_no, s.ts, s.notes, c.name customer_name, c.account_no, c.address customer_address,
+                    (SELECT COALESCE(SUM(x.qty),0) FROM sale_items x WHERE x.sale_id=s.id AND x.bill_later=1) qty
+             FROM sales s JOIN customers c ON c.id=s.customer_id
+             WHERE s.status='COMPLETED' AND COALESCE(s.is_billing,0)=0 AND date(s.ts) >= date('now','-30 day')
+                   AND EXISTS (SELECT 1 FROM sale_items x WHERE x.sale_id=s.id AND x.bill_later=1 AND x.qty>0)
+                   AND NOT EXISTS (SELECT 1 FROM commercial_deliveries cd WHERE cd.source_sale_id=s.id AND cd.status!='CANCELLED')
+                   AND NOT EXISTS (SELECT 1 FROM delivery_records dr WHERE dr.status='SIGNED' AND (dr.sale_id=s.id OR
+                       dr.pending_id IN (SELECT id FROM pending_sales WHERE sale_id=s.id)))"""
+    params = []
+    if loc:
+        sql += " AND s.location_id=?"; params.append(loc)
+    for r in conn.execute(sql + " ORDER BY s.ts", params).fetchall():
+        todo.append({"source": "SALE", "id": r["id"], "ref": r["dr_no"] or r["sale_no"], "ts": _local_ts(r["ts"]),
+                     "customer_name": r["customer_name"], "account_no": r["account_no"],
+                     "address": r["customer_address"], "notes": r["notes"], "qty": r["qty"]})
+    assigned = {(r["source"], r["source_id"]): r for r in conn.execute(
+        "SELECT da.*, u.name driver_name FROM delivery_assignments da JOIN users u ON u.id=da.driver_id").fetchall()}
+    for t in todo:
+        a = assigned.get((t["source"], t["id"]))
+        t["driver_id"] = a["driver_id"] if a else None
+        t["driver_name"] = a["driver_name"] if a else None
+        t["assigned_at"] = _local_ts(a["assigned_at"]) if a else None
+    return todo
+
+
+@app.get("/api/driver/deliveries")
+@roles_or_module_required("ADMIN", module="driver_deliveries")
+def driver_deliveries():
+    """To deliver: Commercial 50kg orders (For Delivery, or POS sales not yet
+    billed) with no signed record yet. Done: the recent records."""
+    u = session["user"]
+    conn = get_db()
+    todo = _open_commercial_deliveries(conn, None)
+    # A driver sees only the deliveries assigned to them; Admin sees all.
+    if not is_admin_like(u["role"]):
+        todo = [t for t in todo if t["driver_id"] == u["id"]]
+    sql = "SELECT * FROM delivery_records WHERE date(recorded_at) >= date('now','-30 day')"
+    params = []
+    if not is_admin_like(u["role"]) and u["role"] not in DELIVERY_RECORD_VIEW_ROLES:
+        sql += " AND driver_id=?"; params.append(u["id"])
+    done = [_record_out(conn, r, with_signature=False)
+            for r in conn.execute(sql + " ORDER BY id DESC LIMIT 100", params).fetchall()]
+    conn.close()
+    return jsonify(to_deliver=todo, done=done)
+
+
+DELIVERY_ASSIGN_ROLES = ("ADMIN", "DISPATCHER", "SUPERVISOR")
+
+
+def _assignable_drivers(conn, loc):
+    sql = "SELECT id, name, username, location_id FROM users WHERE active=1 AND role='DELIVERY_DRIVER'"
+    params = []
+    if loc:
+        sql += " AND (location_id=? OR location_id IS NULL)"; params.append(loc)
+    return [dict(r) for r in conn.execute(sql + " ORDER BY name", params).fetchall()]
+
+
+@app.get("/api/delivery-assignments")
+@roles_or_module_required(*DELIVERY_ASSIGN_ROLES, module="delivery_assign")
+def list_delivery_assignments():
+    """Dispatcher / Supervisor: the open 50kg Commercial deliveries of their
+    location, who each is assigned to, and the drivers to choose from."""
+    u = session["user"]
+    loc = None if is_admin_like(u["role"]) else u.get("location_id")
+    conn = get_db()
+    out = {"deliveries": _open_commercial_deliveries(conn, loc), "drivers": _assignable_drivers(conn, loc)}
+    conn.close()
+    return jsonify(out)
+
+
+@app.put("/api/delivery-assignments")
+@roles_or_module_required(*DELIVERY_ASSIGN_ROLES, module="delivery_assign")
+def set_delivery_assignment():
+    """Assign (or reassign / unassign with driver_id null) a delivery."""
+    d = request.get_json(force=True) or {}
+    u = session["user"]
+    source, src_id, driver_id = d.get("source"), d.get("id"), d.get("driver_id") or None
+    if source not in ("PENDING", "SALE") or not src_id:
+        return jsonify(error="Pick the delivery to assign"), 400
+    conn = get_db()
+    table = "pending_sales" if source == "PENDING" else "sales"
+    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (src_id,)).fetchone()
+    if not row:
+        conn.close(); return jsonify(error="Delivery not found"), 404
+    if not is_admin_like(u["role"]) and u.get("location_id") and row["location_id"] != u["location_id"]:
+        conn.close(); return jsonify(error="This delivery belongs to another location"), 403
+    if source == "PENDING" and row["status"] != "PENDING":
+        conn.close(); return jsonify(error=f"{row['pending_no']} is already {row['status'].lower()}"), 400
+    signed = (conn.execute("SELECT record_no FROM delivery_records WHERE pending_id=? AND status='SIGNED'", (src_id,)).fetchone()
+              if source == "PENDING" else _record_for_sale(conn, src_id))
+    if signed:
+        conn.close(); return jsonify(error=f"Already delivered and signed ({signed['record_no']})"), 400
+    ref = row["pending_no"] if source == "PENDING" else (row["dr_no"] or row["sale_no"])
+    if driver_id:
+        drv = conn.execute("SELECT * FROM users WHERE id=? AND active=1 AND role='DELIVERY_DRIVER'", (driver_id,)).fetchone()
+        if not drv:
+            conn.close(); return jsonify(error="Pick an active Delivery Driver"), 400
+        conn.execute("""INSERT INTO delivery_assignments (source, source_id, driver_id, assigned_by) VALUES (?,?,?,?)
+                        ON CONFLICT(source, source_id) DO UPDATE SET driver_id=excluded.driver_id,
+                        assigned_by=excluded.assigned_by, assigned_at=datetime('now')""",
+                     (source, src_id, drv["id"], u["id"]))
+        audit(conn, "ASSIGN", "DELIVERY_ASSIGNMENTS", src_id, f"{ref} -> driver {drv['name']}")
+    else:
+        conn.execute("DELETE FROM delivery_assignments WHERE source=? AND source_id=?", (source, src_id))
+        audit(conn, "UNASSIGN", "DELIVERY_ASSIGNMENTS", src_id, ref)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/delivery-records")
+@roles_or_module_required("ADMIN", module="driver_deliveries")
+def create_delivery_record():
+    d = request.get_json(force=True) or {}
+    u = session["user"]
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        source, src_id = d.get("source"), d.get("id")
+        if source == "PENDING":
+            row = conn.execute("SELECT * FROM pending_sales WHERE id=?", (src_id,)).fetchone()
+            if not row:
+                raise LookupError("Order not found")
+            if row["status"] != "PENDING":
+                raise ValueError(f"{row['pending_no']} is already {row['status'].lower()}")
+            expected = _pending_commercial_qty(conn, row)
+            sale_id, pending_id, ref = None, row["id"], row["pending_no"]
+            dup = conn.execute("SELECT record_no FROM delivery_records WHERE pending_id=? AND status='SIGNED'",
+                               (pending_id,)).fetchone()
+        elif source == "SALE":
+            row = conn.execute("SELECT * FROM sales WHERE id=?", (src_id,)).fetchone()
+            if not row:
+                raise LookupError("Sale not found")
+            if row["status"] != "COMPLETED":
+                raise ValueError(f"{row['sale_no']} is {row['status'].lower()}")
+            if conn.execute("SELECT 1 FROM commercial_deliveries WHERE source_sale_id=? AND status!='CANCELLED'",
+                            (row["id"],)).fetchone():
+                raise ValueError(f"{row['sale_no']} is already billed")
+            expected = _sale_commercial_qty(conn, row["id"])
+            sale_id, pending_id, ref = row["id"], None, row["dr_no"] or row["sale_no"]
+            dup = _record_for_sale(conn, sale_id)
+        else:
+            raise ValueError("Pick the delivery to record")
+        if not is_admin_like(u["role"]):
+            a = conn.execute("SELECT driver_id FROM delivery_assignments WHERE source=? AND source_id=?",
+                             (source, row["id"])).fetchone()
+            if not a or a["driver_id"] != u["id"]:
+                raise PermissionError("This delivery isn't assigned to you — ask the Dispatcher or Supervisor")
+        if dup:
+            raise ValueError(f"This delivery already has a signed record ({dup['record_no']})")
+        if not row["customer_id"]:
+            raise ValueError("This delivery has no customer account")
+
+        def rows(key, kind):
+            out = []
+            for i, c in enumerate(d.get(key) or [], start=1):
+                label = f"{'Delivered' if kind == 'DELIVERED' else 'Pull-out'} #{i}"
+                serial = (c.get("serial_no") or "").strip()
+                if not serial:
+                    raise ValueError(f"{label}: serial number is required")
+                tare = _num(c.get("tare_weight"), f"{label} tare weight")
+                gross = _num(c.get("gross_weight"), f"{label} gross weight")
+                if tare <= 0 or gross <= 0:
+                    raise ValueError(f"{label} ({serial}): weights must be positive")
+                net = round(gross - tare, 2)
+                if net < 0:
+                    raise ValueError(f"{label} ({serial}): gross weight can't be less than the tare weight")
+                if net > 50.5:
+                    raise ValueError(f"{label} ({serial}): {net} kg of LPG is more than a full 50kg cylinder — check the weights")
+                out.append((kind, serial[:60], tare, gross, net))
+            return out
+        delivered = rows("delivered", "DELIVERED")
+        pullouts = rows("pullouts", "PULLOUT")
+        if len(delivered) != expected:
+            raise ValueError(f"{ref} has {expected} x 50kg to deliver — record {expected} delivered cylinder(s) "
+                             f"(you entered {len(delivered)}). If fewer were delivered, have the order corrected first.")
+        serials = [c[1].upper() for c in delivered]
+        if len(set(serials)) != len(serials):
+            raise ValueError("The same serial number is entered twice under Delivered")
+        recipient = (d.get("recipient_name") or "").strip()
+        if not recipient:
+            raise ValueError("Enter the name of the person receiving")
+        sig = d.get("signature") or ""
+        if not sig.startswith("data:image/png;base64,") or len(sig) < 200:
+            raise ValueError("The recipient must sign before saving")
+        if len(sig) > MAX_SIGNATURE_LEN:
+            raise ValueError("The signature image is too large — clear it and sign again")
+        record_no = next_number(conn, "DREC", "delivery_records", "record_no")
+        cur = conn.execute(
+            """INSERT INTO delivery_records (record_no, sale_id, pending_id, customer_id, location_id, driver_id,
+                   recipient_name, signature, notes) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (record_no, sale_id, pending_id, row["customer_id"], row["location_id"], u["id"],
+             recipient[:120], sig, (d.get("notes") or "").strip()[:500] or None))
+        rid = cur.lastrowid
+        conn.executemany("INSERT INTO delivery_record_cylinders (record_id, kind, serial_no, tare_weight, gross_weight, net_kg) "
+                         "VALUES (?,?,?,?,?,?)", [(rid, *c) for c in delivered + pullouts])
+        audit(conn, "CREATE", "DELIVERY_RECORDS", rid,
+              f"{record_no} for {ref}: {len(delivered)} delivered, {len(pullouts)} pulled out "
+              f"({round(sum(c[4] for c in pullouts), 2)} kg residual), signed by {recipient}")
+        conn.commit()
+        out = _record_out(conn, conn.execute("SELECT * FROM delivery_records WHERE id=?", (rid,)).fetchone(),
+                          with_signature=False)
+    except LookupError as e:
+        conn.rollback(); conn.close(); return jsonify(error=str(e)), 404
+    except PermissionError as e:
+        conn.rollback(); conn.close(); return jsonify(error=str(e)), 403
+    except ValueError as e:
+        conn.rollback(); conn.close(); return jsonify(error=str(e)), 400
+    conn.close()
+    return jsonify(out), 201
+
+
+def _can_view_record(conn, u, r):
+    if is_admin_like(u["role"]) or u["role"] in DELIVERY_RECORD_VIEW_ROLES or r["driver_id"] == u["id"]:
+        return True
+    return has_module_access(conn, u["role"], "commercial_deliveries")
+
+
+@app.get("/api/delivery-records/<int:rid>")
+@login_required
+def get_delivery_record(rid):
+    conn = get_db()
+    r = conn.execute("SELECT * FROM delivery_records WHERE id=?", (rid,)).fetchone()
+    if not r:
+        conn.close(); return jsonify(error="Not found"), 404
+    if not _can_view_record(conn, session["user"], r):
+        conn.close(); return jsonify(error="Forbidden: insufficient permissions"), 403
+    out = _record_out(conn, r)
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/delivery-records/<int:rid>/void")
+@roles_required(*DELIVERY_RECORD_VOID_ROLES)
+def void_delivery_record(rid):
+    """Void a wrong record so the driver can record it again. Not once billed."""
+    d = request.get_json(force=True) or {}
+    reason = (d.get("reason") or "").strip()
+    if not reason:
+        return jsonify(error="Please give a reason"), 400
+    conn = get_db()
+    r = conn.execute("SELECT * FROM delivery_records WHERE id=?", (rid,)).fetchone()
+    if not r:
+        conn.close(); return jsonify(error="Not found"), 404
+    if r["status"] != "SIGNED":
+        conn.close(); return jsonify(error="This record is already void"), 400
+    sale_id = r["sale_id"] or (conn.execute("SELECT sale_id FROM pending_sales WHERE id=?", (r["pending_id"],))
+                               .fetchone() or {"sale_id": None})["sale_id"]
+    if sale_id and conn.execute("SELECT 1 FROM commercial_deliveries WHERE source_sale_id=? AND status!='CANCELLED'",
+                                (sale_id,)).fetchone():
+        conn.close(); return jsonify(error="This delivery is already billed — void the billing first"), 400
+    conn.execute("UPDATE delivery_records SET status='VOID', voided_by=?, voided_at=datetime('now'), void_reason=? "
+                 "WHERE id=?", (session["user"]["id"], reason[:300], rid))
+    audit(conn, "VOID", "DELIVERY_RECORDS", rid, f"{r['record_no']}: {reason}")
     conn.commit()
     conn.close()
     return jsonify(ok=True)

@@ -61,6 +61,7 @@ const NAV = [
   { id: "dashboard", label: "Dashboard", icon: "\u{1F3E0}", module: "dashboard" },
   { id: "pos", label: "POS", icon: "\u{1F6D2}", module: "pos" },
   { id: "for_delivery", label: "For Delivery", icon: "\u23F3", module: "pos" },
+  { id: "driver_deliveries", label: "My Deliveries", icon: "\u{1F4DD}", module: "driver_deliveries" },
   { id: "sales", label: "Sales", icon: "\u{1F9FE}", module: "sales" },
   { id: "eod_report", label: "End of Day Report", icon: "\u{1F4B5}", module: "eod_report" },
   { id: "booked_orders", label: "Booked Orders", icon: "\u{1F4CB}", module: "booked_orders" },
@@ -79,6 +80,7 @@ const NAV = [
   { id: "inventory_ledger", label: "Inv. Ledger", icon: "\u{1F4D2}", module: "inventory_ledger" },
   { id: "stock_import", label: "Import Stock", icon: "\u{1F4E5}", module: "stock_import" },
   { id: "transfers", label: "Dispatch", icon: "\u{1F69A}", module: "transfers" },
+  { id: "delivery_assign", label: "Assign Deliveries", icon: "\u{1F69A}", module: "delivery_assign" },
   { id: "hauling", label: "Hauling Schedule", icon: "\u{1F69B}", module: "hauling" },
   { id: "commercial_deliveries", label: "50kg Commercial Billing", icon: "\u2696\uFE0F", module: "commercial_deliveries" },
 
@@ -183,6 +185,7 @@ function render() {
     booked_orders: renderBookedOrders, incident_reports: renderIncidentReports, roles: renderRoles,
     commercial_deliveries: renderCommercialDeliveries, eod_report: renderEndOfDay,
     customer_growth: renderCustomerGrowth, sales_targets: renderSalesTargets, stock_import: renderStockImport,
+    driver_deliveries: renderDriverDeliveries, delivery_assign: renderDeliveryAssign,
   };
   (views[state.view] || renderDashboard)(c);
 }
@@ -911,7 +914,7 @@ async function renderForDelivery(c) {
         ${status === "DELIVERED" ? "<th>Delivered</th><th>Sale #</th>" : status === "CANCELLED" ? "<th>Cancelled</th><th>Reason</th>" : ""}<th></th>
       </tr></thead><tbody>
       ${rows.length ? rows.map(o => `<tr>
-        <td>${esc(o.pending_no)}</td><td>${esc(o.ts)}</td>
+        <td>${esc(o.pending_no)}${o.delivery_record_id ? `<br><button class="btn small" onclick="viewDeliveryRecord(${o.delivery_record_id})" title="Driver's signed delivery record">✍ Signed</button>` : ""}</td><td>${esc(o.ts)}</td>
         <td>${esc(o.customer_name || "Walk-in")}${o.delivery_address ? `<br><span style="color:var(--muted);font-size:11.5px">${esc(o.delivery_address)}</span>` : ""}
           ${o.notes ? `<br><span style="color:var(--muted);font-size:11.5px">${esc(o.notes)}</span>` : ""}</td>
         <td>${o.items.map(i => `${esc(i.product_name)} x${i.qty}${i.sale_mode !== "REFILL" ? " (" + i.sale_mode + ")" : ""}`).join("<br>")}</td>
@@ -1154,6 +1157,262 @@ function eodReconcileHtml(s, print = false) {
   </div>`;
 }
 
+// ================================================================== DRIVER DELIVERIES
+// Delivery Driver, on the phone at the customer: serial / tare / gross of each
+// 50kg cylinder delivered and pulled out, then the recipient signs on the
+// screen. Accounting's Generate Billing uses this record as is.
+function deliveryRecordTables(r, print) {
+  const b = print ? "#bbb" : "var(--border)";
+  const td = (v, right) => `<td style="border:1px solid ${b};padding:3px 6px;${right ? "text-align:right" : ""}">${v}</td>`;
+  const tbl = (title, list, netLabel) => `<div style="font-weight:700;margin:8px 0 3px">${title} (${list.length})</div>
+    ${list.length ? `<table style="border-collapse:collapse;width:100%;font-size:12px"><tr>
+      ${["Serial No.", "Tare (kg)", "Gross (kg)", netLabel].map((h, i) => `<th style="border:1px solid ${b};padding:3px 6px;text-align:${i ? "right" : "left"}">${h}</th>`).join("")}</tr>
+      ${list.map(c => `<tr>${td(esc(c.serial_no))}${td(c.tare_weight, 1)}${td(c.gross_weight, 1)}${td(c.net_kg.toFixed(2), 1)}</tr>`).join("")}
+      <tr>${td("<b>Total</b>")}${td("")}${td("")}${td(`<b>${list.reduce((a, c) => a + c.net_kg, 0).toFixed(2)}</b>`, 1)}</tr></table>`
+      : `<div style="font-size:12px;color:#888">None</div>`}`;
+  return tbl("Delivered (full)", r.delivered, "Net LPG (kg)") + tbl("Pulled out", r.pullouts, "Residual (kg)");
+}
+function printDeliveryRecord(r) {
+  printDocument(`<div style="font-family:Arial,sans-serif;font-size:12px;max-width:700px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+      <img src="/images/logo.png" style="height:40px">
+      <div><div style="font-weight:700;font-size:14px">GREAT UNLI FOOD CORP.</div>
+        <div>50kg Commercial Delivery &amp; Pull-out Record</div></div>
+      <div style="margin-left:auto;text-align:right"><b>${esc(r.record_no)}</b><br>${esc(r.recorded_at)}</div>
+    </div>
+    <div><b>Customer:</b> ${esc(r.customer_name)} (${esc(r.account_no || "")})</div>
+    <div><b>Order:</b> ${esc(r.dr_no || r.sale_no || r.pending_no || "")} &nbsp; <b>Driver:</b> ${esc(r.driver_name)}</div>
+    ${r.status === "VOID" ? `<div style="color:#c0392b;font-weight:700">VOID — ${esc(r.void_reason || "")}</div>` : ""}
+    ${deliveryRecordTables(r, true)}
+    ${r.notes ? `<div style="margin-top:6px"><b>Notes:</b> ${esc(r.notes)}</div>` : ""}
+    <div style="margin-top:14px">Received the above in good order:</div>
+    <img src="${r.signature}" style="max-width:280px;max-height:120px;display:block;border-bottom:1px solid #000">
+    <div><b>${esc(r.recipient_name)}</b> — signed ${esc(r.recorded_at)}</div>
+  </div>`);
+}
+window.viewDeliveryRecord = async (id) => {
+  let r;
+  try { r = await api(`/delivery-records/${id}`); } catch (e) { return; }
+  const canVoid = r.status === "SIGNED" && (isAdminLike() || ["MANAGER", "ACCOUNTING"].includes(state.user.role));
+  openModal(`Delivery Record ${esc(r.record_no)}`, `
+    <div style="font-size:13px;line-height:1.6">
+      <b>Customer:</b> ${esc(r.customer_name)} (${esc(r.account_no || "")})<br>
+      <b>Order:</b> ${esc(r.dr_no || r.sale_no || r.pending_no || "")} &nbsp; <b>Driver:</b> ${esc(r.driver_name)}<br>
+      <b>Recorded:</b> ${esc(r.recorded_at)} &nbsp; <span class="badge ${r.status === "VOID" ? "danger" : "green"}">${r.status}</span>
+      ${r.status === "VOID" ? `<br><span style="color:var(--danger)">Voided ${esc(r.voided_at || "")} by ${esc(r.voided_by_name || "")}: ${esc(r.void_reason || "")}</span>` : ""}
+    </div>
+    ${deliveryRecordTables(r)}
+    ${r.notes ? `<div style="margin-top:6px;font-size:13px"><b>Notes:</b> ${esc(r.notes)}</div>` : ""}
+    <div style="margin-top:10px;font-size:13px"><b>Received and signed by:</b> ${esc(r.recipient_name)}</div>
+    <img src="${r.signature}" alt="Signature" style="max-width:100%;max-height:140px;background:#fff;border:1px solid var(--border);border-radius:8px">
+    <div class="modal-actions">
+      ${canVoid ? `<button class="btn danger" id="drVoid">Void</button>` : ""}
+      <button class="btn" id="drPrint">Print</button>
+      <button class="btn" onclick="closeModal()">Close</button></div>
+  `, () => {
+    document.getElementById("drPrint").onclick = () => printDeliveryRecord(r);
+    if (canVoid) document.getElementById("drVoid").onclick = async () => {
+      const reason = prompt("Reason for voiding this record? The driver can then record the delivery again.");
+      if (!reason) return;
+      try {
+        await api(`/delivery-records/${id}/void`, { method: "POST", body: { reason } });
+        closeModal(); toast("Record voided", "success");
+        if (state.view === "sales") loadSalesPage(); else render();
+      } catch (e) {}
+    };
+  });
+};
+
+// Signature pad on a canvas: works with finger, stylus or mouse.
+function initSignaturePad(canvas) {
+  const ctx = canvas.getContext("2d");
+  let drawing = false, hasInk = false, last = null;
+  const fit = () => {
+    const ratio = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+    canvas.width = w * ratio; canvas.height = h * ratio;
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
+    ctx.lineWidth = 2.2; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = "#111";
+    hasInk = false;
+  };
+  const pos = e => { const r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+  canvas.addEventListener("pointerdown", e => { e.preventDefault(); drawing = true; last = pos(e); canvas.setPointerCapture(e.pointerId);
+    ctx.beginPath(); ctx.arc(last.x, last.y, 1.1, 0, Math.PI * 2); ctx.fillStyle = "#111"; ctx.fill(); hasInk = true; });
+  canvas.addEventListener("pointermove", e => { if (!drawing) return; e.preventDefault(); const p = pos(e);
+    ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(p.x, p.y); ctx.stroke(); last = p; hasInk = true; });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(ev => canvas.addEventListener(ev, () => { drawing = false; }));
+  fit();
+  return { clear: fit, isEmpty: () => !hasInk, toDataURL: () => canvas.toDataURL("image/png") };
+}
+
+async function renderDriverDeliveries(c) {
+  c.innerHTML = `<div style="display:flex;gap:8px;margin-bottom:12px">
+      <button class="btn green" data-tab="todo">To Deliver</button><button class="btn" data-tab="done">Done (30 days)</button>
+      <span style="flex:1"></span><button class="btn small" id="ddRefresh">Refresh</button></div>
+    <div id="ddList">Loading...</div>`;
+  let data = { to_deliver: [], done: [] }, tab = "todo";
+  const draw = () => {
+    c.querySelectorAll("[data-tab]").forEach(b => b.className = "btn" + (b.dataset.tab === tab ? " green" : ""));
+    const el = document.getElementById("ddList");
+    if (tab === "todo") {
+      el.innerHTML = data.to_deliver.length ? data.to_deliver.map((o, i) => `<div class="card" style="margin-bottom:10px">
+          <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">
+            <div><b style="font-size:15px">${esc(o.customer_name)}</b> <span style="color:var(--muted);font-size:12px">${esc(o.account_no || "")}</span><br>
+              <span style="font-size:13px">${esc(o.ref)} · ${esc(o.ts)}</span>
+              ${o.address ? `<br><span style="font-size:12.5px;color:var(--muted)">📍 ${esc(o.address)}</span>` : ""}
+              ${o.notes ? `<br><span style="font-size:12.5px;color:var(--muted)">${esc(o.notes)}</span>` : ""}</div>
+            <div style="text-align:right"><span class="badge blue" style="font-size:13px">${o.qty} x 50kg</span>
+              ${isAdminLike() ? `<br><span style="font-size:12px;color:var(--muted)">${o.driver_name ? "🚚 " + esc(o.driver_name) : "Unassigned"}</span>` : ""}</div>
+          </div>
+          <button class="btn green" style="width:100%;margin-top:10px" data-rec="${i}">Record Delivery &amp; Pull-out</button>
+        </div>`).join("") : `<div class="card" style="color:var(--muted)">No deliveries assigned to you yet. The Dispatcher or Supervisor assigns them.</div>`;
+      el.querySelectorAll("[data-rec]").forEach(b => b.onclick = () => openDeliveryRecordForm(data.to_deliver[b.dataset.rec], load));
+    } else {
+      el.innerHTML = data.done.length ? data.done.map(r => `<div class="card" style="margin-bottom:10px;cursor:pointer" onclick="viewDeliveryRecord(${r.id})">
+          <div style="display:flex;justify-content:space-between;gap:8px">
+            <div><b>${esc(r.customer_name)}</b><br><span style="font-size:12.5px">${esc(r.record_no)} · ${esc(r.dr_no || r.sale_no || r.pending_no || "")}</span><br>
+              <span style="font-size:12px;color:var(--muted)">${esc(r.recorded_at)} · signed by ${esc(r.recipient_name)}${r.driver_name !== state.user.name ? " · driver " + esc(r.driver_name) : ""}</span></div>
+            <div style="text-align:right;font-size:12.5px"><span class="badge ${r.status === "VOID" ? "danger" : "green"}">${r.status}</span><br>
+              ${r.delivered.length} delivered<br>${r.pullouts.length} pulled out</div>
+          </div></div>`).join("") : `<div class="card" style="color:var(--muted)">No records yet.</div>`;
+    }
+  };
+  async function load() {
+    try { data = await api("/driver/deliveries"); } catch (e) { return; }
+    draw();
+  }
+  c.querySelectorAll("[data-tab]").forEach(b => b.onclick = () => { tab = b.dataset.tab; draw(); });
+  document.getElementById("ddRefresh").onclick = load;
+  load();
+}
+
+// Dispatcher / Supervisor: assign each open 50kg Commercial delivery to a driver.
+async function renderDeliveryAssign(c) {
+  c.innerHTML = `<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <span style="font-size:13px;color:var(--muted);flex:1">50kg deliveries of Commercial accounts (For Delivery orders and POS sales not yet billed).
+        The driver sees only what is assigned to them.</span>
+      <label style="font-size:13px;display:flex;gap:4px;align-items:center"><input type="checkbox" id="daUnassigned"> Unassigned only</label>
+      <button class="btn small" id="daRefresh">Refresh</button></div>
+    <div id="daList">Loading...</div>`;
+  let data = { deliveries: [], drivers: [] };
+  const draw = () => {
+    const only = document.getElementById("daUnassigned").checked;
+    const rows = data.deliveries.filter(o => !only || !o.driver_id);
+    const opts = sel => `<option value="">— Unassigned —</option>` + data.drivers.map(d =>
+      `<option value="${d.id}" ${d.id === sel ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+    document.getElementById("daList").innerHTML = !data.drivers.length
+      ? `<div class="card" style="color:var(--danger);margin-bottom:10px">No Delivery Driver users for this location yet — ask the Admin to create one (Users, role DELIVERY_DRIVER).</div>` : "";
+    document.getElementById("daList").innerHTML += `<div class="table-wrap"><table><thead><tr>
+        <th>Order / DR</th><th>Date</th><th>Customer</th><th>Address</th><th>50kg</th><th>Driver</th></tr></thead><tbody>
+      ${rows.length ? rows.map((o, i) => `<tr>
+        <td>${esc(o.ref)}<br><span class="badge gray">${o.source === "PENDING" ? "For Delivery" : "Sale"}</span></td>
+        <td>${esc(o.ts)}</td><td>${esc(o.customer_name)}<br><span style="font-size:11.5px;color:var(--muted)">${esc(o.account_no || "")}</span></td>
+        <td style="font-size:12.5px">${esc(o.address || "")}${o.notes ? `<br><span style="color:var(--muted)">${esc(o.notes)}</span>` : ""}</td>
+        <td>${o.qty}</td>
+        <td><select data-i="${data.deliveries.indexOf(o)}" style="min-width:150px">${opts(o.driver_id)}</select>
+          ${o.assigned_at ? `<br><span style="font-size:11px;color:var(--muted)">since ${esc(o.assigned_at)}</span>` : ""}</td></tr>`).join("")
+        : `<tr><td colspan="6" style="color:var(--muted)">${only ? "Everything is assigned." : "No 50kg commercial deliveries waiting."}</td></tr>`}
+    </tbody></table></div>`;
+    document.querySelectorAll("#daList select[data-i]").forEach(sel => sel.onchange = async () => {
+      const o = data.deliveries[sel.dataset.i];
+      try {
+        await api("/delivery-assignments", { method: "PUT", body: { source: o.source, id: o.id, driver_id: sel.value || null } });
+        toast(sel.value ? `${o.ref} assigned to ${sel.selectedOptions[0].text}` : `${o.ref} unassigned`, "success");
+      } catch (e) {}
+      load();
+    });
+  };
+  async function load() {
+    try { data = await api("/delivery-assignments"); } catch (e) { return; }
+    draw();
+  }
+  document.getElementById("daUnassigned").onchange = draw;
+  document.getElementById("daRefresh").onclick = load;
+  load();
+}
+
+function openDeliveryRecordForm(o, onSaved) {
+  const num = 'type="number" inputmode="decimal" step="0.01" min="0"';
+  const cylRow = (kind, i) => `<div class="drc-row" data-kind="${kind}" style="border:1px solid var(--border);border-radius:8px;padding:8px;margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <b style="font-size:13px">${kind === "D" ? "Delivered" : "Pull-out"} #<span class="drc-n">${i}</span></b>
+        ${kind === "P" ? `<button class="btn small danger drc-del" type="button">&times;</button>` : ""}</div>
+      <input class="drc-serial" placeholder="Serial number" autocapitalize="characters" style="width:100%;margin-bottom:6px">
+      <div style="display:flex;gap:6px">
+        <input class="drc-tare" ${num} placeholder="Tare kg" style="flex:1;min-width:0">
+        <input class="drc-gross" ${num} placeholder="Gross kg" style="flex:1;min-width:0">
+        <div class="drc-net" style="flex:1;align-self:center;text-align:right;font-size:12.5px;color:var(--muted)">—</div>
+      </div></div>`;
+  openModal(`Record Delivery — ${esc(o.customer_name)}`, `
+    <div style="font-size:13px;margin-bottom:8px">${esc(o.ref)} · <b>${o.qty} x 50kg</b>${o.address ? `<br>📍 ${esc(o.address)}` : ""}</div>
+    <h4 style="margin:10px 0 6px">1. Delivered cylinders (full)</h4>
+    <p style="font-size:12px;color:var(--muted);margin:0 0 6px">Serial no., tare and gross weight of each 50kg cylinder delivered.</p>
+    <div id="drcDelivered">${Array.from({ length: o.qty }, (_, i) => cylRow("D", i + 1)).join("")}</div>
+    <h4 style="margin:14px 0 6px">2. Pulled-out cylinders</h4>
+    <p style="font-size:12px;color:var(--muted);margin:0 0 6px">Serial no., tare and gross weight of each cylinder taken back. Gross − tare = residual LPG, deducted from the bill.</p>
+    <div id="drcPullouts"></div>
+    <button class="btn small" type="button" id="drcAddPull">+ Add Pull-out</button>
+    <div id="drcTotals" style="background:var(--bg);padding:8px 10px;border-radius:8px;font-size:13px;margin-top:10px"></div>
+    <div class="field" style="margin-top:10px"><label>Notes (optional)</label><input id="drcNotes"></div>
+    <h4 style="margin:14px 0 6px">3. Customer acknowledgement</h4>
+    <div class="field"><label>Name of person receiving</label><input id="drcRecipient" autocomplete="off"></div>
+    <div class="field"><label>Signature — have the recipient sign below</label>
+      <canvas id="drcSig" style="width:100%;height:170px;border:1px dashed #999;border-radius:8px;touch-action:none;background:#fff;display:block"></canvas>
+      <button class="btn small" type="button" id="drcSigClear" style="margin-top:6px">Clear signature</button></div>
+    <p style="font-size:12px;color:var(--muted)">By signing, the recipient confirms the cylinders delivered and pulled out above. The record can't be changed after saving.</p>
+    <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn green" id="drcSave">Save Signed Record</button></div>
+  `, () => {
+    const pulls = document.getElementById("drcPullouts");
+    const rowsOf = kind => [...document.querySelectorAll(`.drc-row[data-kind="${kind}"]`)];
+    const read = r => ({ serial_no: r.querySelector(".drc-serial").value.trim(),
+      tare_weight: r.querySelector(".drc-tare").value, gross_weight: r.querySelector(".drc-gross").value });
+    const recalc = () => {
+      let del = 0, res = 0;
+      ["D", "P"].forEach(kind => rowsOf(kind).forEach((r, i) => {
+        r.querySelector(".drc-n").textContent = i + 1;
+        const t = parseFloat(r.querySelector(".drc-tare").value), g = parseFloat(r.querySelector(".drc-gross").value);
+        const out = r.querySelector(".drc-net");
+        if (isNaN(t) || isNaN(g)) { out.textContent = "—"; out.style.color = "var(--muted)"; return; }
+        const n = g - t;
+        out.textContent = `${n.toFixed(2)} kg`;
+        out.style.color = n < 0 || n > 50.5 ? "var(--danger)" : "var(--text)";
+        if (kind === "D") del += n; else res += n;
+      }));
+      document.getElementById("drcTotals").innerHTML = `Delivered: <b>${rowsOf("D").length}</b> cyl · net LPG <b>${del.toFixed(2)} kg</b><br>
+        Pulled out: <b>${rowsOf("P").length}</b> cyl · residual <b>${res.toFixed(2)} kg</b>`;
+    };
+    const addPull = () => {
+      const wrap = document.createElement("div");
+      wrap.innerHTML = cylRow("P", rowsOf("P").length + 1);
+      const row = wrap.firstElementChild;
+      row.querySelector(".drc-del").onclick = () => { row.remove(); recalc(); };
+      pulls.appendChild(row); recalc();
+    };
+    document.getElementById("drcAddPull").onclick = addPull;
+    document.getElementById("modalBody").addEventListener("input", e => { if (e.target.closest(".drc-row")) recalc(); });
+    for (let i = 0; i < o.qty; i++) addPull();  // usually one empty pulled out per full delivered
+    const pad = initSignaturePad(document.getElementById("drcSig"));
+    document.getElementById("drcSigClear").onclick = () => pad.clear();
+    document.getElementById("drcSave").onclick = async (ev) => {
+      const delivered = rowsOf("D").map(read), pullouts = rowsOf("P").map(read)
+        .filter(p => p.serial_no || p.tare_weight || p.gross_weight);
+      const bad = [...delivered, ...pullouts].find(c => !c.serial_no || c.tare_weight === "" || c.gross_weight === "");
+      if (bad) { toast("Fill in the serial no., tare and gross weight of every cylinder (remove unused pull-out rows)", "error"); return; }
+      const recipient_name = document.getElementById("drcRecipient").value.trim();
+      if (!recipient_name) { toast("Enter the name of the person receiving", "error"); return; }
+      if (pad.isEmpty()) { toast("The recipient must sign first", "error"); return; }
+      ev.target.disabled = true;
+      try {
+        const r = await api("/delivery-records", { method: "POST", body: {
+          source: o.source, id: o.id, delivered, pullouts, recipient_name,
+          signature: pad.toDataURL(), notes: document.getElementById("drcNotes").value } });
+        closeModal(); toast(`Saved ${r.record_no}`, "success"); onSaved && onSaved();
+      } catch (e) { ev.target.disabled = false; }
+    };
+  });
+}
+
 // ================================================================== SALES
 // Generate Billing (Commercial 50kg deliveries) is for Accounting only (+ Admin).
 const canCommercialBilling = () => isAdminLike() || state.user.role === "ACCOUNTING";
@@ -1221,6 +1480,7 @@ async function loadSalesPage() {
       <td style="display:flex;gap:6px">
         <button class="btn small" onclick="viewSale(${s.id})">View</button>
         ${s.sale_type === 'CREDIT' ? `<button class="btn small green" onclick="printSaleDR(${s.id})" title="Print Delivery Receipt">DR</button>` : ""}
+        ${s.delivery_record_id ? `<button class="btn small" onclick="viewDeliveryRecord(${s.delivery_record_id})" title="Driver's signed delivery record">✍ Signed</button>` : ""}
         ${s.billing_id ? `<span class="badge green" title="Billed ${money(Number((s.billing_ref || "|0").split("|")[1]))}">Billed ${esc((s.billing_ref || "").split("|")[0])}</span>`
           : canGenBill && s.bill_later_qty > 0 && s.status === 'COMPLETED' ? `<button class="btn small blue" onclick="openSaleBilling(${s.id})" title="50kg commercial delivery — bill the gas">Generate Billing</button>` : ""}
         ${canEditSale() && s.status === 'COMPLETED' && !s.billing_id ? `<button class="btn small" onclick="openEditSale(${s.id})" title="Adjust items, prices, payment or customer">Edit</button>` : ""}
@@ -1408,6 +1668,7 @@ window.openSaleBilling = async (saleId) => {
   let d;
   try { d = await api(`/sales/${saleId}/commercial-billing`); } catch (e) { return; }
   if (d.billing) { toast(`Already billed in ${d.billing.delivery_no}`, "error"); return; }
+  const rec = d.delivery_record;
   const rate = d.rate || 0;
   const rateNote = d.rate_source === "CUSTOMER" ? "account rate"
     : rate ? "product default — no rate set on this account yet" : "";
@@ -1422,10 +1683,18 @@ window.openSaleBilling = async (saleId) => {
       ⚠ This customer already has 50kg Commercial Billing record(s) since this sale that aren't linked to a sale:
       ${d.possible_duplicates.map(x => `${esc(x.delivery_no)}${x.dr_ref ? " (DR " + esc(x.dr_ref) + ")" : ""} ${money(x.billed_amount)}`).join(", ")}.
       Make sure this delivery wasn't billed there already.</div>` : ""}
+    ${rec ? `<div class="field" style="background:#e9f7ef;padding:8px 10px;border-radius:8px;font-size:12.5px">
+      ✍ <b>Driver record ${esc(rec.record_no)}</b> — ${esc(rec.driver_name)}, ${esc(rec.recorded_at)}. Received and signed by <b>${esc(rec.recipient_name)}</b>.
+      <button class="btn small" type="button" onclick="viewDeliveryRecord(${rec.id})">View</button>
+      ${deliveryRecordTables(rec)}
+      <img src="${rec.signature}" alt="Signature" style="max-width:220px;max-height:90px;background:#fff;border:1px solid var(--border);border-radius:6px;margin-top:6px;display:block">
+    </div>
+    <input type="hidden" id="sbResidual" value="${rec.total_residual_kg}">`
+    : `<div class="field" style="background:#fff4e5;padding:6px 10px;border-radius:8px;font-size:12px">No signed driver record for this delivery — type the residual below.</div>
     <div class="field"><label>Total residual of the cylinders pulled out (kg)</label>
       <p style="font-size:12px;color:var(--muted);margin:0 0 6px">Type the overall residual kg of all pulled-out cylinders. It is deducted from the delivered kg.</p>
       <input type="number" step="0.01" min="0" id="sbResidual" placeholder="0.00">
-    </div>
+    </div>`}
     <div class="field"><label>Notes</label><input id="sbNotes"></div>
     <div class="field" id="sbSummary" style="background:var(--bg);padding:10px;border-radius:8px;font-size:13.5px"></div>
     <p style="font-size:12px;color:var(--muted);margin:0">This creates the customer's invoice (Receivables / SOA). It is not recorded as a new sale.</p>
@@ -1443,7 +1712,7 @@ window.openSaleBilling = async (saleId) => {
     };
     resEl.addEventListener("input", recalc);
     recalc();
-    setTimeout(() => resEl.focus(), 0);
+    if (!rec) setTimeout(() => resEl.focus(), 0);
     document.getElementById("sbSave").addEventListener("click", async (ev) => {
       ev.target.disabled = true;
       try {
@@ -4486,6 +4755,8 @@ async function renderRoles(c) {
       commercial_deliveries: "50kg Commercial Billing", eod_report: "End of Day Report",
       receivables_summary: "Dashboard: Receivables Totals", customer_growth: "Customer Growth",
       stock_import: "Import Stock from Supplier", sales_targets: "Sales Targets",
+      driver_deliveries: "My Deliveries (driver: 50kg delivery & pull-out record + signature)",
+      delivery_assign: "Assign Deliveries (50kg commercial deliveries to drivers)",
     };
     openModal(`${locked ? "View" : "Edit"} Modules — ${name}`, `
       ${locked ? `<p style="color:var(--muted);font-size:13px">${name === "OPERATION_HEAD" ? "Operation Head always has full access to every module (everything except the System Reset)" : "Admin always has full access to every module"} — this can't be changed.</p>` : ""}
