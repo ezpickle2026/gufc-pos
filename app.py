@@ -1083,8 +1083,10 @@ def list_booked_orders():
     params = []
     if u["role"] == "ORDER_TAKER":
         # Order Takers see orders they personally booked, plus every
-        # customer-submitted order that still needs a location assigned.
-        sql += " AND (bo.created_by=? OR bo.showroom_location_id IS NULL)"
+        # customer-submitted order (online form or customer portal) — whether
+        # still unassigned or already routed — so they can assign it and
+        # later reassign it to a different warehouse/showroom.
+        sql += " AND (bo.created_by=? OR bo.source='CUSTOMER' OR bo.showroom_location_id IS NULL)"
         params.append(u["id"])
     elif u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
         sql += " AND bo.showroom_location_id=?"
@@ -1152,16 +1154,32 @@ def update_booked_order(oid):
                      (new_status, u["id"], oid))
     else:
         # Admin/Manager/Order Taker can also (re)assign which location the
-        # order goes to — this is how a customer-submitted, unassigned order
-        # gets routed to a specific warehouse or showroom.
-        new_location = d.get("showroom_location_id", order["showroom_location_id"])
+        # order goes to — this is how a customer-submitted (online form or
+        # portal) order gets routed to a specific warehouse or showroom.
+        if u["role"] == "ORDER_TAKER" and not (
+                order["created_by"] == u["id"] or order["source"] == "CUSTOMER"
+                or order["showroom_location_id"] is None):
+            conn.close()
+            return jsonify(error="Forbidden: this order was booked by another staff member"), 403
+        new_location = d.get("showroom_location_id", order["showroom_location_id"]) or None
+        if "showroom_location_id" in d and order["status"] != "PENDING":
+            conn.close()
+            return jsonify(error="Only pending orders can be assigned or reassigned"), 400
+        if new_location and str(new_location) != str(order["showroom_location_id"] or ""):
+            loc = conn.execute("SELECT id FROM locations WHERE id=? AND status='ACTIVE'", (new_location,)).fetchone()
+            if not loc:
+                conn.close()
+                return jsonify(error="Selected location is not active"), 400
         conn.execute("UPDATE booked_orders SET status=?, notes=?, delivery_address=?, showroom_location_id=? WHERE id=?",
                      (new_status, d.get("notes", order["notes"]), d.get("delivery_address", order["delivery_address"]),
-                      new_location or None, oid))
+                      new_location, oid))
         if new_status == "FULFILLED" and order["status"] != "FULFILLED":
             conn.execute("UPDATE booked_orders SET fulfilled_by=?, fulfilled_at=datetime('now') WHERE id=?",
                          (u["id"], oid))
-    audit(conn, "UPDATE", "BOOKED_ORDERS", oid, f"status={new_status}")
+    detail = f"status={new_status}"
+    if str(order["showroom_location_id"] or "") != str(d.get("showroom_location_id", order["showroom_location_id"]) or ""):
+        detail += f", location {order['showroom_location_id'] or 'unassigned'} -> {d.get('showroom_location_id') or 'unassigned'}"
+    audit(conn, "UPDATE", "BOOKED_ORDERS", oid, detail)
     conn.commit()
     conn.close()
     return jsonify(ok=True)
