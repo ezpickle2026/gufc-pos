@@ -4082,8 +4082,8 @@ async function renderBookedOrders(c) {
     catch (e) {}
   };
   window.assignOrderLocation = (id, currentLocationId) => {
-    const locOpts = state.locations.map(l => `<option value="${l.id}" ${l.id === currentLocationId ? "selected" : ""}>${esc(l.name)} (${l.type === "WAREHOUSE" ? "Warehouse" : "Showroom"})</option>`).join("");
-    openModal("Assign Order to Location", `
+    const locOpts = state.locations.filter(l => l.status !== "INACTIVE" || l.id === currentLocationId).map(l => `<option value="${l.id}" ${l.id === currentLocationId ? "selected" : ""}>${esc(l.name)} (${l.type === "WAREHOUSE" ? "Warehouse" : "Showroom"})</option>`).join("");
+    openModal(currentLocationId ? "Reassign Order to Location" : "Assign Order to Location", `
       <div class="field"><label>Warehouse / Showroom</label><select id="assignLoc">${locOpts}</select></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
         <button class="btn green" id="assignSaveBtn">Assign</button></div>
@@ -4091,7 +4091,7 @@ async function renderBookedOrders(c) {
       document.getElementById("assignSaveBtn").addEventListener("click", async () => {
         try {
           await api(`/booked-orders/${id}`, { method: "PUT", body: { showroom_location_id: document.getElementById("assignLoc").value } });
-          closeModal(); toast("Order assigned", "success"); load();
+          closeModal(); toast(currentLocationId ? "Order reassigned" : "Order assigned", "success"); load();
         } catch (e) {}
       });
     });
