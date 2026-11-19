@@ -2122,7 +2122,7 @@ async function renderReceivables(c) {
       <td>${r.is_opening_balance ? '<span class="badge gray">PREV. ARREARS</span>' : esc(r.sale_no)}</td>
       <td>${r.invoice_date}</td><td>${r.due_date}</td><td>${money(r.amount)}</td><td>${money(r.paid)}</td><td>${money(r.balance)}</td>
       <td><span class="badge ${statusColor(r.status)}">${r.status}</span></td>
-      <td style="display:flex;gap:6px">${r.balance > 0.009 ? `<button class="btn small green" onclick="payReceivable(${r.id}, ${r.balance})">Record Payment</button>` : ""}
+      <td style="display:flex;gap:6px">${r.balance > 0.009 ? `<button class="btn small green" onclick="payReceivable(${r.id}, ${r.balance}, ${r.sale_total || 0}, ${r.withholding_tax || 0})">Record Payment</button>` : ""}
         ${canEdit ? `<button class="btn small" onclick="editReceivable(${r.id})">Edit</button>` : ""}
         ${canArrears && r.is_opening_balance && r.paid <= 0 ? `<button class="btn small danger" onclick="deleteArrears(${r.id})">Remove</button>` : ""}</td>
     </tr>`;
@@ -2305,9 +2305,17 @@ async function openAgingReport(canExport) {
   `);
 }
 
-window.payReceivable = (id, balance) => {
+window.payReceivable = (id, balance, saleTotal = 0, existingWht = 0) => {
+  // 1% withholding tax, same computation as the POS: sale gross / 1.12 x 1%.
+  const wht = withholdingTax(saleTotal);
+  const whtAllowed = !(existingWht > 0) && saleTotal > 0 && wht <= balance + 0.009;
   openModal("Record Payment", `
-    <div class="field"><label>Outstanding Balance</label><div style="font-weight:700">${money(balance)}</div></div>
+    <div class="field"><label>Outstanding Balance</label><div style="font-weight:700" id="rBalance">${money(balance)}</div></div>
+    <div class="field"><label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="checkbox" id="rWht" style="width:auto;margin:0" ${whtAllowed ? "" : "disabled"}> Withholding tax (1%)</label>
+      ${existingWht > 0 ? `<div style="font-size:12.5px;color:var(--muted);margin-top:4px">Already deducted on this invoice: ${money(existingWht)}</div>` : ""}
+      <div id="rWhtInfo" style="display:none;font-size:12.5px;color:var(--muted);margin-top:4px">
+        Gross ${money(saleTotal)} &divide; 1.12 = ${money(saleTotal / 1.12)} &times; 1% = <b>&minus;${money(wht)}</b></div></div>
     <div class="field"><label>Payment Method</label>
       <select id="rMethod"><option>Cash</option><option>GCash</option><option>Bank Transfer</option><option>Maya</option><option>Cheque</option><option>Other</option></select></div>
     <div class="field"><label>Amount</label><input type="number" id="rAmount" value="${balance}" max="${balance}" min="0"></div>
@@ -2315,12 +2323,23 @@ window.payReceivable = (id, balance) => {
     <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
       <button class="btn green" id="rSaveBtn">Save Payment</button></div>
   `, () => {
+    const whtBox = document.getElementById("rWht");
+    whtBox.addEventListener("change", () => {
+      const due = whtBox.checked ? Math.round((balance - wht) * 100) / 100 : balance;
+      document.getElementById("rWhtInfo").style.display = whtBox.checked ? "" : "none";
+      document.getElementById("rBalance").innerHTML = whtBox.checked
+        ? `${money(balance)} &minus; ${money(wht)} WHT = ${money(due)}` : money(balance);
+      const amt = document.getElementById("rAmount");
+      amt.max = due;
+      if (parseFloat(amt.value) > due || parseFloat(amt.value) === (whtBox.checked ? balance : Math.round((balance - wht) * 100) / 100)) amt.value = due;
+    });
     document.getElementById("rSaveBtn").addEventListener("click", async () => {
       try {
         await api(`/receivables/${id}/pay`, { method: "POST", body: {
           amount: parseFloat(document.getElementById("rAmount").value),
           method: document.getElementById("rMethod").value,
           reference: document.getElementById("rRef").value,
+          withholding_tax: whtBox.checked,
         }});
         closeModal(); toast("Payment recorded", "success"); renderReceivables(document.getElementById("content"));
       } catch (e) {}
