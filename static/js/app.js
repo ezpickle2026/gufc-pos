@@ -80,6 +80,7 @@ const NAV = [
   { id: "inventory_ledger", label: "Inv. Ledger", icon: "\u{1F4D2}", module: "inventory_ledger" },
   { id: "stock_import", label: "Import Stock", icon: "\u{1F4E5}", module: "stock_import" },
   { id: "transfers", label: "Dispatch", icon: "\u{1F69A}", module: "transfers" },
+  { id: "delivery_assign", label: "Assign Deliveries", icon: "\u{1F69A}", module: "delivery_assign" },
   { id: "hauling", label: "Hauling Schedule", icon: "\u{1F69B}", module: "hauling" },
   { id: "commercial_deliveries", label: "50kg Commercial Billing", icon: "\u2696\uFE0F", module: "commercial_deliveries" },
 
@@ -184,7 +185,7 @@ function render() {
     booked_orders: renderBookedOrders, incident_reports: renderIncidentReports, roles: renderRoles,
     commercial_deliveries: renderCommercialDeliveries, eod_report: renderEndOfDay,
     customer_growth: renderCustomerGrowth, sales_targets: renderSalesTargets, stock_import: renderStockImport,
-    driver_deliveries: renderDriverDeliveries,
+    driver_deliveries: renderDriverDeliveries, delivery_assign: renderDeliveryAssign,
   };
   (views[state.view] || renderDashboard)(c);
 }
@@ -1260,10 +1261,11 @@ async function renderDriverDeliveries(c) {
               <span style="font-size:13px">${esc(o.ref)} · ${esc(o.ts)}</span>
               ${o.address ? `<br><span style="font-size:12.5px;color:var(--muted)">📍 ${esc(o.address)}</span>` : ""}
               ${o.notes ? `<br><span style="font-size:12.5px;color:var(--muted)">${esc(o.notes)}</span>` : ""}</div>
-            <div style="text-align:right"><span class="badge blue" style="font-size:13px">${o.qty} x 50kg</span></div>
+            <div style="text-align:right"><span class="badge blue" style="font-size:13px">${o.qty} x 50kg</span>
+              ${isAdminLike() ? `<br><span style="font-size:12px;color:var(--muted)">${o.driver_name ? "🚚 " + esc(o.driver_name) : "Unassigned"}</span>` : ""}</div>
           </div>
           <button class="btn green" style="width:100%;margin-top:10px" data-rec="${i}">Record Delivery &amp; Pull-out</button>
-        </div>`).join("") : `<div class="card" style="color:var(--muted)">No 50kg commercial deliveries waiting.</div>`;
+        </div>`).join("") : `<div class="card" style="color:var(--muted)">No deliveries assigned to you yet. The Dispatcher or Supervisor assigns them.</div>`;
       el.querySelectorAll("[data-rec]").forEach(b => b.onclick = () => openDeliveryRecordForm(data.to_deliver[b.dataset.rec], load));
     } else {
       el.innerHTML = data.done.length ? data.done.map(r => `<div class="card" style="margin-bottom:10px;cursor:pointer" onclick="viewDeliveryRecord(${r.id})">
@@ -1281,6 +1283,51 @@ async function renderDriverDeliveries(c) {
   }
   c.querySelectorAll("[data-tab]").forEach(b => b.onclick = () => { tab = b.dataset.tab; draw(); });
   document.getElementById("ddRefresh").onclick = load;
+  load();
+}
+
+// Dispatcher / Supervisor: assign each open 50kg Commercial delivery to a driver.
+async function renderDeliveryAssign(c) {
+  c.innerHTML = `<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <span style="font-size:13px;color:var(--muted);flex:1">50kg deliveries of Commercial accounts (For Delivery orders and POS sales not yet billed).
+        The driver sees only what is assigned to them.</span>
+      <label style="font-size:13px;display:flex;gap:4px;align-items:center"><input type="checkbox" id="daUnassigned"> Unassigned only</label>
+      <button class="btn small" id="daRefresh">Refresh</button></div>
+    <div id="daList">Loading...</div>`;
+  let data = { deliveries: [], drivers: [] };
+  const draw = () => {
+    const only = document.getElementById("daUnassigned").checked;
+    const rows = data.deliveries.filter(o => !only || !o.driver_id);
+    const opts = sel => `<option value="">— Unassigned —</option>` + data.drivers.map(d =>
+      `<option value="${d.id}" ${d.id === sel ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+    document.getElementById("daList").innerHTML = !data.drivers.length
+      ? `<div class="card" style="color:var(--danger);margin-bottom:10px">No Delivery Driver users for this location yet — ask the Admin to create one (Users, role DELIVERY_DRIVER).</div>` : "";
+    document.getElementById("daList").innerHTML += `<div class="table-wrap"><table><thead><tr>
+        <th>Order / DR</th><th>Date</th><th>Customer</th><th>Address</th><th>50kg</th><th>Driver</th></tr></thead><tbody>
+      ${rows.length ? rows.map((o, i) => `<tr>
+        <td>${esc(o.ref)}<br><span class="badge gray">${o.source === "PENDING" ? "For Delivery" : "Sale"}</span></td>
+        <td>${esc(o.ts)}</td><td>${esc(o.customer_name)}<br><span style="font-size:11.5px;color:var(--muted)">${esc(o.account_no || "")}</span></td>
+        <td style="font-size:12.5px">${esc(o.address || "")}${o.notes ? `<br><span style="color:var(--muted)">${esc(o.notes)}</span>` : ""}</td>
+        <td>${o.qty}</td>
+        <td><select data-i="${data.deliveries.indexOf(o)}" style="min-width:150px">${opts(o.driver_id)}</select>
+          ${o.assigned_at ? `<br><span style="font-size:11px;color:var(--muted)">since ${esc(o.assigned_at)}</span>` : ""}</td></tr>`).join("")
+        : `<tr><td colspan="6" style="color:var(--muted)">${only ? "Everything is assigned." : "No 50kg commercial deliveries waiting."}</td></tr>`}
+    </tbody></table></div>`;
+    document.querySelectorAll("#daList select[data-i]").forEach(sel => sel.onchange = async () => {
+      const o = data.deliveries[sel.dataset.i];
+      try {
+        await api("/delivery-assignments", { method: "PUT", body: { source: o.source, id: o.id, driver_id: sel.value || null } });
+        toast(sel.value ? `${o.ref} assigned to ${sel.selectedOptions[0].text}` : `${o.ref} unassigned`, "success");
+      } catch (e) {}
+      load();
+    });
+  };
+  async function load() {
+    try { data = await api("/delivery-assignments"); } catch (e) { return; }
+    draw();
+  }
+  document.getElementById("daUnassigned").onchange = draw;
+  document.getElementById("daRefresh").onclick = load;
   load();
 }
 
@@ -4709,6 +4756,7 @@ async function renderRoles(c) {
       receivables_summary: "Dashboard: Receivables Totals", customer_growth: "Customer Growth",
       stock_import: "Import Stock from Supplier", sales_targets: "Sales Targets",
       driver_deliveries: "My Deliveries (driver: 50kg delivery & pull-out record + signature)",
+      delivery_assign: "Assign Deliveries (50kg commercial deliveries to drivers)",
     };
     openModal(`${locked ? "View" : "Edit"} Modules — ${name}`, `
       ${locked ? `<p style="color:var(--muted);font-size:13px">${name === "OPERATION_HEAD" ? "Operation Head always has full access to every module (everything except the System Reset)" : "Admin always has full access to every module"} — this can't be changed.</p>` : ""}

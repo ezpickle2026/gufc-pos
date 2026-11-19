@@ -386,6 +386,19 @@ CREATE TABLE IF NOT EXISTS delivery_record_cylinders (
     net_kg REAL NOT NULL
 );
 
+-- Which Delivery Driver takes a 50kg Commercial delivery. Set by the
+-- Dispatcher or Supervisor; the driver sees only what is assigned to them.
+-- source PENDING = For Delivery order (pending_sales.id), SALE = sales.id.
+CREATE TABLE IF NOT EXISTS delivery_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL CHECK(source IN ('PENDING','SALE')),
+    source_id INTEGER NOT NULL,
+    driver_id INTEGER NOT NULL REFERENCES users(id),
+    assigned_by INTEGER REFERENCES users(id),
+    assigned_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(source, source_id)
+);
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     migration_key TEXT PRIMARY KEY,
     applied_at TEXT DEFAULT (datetime('now'))
@@ -559,7 +572,7 @@ MODULE_KEYS = [
     "employees", "staff_schedule", "kpi", "reports", "audit",
     "booked_orders", "incident_reports", "commercial_deliveries",
     "eod_report", "receivables_summary", "customer_growth",
-    "stock_import", "sales_targets", "driver_deliveries",
+    "stock_import", "sales_targets", "driver_deliveries", "delivery_assign",
 ]
 
 # Roles with Admin-level access. OPERATION_HEAD can do everything Admin can
@@ -587,7 +600,7 @@ DEFAULT_ROLE_PERMISSIONS = {
     ],
     "DISPATCHER": [
         "dashboard", "inventory", "transfers", "staff_schedule", "incident_reports",
-        "commercial_deliveries", "stock_import",
+        "commercial_deliveries", "stock_import", "delivery_assign",
     ],
     "ORDER_TAKER": [
         "dashboard", "booked_orders", "customers", "incident_reports",
@@ -595,6 +608,7 @@ DEFAULT_ROLE_PERMISSIONS = {
     ],
     "SUPERVISOR": [
         "dashboard", "sales", "inventory", "stock_import", "staff_schedule", "incident_reports",
+        "delivery_assign",
     ],
     "DELIVERY_DRIVER": ["driver_deliveries"],
 }
@@ -974,6 +988,17 @@ def migrate_schema():
     if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
         conn.execute("INSERT OR IGNORE INTO roles (name, is_builtin) VALUES ('DELIVERY_DRIVER', 1)")
         conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES ('DELIVERY_DRIVER', 'driver_deliveries')")
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
+        conn.commit()
+
+    # 31. Dispatcher and Supervisor assign 50kg Commercial deliveries to
+    #     drivers (Assign Deliveries module). Runs once.
+    MIGRATION_KEY = "delivery_assign_module"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        for role_name in ("DISPATCHER", "SUPERVISOR"):
+            if conn.execute("SELECT 1 FROM roles WHERE name=?", (role_name,)).fetchone():
+                conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES (?, 'delivery_assign')",
+                             (role_name,))
         conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 

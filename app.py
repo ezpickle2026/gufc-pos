@@ -7155,14 +7155,10 @@ def _sale_commercial_qty(conn, sale_id):
                         (sale_id,)).fetchone()["q"]
 
 
-@app.get("/api/driver/deliveries")
-@roles_or_module_required("ADMIN", module="driver_deliveries")
-def driver_deliveries():
-    """To deliver: Commercial 50kg orders (For Delivery, or POS sales not yet
-    billed) with no signed record yet. Done: the recent records."""
-    u = session["user"]
-    loc = None if is_admin_like(u["role"]) else u.get("location_id")
-    conn = get_db()
+def _open_commercial_deliveries(conn, loc):
+    """Commercial 50kg deliveries with no signed record yet: For Delivery
+    orders and POS sales (last 30 days) not yet billed. With the driver
+    each one is assigned to (driver_id / driver_name, None if unassigned)."""
     todo = []
     sql = """SELECT ps.*, c.name customer_name, c.account_no, c.address customer_address, c.category
              FROM pending_sales ps JOIN customers c ON c.id=ps.customer_id
@@ -7192,6 +7188,27 @@ def driver_deliveries():
         todo.append({"source": "SALE", "id": r["id"], "ref": r["dr_no"] or r["sale_no"], "ts": _local_ts(r["ts"]),
                      "customer_name": r["customer_name"], "account_no": r["account_no"],
                      "address": r["customer_address"], "notes": r["notes"], "qty": r["qty"]})
+    assigned = {(r["source"], r["source_id"]): r for r in conn.execute(
+        "SELECT da.*, u.name driver_name FROM delivery_assignments da JOIN users u ON u.id=da.driver_id").fetchall()}
+    for t in todo:
+        a = assigned.get((t["source"], t["id"]))
+        t["driver_id"] = a["driver_id"] if a else None
+        t["driver_name"] = a["driver_name"] if a else None
+        t["assigned_at"] = _local_ts(a["assigned_at"]) if a else None
+    return todo
+
+
+@app.get("/api/driver/deliveries")
+@roles_or_module_required("ADMIN", module="driver_deliveries")
+def driver_deliveries():
+    """To deliver: Commercial 50kg orders (For Delivery, or POS sales not yet
+    billed) with no signed record yet. Done: the recent records."""
+    u = session["user"]
+    conn = get_db()
+    todo = _open_commercial_deliveries(conn, None)
+    # A driver sees only the deliveries assigned to them; Admin sees all.
+    if not is_admin_like(u["role"]):
+        todo = [t for t in todo if t["driver_id"] == u["id"]]
     sql = "SELECT * FROM delivery_records WHERE date(recorded_at) >= date('now','-30 day')"
     params = []
     if not is_admin_like(u["role"]) and u["role"] not in DELIVERY_RECORD_VIEW_ROLES:
@@ -7200,6 +7217,70 @@ def driver_deliveries():
             for r in conn.execute(sql + " ORDER BY id DESC LIMIT 100", params).fetchall()]
     conn.close()
     return jsonify(to_deliver=todo, done=done)
+
+
+DELIVERY_ASSIGN_ROLES = ("ADMIN", "DISPATCHER", "SUPERVISOR")
+
+
+def _assignable_drivers(conn, loc):
+    sql = "SELECT id, name, username, location_id FROM users WHERE active=1 AND role='DELIVERY_DRIVER'"
+    params = []
+    if loc:
+        sql += " AND (location_id=? OR location_id IS NULL)"; params.append(loc)
+    return [dict(r) for r in conn.execute(sql + " ORDER BY name", params).fetchall()]
+
+
+@app.get("/api/delivery-assignments")
+@roles_or_module_required(*DELIVERY_ASSIGN_ROLES, module="delivery_assign")
+def list_delivery_assignments():
+    """Dispatcher / Supervisor: the open 50kg Commercial deliveries of their
+    location, who each is assigned to, and the drivers to choose from."""
+    u = session["user"]
+    loc = None if is_admin_like(u["role"]) else u.get("location_id")
+    conn = get_db()
+    out = {"deliveries": _open_commercial_deliveries(conn, loc), "drivers": _assignable_drivers(conn, loc)}
+    conn.close()
+    return jsonify(out)
+
+
+@app.put("/api/delivery-assignments")
+@roles_or_module_required(*DELIVERY_ASSIGN_ROLES, module="delivery_assign")
+def set_delivery_assignment():
+    """Assign (or reassign / unassign with driver_id null) a delivery."""
+    d = request.get_json(force=True) or {}
+    u = session["user"]
+    source, src_id, driver_id = d.get("source"), d.get("id"), d.get("driver_id") or None
+    if source not in ("PENDING", "SALE") or not src_id:
+        return jsonify(error="Pick the delivery to assign"), 400
+    conn = get_db()
+    table = "pending_sales" if source == "PENDING" else "sales"
+    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (src_id,)).fetchone()
+    if not row:
+        conn.close(); return jsonify(error="Delivery not found"), 404
+    if not is_admin_like(u["role"]) and u.get("location_id") and row["location_id"] != u["location_id"]:
+        conn.close(); return jsonify(error="This delivery belongs to another location"), 403
+    if source == "PENDING" and row["status"] != "PENDING":
+        conn.close(); return jsonify(error=f"{row['pending_no']} is already {row['status'].lower()}"), 400
+    signed = (conn.execute("SELECT record_no FROM delivery_records WHERE pending_id=? AND status='SIGNED'", (src_id,)).fetchone()
+              if source == "PENDING" else _record_for_sale(conn, src_id))
+    if signed:
+        conn.close(); return jsonify(error=f"Already delivered and signed ({signed['record_no']})"), 400
+    ref = row["pending_no"] if source == "PENDING" else (row["dr_no"] or row["sale_no"])
+    if driver_id:
+        drv = conn.execute("SELECT * FROM users WHERE id=? AND active=1 AND role='DELIVERY_DRIVER'", (driver_id,)).fetchone()
+        if not drv:
+            conn.close(); return jsonify(error="Pick an active Delivery Driver"), 400
+        conn.execute("""INSERT INTO delivery_assignments (source, source_id, driver_id, assigned_by) VALUES (?,?,?,?)
+                        ON CONFLICT(source, source_id) DO UPDATE SET driver_id=excluded.driver_id,
+                        assigned_by=excluded.assigned_by, assigned_at=datetime('now')""",
+                     (source, src_id, drv["id"], u["id"]))
+        audit(conn, "ASSIGN", "DELIVERY_ASSIGNMENTS", src_id, f"{ref} -> driver {drv['name']}")
+    else:
+        conn.execute("DELETE FROM delivery_assignments WHERE source=? AND source_id=?", (source, src_id))
+        audit(conn, "UNASSIGN", "DELIVERY_ASSIGNMENTS", src_id, ref)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
 
 
 @app.post("/api/delivery-records")
@@ -7235,8 +7316,11 @@ def create_delivery_record():
             dup = _record_for_sale(conn, sale_id)
         else:
             raise ValueError("Pick the delivery to record")
-        if not is_admin_like(u["role"]) and u.get("location_id") and row["location_id"] != u["location_id"]:
-            raise PermissionError("This delivery belongs to another location")
+        if not is_admin_like(u["role"]):
+            a = conn.execute("SELECT driver_id FROM delivery_assignments WHERE source=? AND source_id=?",
+                             (source, row["id"])).fetchone()
+            if not a or a["driver_id"] != u["id"]:
+                raise PermissionError("This delivery isn't assigned to you — ask the Dispatcher or Supervisor")
         if dup:
             raise ValueError(f"This delivery already has a signed record ({dup['record_no']})")
         if not row["customer_id"]:

@@ -537,8 +537,11 @@ P("You can <b>View</b>, <b>Print</b> or download a <b>PDF</b> of any billing rec
   "<b>Cancel</b> one that has not been invoiced yet.")
 
 section("4.6 Delivery Driver: recording a 50kg delivery and pull-out")
+P("The <b>Dispatcher</b> or <b>Supervisor</b> first assigns each 50kg Commercial delivery to a driver in "
+  "<b>Assign Deliveries</b>: it lists the 50kg orders of Commercial accounts (For Delivery orders and POS sales not "
+  "yet billed) of their location; pick the driver in the <b>Driver</b> column (or <b>Unassigned</b> to take it back).")
 P("Drivers sign in with the <b>DELIVERY_DRIVER</b> role on their phone and see only <b>My Deliveries</b>. "
-  "<b>To Deliver</b> lists the 50kg orders of Commercial accounts (For Delivery orders and POS sales not yet billed).")
+  "<b>To Deliver</b> lists only the deliveries assigned to them.")
 steps([
     "At the customer, tap <b>Record Delivery &amp; Pull-out</b> on the order.",
     "For each 50kg cylinder delivered, enter its <b>serial number</b>, <b>tare</b> and <b>gross</b> weight. "

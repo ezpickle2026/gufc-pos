@@ -34,7 +34,8 @@ model maps cleanly onto Postgres+Prisma if/when you want to migrate.
 
 - **Delivery Driver role: 50kg delivery & pull-out record with the customer's signature.** A new built-in
   role, **DELIVERY_DRIVER**, sees only **My Deliveries** on their phone: the 50kg orders of Commercial accounts
-  (For Delivery orders and POS sales not yet billed). At the customer the driver records the serial number, tare
+  (For Delivery orders and POS sales not yet billed) that the **Dispatcher or Supervisor assigned to them** in the
+  new **Assign Deliveries** page. At the customer the driver records the serial number, tare
   and gross weight of each cylinder delivered and pulled out, and the recipient signs on the phone screen. In
   Accounting's **Generate Billing** the signed record is already filled in (pull-out residual, serials, signature),
   so Accounting only presses the button. Records can be viewed / printed from the sale (**✍ Signed**) and voided
