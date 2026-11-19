@@ -4052,10 +4052,26 @@ def pay_receivable(rid):
     return jsonify(ok=True, paid=new_paid, balance=new_balance)
 
 
+@app.get("/api/receivables/<int:rid>/payments")
+@roles_required("ADMIN")  # Admin (super admin) and Operation Head only
+def receivable_payments(rid):
+    conn = get_db()
+    r = conn.execute("SELECT sale_id FROM receivables WHERE id=?", (rid,)).fetchone()
+    if not r:
+        conn.close(); return jsonify(error="Not found"), 404
+    rows = conn.execute(
+        """SELECT p.id, p.ts, p.method, p.amount, p.reference, p.payment_source, u.name user_name
+           FROM payments p LEFT JOIN users u ON u.id=p.user_id WHERE p.sale_id=? ORDER BY p.ts, p.id""",
+        (r["sale_id"],)).fetchall()
+    conn.close()
+    return jsonify([dict(x) for x in rows])
+
+
 @app.put("/api/receivables/<int:rid>")
 @roles_required("ADMIN")  # Admin (super admin) and Operation Head only
 def update_receivable(rid):
-    """Correct a receivable's invoice #, invoice date and due date. The amount
+    """Correct a receivable's invoice #, invoice date, due date and the
+    method / reference of its payments. The amount
     can be changed only on previous-arrears entries — a regular invoice's
     amount follows its sale (edit the sale instead) so the two never drift."""
     d = request.get_json(force=True)
@@ -4087,6 +4103,28 @@ def update_receivable(rid):
                     raise ValueError("Amount must be greater than zero")
                 if amount < r["paid"] - 0.009:
                     raise ValueError(f"Amount can't be less than what's already paid ({r['paid']:.2f})")
+        # Payment method / reference corrections (amounts are not changed here).
+        pay_changes = []
+        if d.get("payments"):
+            old_pays = {p["id"]: p for p in conn.execute(
+                "SELECT * FROM payments WHERE sale_id=?", (r["sale_id"],)).fetchall()}
+            for n, p in enumerate(d["payments"], start=1):
+                try:
+                    pid = int(p.get("id"))
+                except (TypeError, ValueError):
+                    raise ValueError(f"Payment {n}: missing id")
+                if pid not in old_pays:
+                    raise ValueError(f"Payment {n} doesn't belong to this receivable")
+                method = (p.get("method") or "").strip()[:40]
+                if not method:
+                    raise ValueError(f"Payment {n}: choose the payment method")
+                ref = (p.get("reference") if p.get("reference") is not None else old_pays[pid]["reference"] or "")
+                ref = str(ref).strip()[:120]
+                op = old_pays[pid]
+                if method != op["method"] or ref != (op["reference"] or ""):
+                    conn.execute("UPDATE payments SET method=?, reference=? WHERE id=?", (method, ref, pid))
+                    pay_changes.append(f"payment {op['amount']:.2f} {op['method']} -> {method}"
+                                       + (f" ref {op['reference'] or '-'} -> {ref or '-'}" if ref != (op["reference"] or "") else ""))
         balance = round(amount - r["paid"], 2)
         conn.execute("UPDATE receivables SET invoice_no=?, invoice_date=?, due_date=?, amount=?, balance=? WHERE id=?",
                      (invoice_no, str(invoice_date), str(due_date), amount, balance, rid))
@@ -4100,6 +4138,7 @@ def update_receivable(rid):
                                 ("due date", r["due_date"], str(due_date)), ("amount", f"{r['amount']:.2f}", f"{amount:.2f}")):
             if str(old) != str(new):
                 changes.append(f"{label} {old} -> {new}")
+        changes += pay_changes
         audit(conn, "UPDATE", "RECEIVABLES", rid, f"{r['invoice_no']}: " + ("; ".join(changes) or "no changes"))
         conn.commit()
     except ValueError as e:
