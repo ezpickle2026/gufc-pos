@@ -3941,7 +3941,8 @@ def list_receivables():
     for r in rows:
         recompute_receivable_status(conn, r["id"])
     conn.commit()
-    sql = """SELECT r.*, c.name customer_name, c.account_no, s.sale_no, s.location_id, s.is_opening_balance
+    sql = """SELECT r.*, c.name customer_name, c.account_no, s.sale_no, s.location_id, s.is_opening_balance,
+                     s.total sale_total, s.withholding_tax
               FROM receivables r JOIN customers c ON c.id=r.customer_id JOIN sales s ON s.id=r.sale_id
               WHERE 1=1"""
     params = []
@@ -4047,7 +4048,8 @@ def pay_receivable(rid):
     u = session["user"]
     conn = get_db()
     r = conn.execute(
-        "SELECT r.*, s.location_id sale_location_id FROM receivables r JOIN sales s ON s.id=r.sale_id WHERE r.id=?",
+        """SELECT r.*, s.location_id sale_location_id, s.total sale_total, s.withholding_tax sale_wht
+           FROM receivables r JOIN sales s ON s.id=r.sale_id WHERE r.id=?""",
         (rid,),
     ).fetchone()
     if not r:
@@ -4056,12 +4058,28 @@ def pay_receivable(rid):
     if u["role"] not in ALL_LOCATION_FINANCE_ROLES and r["sale_location_id"] != u["location_id"]:
         conn.close()
         return jsonify(error="Forbidden: this receivable belongs to another location"), 403
-    if amount <= 0 or amount > r["balance"] + 0.009:
+    # 1% withholding tax deducted by the customer on collection: same as the
+    # POS (gross / 1.12 x 1% of the sale total). It lowers the invoice and the
+    # sale's amount due, so the receivable is settled by cash + Form 2307.
+    wht = 0.0
+    if d.get("withholding_tax"):
+        if (r["sale_wht"] or 0) > 0:
+            conn.close()
+            return jsonify(error=f"Withholding tax was already deducted on this invoice ({r['sale_wht']:.2f})"), 400
+        wht = compute_withholding_tax(r["sale_total"])
+        if wht > r["balance"] + 0.009:
+            conn.close()
+            return jsonify(error=f"Withholding tax ({wht:.2f}) is more than the outstanding balance ({r['balance']:.2f})"), 400
+    balance = round(r["balance"] - wht, 2)
+    if amount <= 0 or amount > balance + 0.009:
         conn.close()
-        return jsonify(error=f"Payment must be > 0 and <= outstanding balance ({r['balance']:.2f})"), 400
+        return jsonify(error=f"Payment must be > 0 and <= outstanding balance ({balance:.2f})"), 400
     new_paid = round(r["paid"] + amount, 2)
-    new_balance = round(r["balance"] - amount, 2)
-    conn.execute("UPDATE receivables SET paid=?, balance=? WHERE id=?", (new_paid, new_balance, rid))
+    new_balance = round(balance - amount, 2)
+    conn.execute("UPDATE receivables SET amount=?, paid=?, balance=? WHERE id=?",
+                 (round(r["amount"] - wht, 2), new_paid, new_balance, rid))
+    if wht:
+        conn.execute("UPDATE sales SET withholding_tax=?, balance = balance - ? WHERE id=?", (wht, wht, r["sale_id"]))
     conn.execute(
         "INSERT INTO payments (sale_id, method, amount, reference, user_id, payment_source) VALUES (?,?,?,?,?,'AR_COLLECTION')",
         (r["sale_id"], method, amount, d.get("reference") or f"AR-{r['invoice_no']}", session["user"]["id"]),
@@ -4069,10 +4087,11 @@ def pay_receivable(rid):
     conn.execute("UPDATE sales SET paid = paid + ?, balance = balance - ? WHERE id=?",
                  (amount, amount, r["sale_id"]))
     recompute_receivable_status(conn, rid)
-    audit(conn, "PAYMENT", "RECEIVABLES", rid, f"{r['invoice_no']} +{amount} via {method}")
+    audit(conn, "PAYMENT", "RECEIVABLES", rid,
+          f"{r['invoice_no']} +{amount} via {method}" + (f", less 1% WHT {wht}" if wht else ""))
     conn.commit()
     conn.close()
-    return jsonify(ok=True, paid=new_paid, balance=new_balance)
+    return jsonify(ok=True, paid=new_paid, balance=new_balance, withholding_tax=wht)
 
 
 @app.get("/api/receivables/<int:rid>/payments")
