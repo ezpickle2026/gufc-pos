@@ -3349,8 +3349,11 @@ async function renderReports(c) {
 // ================================================================== ADMIN: USERS
 async function renderUsers(c) {
   const canManage = isAdminLike() || state.user.role === "MANAGER";
+  // Share Login is for the System Administrator account only (not Operation Head).
+  const isSysAdmin = state.user.role === "ADMIN";
   c.innerHTML = `<div style="margin-bottom:12px">${canManage ? `<button class="btn green" id="newUserBtn">+ New User</button>` : ""}</div><div id="usersTable">Loading...</div>`;
   let allRoles = [];
+  let lastRows = [];
   function roleOptions(selected) {
     // Only Admin can give out ADMIN; only Admin / Operation Head can give out OPERATION_HEAD.
     const me = state.user.role;
@@ -3361,6 +3364,7 @@ async function renderUsers(c) {
   async function load() {
     allRoles = await api("/roles");
     const rows = await api("/users");
+    lastRows = rows;
     document.getElementById("usersTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
       <th>Username</th><th>Name</th><th>Role</th><th>Location</th><th>Status</th>${canManage ? "<th></th>" : ""}
     </tr></thead><tbody>
@@ -3371,6 +3375,7 @@ async function renderUsers(c) {
           ${u.active ? `<button class="btn small danger" onclick="disableUser(${u.id})">Disable</button>`
                      : `<button class="btn small" onclick="enableUser(${u.id})">Enable</button>`}
           <button class="btn small danger" onclick="deleteUserRow(${u.id})">Delete</button>
+          ${isSysAdmin && u.id !== state.user.id ? `<button class="btn small blue" onclick="shareUserCredentials(${u.id})">Share Login</button>` : ""}
         </td>` : ""}</tr>`).join("")}
     </tbody></table></div>`;
   }
@@ -3432,6 +3437,39 @@ async function renderUsers(c) {
     window.enableUser = async (id) => {
       try { await api(`/users/${id}/enable`, { method: "POST" }); toast("User re-enabled", "success"); load(); }
       catch (e) {}
+    };
+    window.shareUserCredentials = (id) => {
+      if (!isSysAdmin) return;
+      const row = lastRows.find(x => x.id === id);
+      if (!row) return;
+      openModal("Share Login", `
+        <p>Login details for <b>${esc(row.name)}</b> (<b>${esc(row.username)}</b>).</p>
+        <p style="color:var(--muted);font-size:13px">Passwords are stored encrypted, so the current one can't be shown.
+          Continuing sets a <b>new temporary password</b>. Their old password will stop working.</p>
+        <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
+          <button class="btn green" id="shGo">Generate &amp; Share</button></div>`, () => {
+        document.getElementById("shGo").addEventListener("click", async () => {
+          let r;
+          try { r = await api(`/users/${id}/share-credentials`, { method: "POST" }); } catch (e) { return; }
+          const link = location.origin + "/";
+          const text = `GUFC POS Login\nLink: ${link}\nUsername: ${r.username}\nPassword: ${r.password}`;
+          closeModal();
+          openModal("Share Login", `
+            <p>Send these to <b>${esc(r.name)}</b>. The password is not shown again.</p>
+            ${r.active ? "" : `<p style="color:var(--danger,#c0392b);font-size:13px">This account is <b>disabled</b>. Enable it first or they can't log in.</p>`}
+            <div class="card" style="font-size:14px;line-height:1.8">Link: <b>${esc(link)}</b><br>Username: <b>${esc(r.username)}</b><br>Password: <b style="font-family:monospace">${esc(r.password)}</b></div>
+            <div class="modal-actions">
+              ${navigator.share ? `<button class="btn" id="shShare">Share…</button>` : ""}
+              <button class="btn" id="shCopy">Copy</button>
+              <button class="btn green" onclick="closeModal()">Done</button></div>`, () => {
+            document.getElementById("shCopy").addEventListener("click", () =>
+              navigator.clipboard.writeText(text).then(() => toast("Copied", "success"), () => toast("Copy failed. Select and copy the text manually.", "error")));
+            const sh = document.getElementById("shShare");
+            if (sh) sh.addEventListener("click", () => navigator.share({ title: "GUFC POS Login", text }).catch(() => {}));
+          });
+          toast("New temporary password set", "success");
+        });
+      });
     };
     window.deleteUserRow = async (id) => {
       if (!confirm("Permanently delete this user? This only works if they have no activity on record.")) return;

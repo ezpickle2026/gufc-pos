@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import re
+import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -6002,6 +6003,31 @@ def update_user(uid):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# Readable temporary passwords: no 0/O/1/l/I to avoid mix-ups when typed.
+_TEMP_PW_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+
+
+@app.post("/api/users/<int:uid>/share-credentials")
+@admin_only
+def share_user_credentials(uid):
+    """System Administrator only. Passwords are stored hashed, so the current
+    one can't be shown. This sets a fresh temporary password and returns it
+    once so the admin can send the login details to the user."""
+    if uid == session["user"]["id"]:
+        return jsonify(error="Use Edit to change your own password"), 400
+    conn = get_db()
+    row = conn.execute("SELECT id, username, name, active FROM users WHERE id=?", (uid,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Not found"), 404
+    password = "".join(secrets.choice(_TEMP_PW_CHARS) for _ in range(10))
+    conn.execute("UPDATE users SET password_hash=? WHERE id=?", (generate_password_hash(password), uid))
+    audit(conn, "UPDATE", "USERS", uid, "credentials shared (new temporary password)")
+    conn.commit()
+    conn.close()
+    return jsonify(username=row["username"], name=row["name"], active=bool(row["active"]), password=password)
 
 
 @app.post("/api/users/<int:uid>/disable")
