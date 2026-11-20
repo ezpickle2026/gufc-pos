@@ -2070,7 +2070,7 @@ window.openCustomerLedger = async (cid) => {
         Previous arrears ${money(data.previous_arrears)}${data.balance_forward ? ` &middot; balance forward (before From) ${money(data.balance_forward)}` : ""}</div>` : ""}
       <div class="table-wrap" style="margin:8px 0"><table><thead><tr><th>Date</th><th>Type</th><th>Reference</th><th>Charges</th><th>Payments</th><th>Balance</th></tr></thead><tbody>
         ${data.entries.length ? data.entries.map(e => `<tr><td>${e.date}</td>
-          <td><span class="badge ${e.type === 'PAYMENT' ? 'green' : 'warn'}">${e.type}</span></td><td>${esc(e.ref)}</td>
+          <td><span class="badge ${e.credit ? 'green' : 'warn'}">${e.type}</span></td><td>${esc(e.ref)}</td>
           <td>${e.debit ? money(e.debit) : ""}</td><td>${e.credit ? money(e.credit) : ""}</td><td>${money(e.balance)}</td></tr>`).join("")
           : `<tr><td colspan="6" style="color:var(--muted)">No activity in this range.</td></tr>`}
       </tbody></table></div>
@@ -4840,6 +4840,17 @@ async function renderRoles(c) {
 }
 
 // ================================================================== COMMERCIAL 50kg BILLING
+// Meter READING: usage (current - previous) x this fixed factor = kg, billed
+// at the account's rate per kg. Mirrors READING_KG_FACTOR on the server.
+const READING_KG_FACTOR = 5.3584;
+const fmtNum = (n, dp = 4) => (n === null || n === undefined) ? "—" : String(Math.round(n * 10 ** dp) / 10 ** dp);
+// Unit of a commercial billing record's consumption: kg, except READING
+// bills made before the kg factor (billed per meter unit).
+const cdUnit = (d) => d.billing_type !== "READING" || d.reading_kg_factor ? "kg" : "unit(s)";
+const readingUsage = (d) => Math.round((d.current_reading - d.previous_reading) * 10000) / 10000;
+const readingKgLine = (d) => d.reading_kg_factor
+  ? `${d.current_reading} &minus; ${d.previous_reading} = <b>${fmtNum(readingUsage(d))}</b> usage &times; ${d.reading_kg_factor} = <b>${fmtNum(d.total_consumption_weight)} kg</b>`
+  : `${fmtNum(readingUsage(d))} unit(s)`;
 async function renderCommercialDeliveries(c) {
   const role = state.user.role;
   const canCreate = hasModule("commercial_deliveries");
@@ -4866,7 +4877,7 @@ async function renderCommercialDeliveries(c) {
         <td>${d.source_sale_no ? `<span class="badge gray" title="Generated from this POS sale">${esc(d.source_sale_no)}</span><br>` : ""}${d.billing_type === 'WIWO' ? `${d.cylinders.length} cylinder(s), ${d.total_net_weight_in}kg in`
               : d.billing_type === 'DR' ? `${d.dr_ref ? 'DR ' + esc(d.dr_ref) + ': ' : ''}${d.delivered_qty} delivered, ${d.cylinders.length} pulled out (${d.total_residual_kg || 0}kg residual)`
               : `${esc(d.meter_label || 'meter')}: ${d.previous_reading} \u2192 ${d.current_reading}`}</td>
-        <td>${d.total_consumption_weight !== null ? d.total_consumption_weight + (d.billing_type !== 'READING' ? ' kg' : '') : '—'}</td>
+        <td>${d.total_consumption_weight !== null ? fmtNum(d.total_consumption_weight, 2) + ' ' + cdUnit(d) : '—'}</td>
         <td>${d.billed_amount ? money(d.billed_amount) : '—'}</td>
         <td><span class="badge ${statusColor(d.status)}">${d.status}</span></td>
         <td style="display:flex;gap:6px;flex-wrap:wrap">
@@ -4941,7 +4952,8 @@ async function renderCommercialDeliveries(c) {
           <div class="field"><label>Previous Reading <span id="cdPrevSrc" style="font-weight:400;color:var(--muted)"></span></label>
             <input type="number" step="0.01" id="cdPrevReading" readonly placeholder="Set the beginning reading first" style="background:var(--bg)"></div>
           <div class="field"><label>Current Reading</label><input type="number" step="0.01" id="cdCurrReading"></div>
-          <div class="field"><b>Consumption:</b> <span id="cdConsumptionPreview">—</span></div>
+          <div class="field"><b>Usage in kg:</b> <span id="cdConsumptionPreview">—</span>
+            <div style="font-size:12px;color:var(--muted)">(Current &minus; Previous) &times; ${READING_KG_FACTOR} = kg, billed at the account's rate per kg</div></div>
         </div>
 
         <div class="field"><label>Notes</label><input id="cdNotes"></div>
@@ -5048,8 +5060,9 @@ async function renderCommercialDeliveries(c) {
         function updateConsumptionPreview() {
           const prev = parseFloat(document.getElementById("cdPrevReading").value);
           const curr = parseFloat(document.getElementById("cdCurrReading").value);
-          document.getElementById("cdConsumptionPreview").textContent =
-            (!isNaN(prev) && !isNaN(curr)) ? (curr - prev).toFixed(2) : "—";
+          const usage = curr - prev;
+          document.getElementById("cdConsumptionPreview").innerHTML = (!isNaN(prev) && !isNaN(curr))
+            ? `${fmtNum(usage)} usage &times; ${READING_KG_FACTOR} = <b>${fmtNum(usage * READING_KG_FACTOR)} kg</b>` : "—";
         }
         document.getElementById("cdPrevReading").addEventListener("input", updateConsumptionPreview);
         document.getElementById("cdCurrReading").addEventListener("input", updateConsumptionPreview);
@@ -5171,7 +5184,7 @@ async function renderCommercialDeliveries(c) {
     ` : `
       <div class="field"><b>Meter/Tank:</b> ${esc(d.meter_label || '—')}</div>
       <div class="field"><b>Previous Reading:</b> ${d.previous_reading} &nbsp; <b>Current Reading:</b> ${d.current_reading}</div>
-      <div class="field"><b>Consumption:</b> ${d.total_consumption_weight}</div>
+      <div class="field"><b>Usage:</b> ${readingKgLine(d)}</div>
     `;
     openModal(`${d.delivery_no}`, `
       <div class="field"><b>Type:</b> <span class="badge ${typeBadge(d.billing_type)}">${d.billing_type}</span></div>
@@ -5179,7 +5192,7 @@ async function renderCommercialDeliveries(c) {
       <div class="field"><b>Location:</b> ${esc(d.location_name)} &nbsp; <b>Product:</b> ${esc(d.product_name)}</div>
       <div class="field"><b>Status:</b> <span class="badge ${statusColor(d.status)}">${d.status}</span></div>
       ${detailHtml}
-      ${d.billed_amount ? `<div class="field" style="margin-top:10px"><b>Billed:</b> ${money(d.price_per_kg)}/unit x ${d.total_consumption_weight} = ${money(d.billed_amount)}</div>` : ""}
+      ${d.billed_amount ? `<div class="field" style="margin-top:10px"><b>Billed:</b> ${fmtNum(d.total_consumption_weight)} ${cdUnit(d)} x ${money(d.price_per_kg)} = ${money(d.billed_amount)}</div>` : ""}
       <div class="modal-actions">
         <button class="btn" onclick="closeModal()">Close</button>
         <button class="btn" onclick="printCommercialDelivery(${id})">Print</button>
@@ -5234,10 +5247,12 @@ async function renderCommercialDeliveries(c) {
     let acctRate = 0;
     try { const cu = (await api("/customers?q=" + encodeURIComponent(d.account_no))).find(x => x.id === d.customer_id); acctRate = cu && cu.commercial_rate > 0 ? cu.commercial_rate : 0; } catch (e) {}
     const defaultRate = acctRate || (prod ? prod.price_per_kg : 0);
-    const unitLabel = d.billing_type === "WIWO" ? "kg" : "unit(s)";
+    const unitLabel = cdUnit(d);
+    totalConsumption = d.total_consumption_weight ?? totalConsumption;
     openModal("Generate Invoice", `
-      <div class="field"><b>Total Consumption:</b> ${totalConsumption} ${unitLabel}</div>
-      <div class="field"><label>Price per ${d.billing_type === 'WIWO' ? 'KG' : 'Unit'} ${acctRate ? `<span style="font-weight:400;color:var(--muted)">(account rate)</span>` : ""}</label>
+      ${d.billing_type === "READING" ? `<div class="field"><b>Usage:</b> ${readingKgLine(d)}</div>` : ""}
+      <div class="field"><b>Total Consumption:</b> ${fmtNum(totalConsumption)} ${unitLabel}</div>
+      <div class="field"><label>Price per ${unitLabel === 'kg' ? 'KG' : 'Unit'} ${acctRate ? `<span style="font-weight:400;color:var(--muted)">(account rate)</span>` : ""}</label>
         <input type="number" step="0.01" id="billRate" value="${defaultRate}" ${acctRate ? "readonly" : ""}></div>
       <div class="field"><b>Estimated Total:</b> <span id="billTotal">${money(totalConsumption * defaultRate)}</span></div>
       <div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>
@@ -5289,7 +5304,8 @@ async function renderCommercialDeliveries(c) {
             <td>${cy.net_weight_out ?? '—'}</td><td>${cy.consumption_weight ?? '—'}</td></tr>`).join("")}
         </table>`
       : `<div style="margin:10px 0">Meter/Tank: ${esc(d.meter_label || '—')}<br>
-          Previous Reading: ${d.previous_reading} &nbsp; Current Reading: ${d.current_reading}</div>`;
+          Previous Reading: ${d.previous_reading} &nbsp; Current Reading: ${d.current_reading}<br>
+          Usage: ${readingKgLine(d)}</div>`;
     const html = `
       <div style="max-width:640px;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:13px">
         <div style="text-align:center;margin-bottom:14px">
@@ -5307,7 +5323,7 @@ async function renderCommercialDeliveries(c) {
         </table>
         ${detailRows}
         <div style="margin-top:14px;font-size:14px">
-          <b>${d.billing_type === 'DR' ? 'Billable' : 'Total Consumption'}:</b> ${d.total_consumption_weight ?? '—'} ${d.billing_type !== 'READING' ? 'kg' : ''}<br>
+          <b>${d.billing_type === 'DR' ? 'Billable' : 'Total Consumption'}:</b> ${d.total_consumption_weight !== null && d.total_consumption_weight !== undefined ? fmtNum(d.total_consumption_weight) : '—'} ${cdUnit(d)}<br>
           ${d.price_per_kg ? `<b>Rate:</b> ${money(d.price_per_kg)}<br>` : ""}
           ${d.billed_amount ? `<b style="color:#1e9e5a">Billed Amount: ${money(d.billed_amount)}</b>` : ""}
         </div>

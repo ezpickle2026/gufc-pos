@@ -215,11 +215,18 @@ def commercial_billing_pdf(delivery, cylinders, filename):
             flow.append(table)
         total_consumption = round(delivered_kg - (delivery["total_residual_kg"] or 0), 2)
     else:
+        # Usage (current - previous) x the kg factor = kg. Bills made before
+        # the factor existed (none on record) were per meter unit.
+        factor = delivery.get("reading_kg_factor")
+        usage = round((delivery["current_reading"] or 0) - (delivery["previous_reading"] or 0), 4)
         reading_rows = [
             ["Meter / Tank", delivery["meter_label"] or "—"],
             ["Previous Reading", delivery["previous_reading"]],
             ["Current Reading", delivery["current_reading"]],
+            ["Usage (current - previous)", f"{usage:g}"],
         ]
+        if factor:
+            reading_rows.append(["Usage in kg", f"{usage:g} x {factor:g} = {round(usage * factor, 4):g} kg"])
         reading_table = Table(reading_rows, colWidths=[150, 330])
         reading_table.setStyle(TableStyle([
             ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
@@ -228,10 +235,10 @@ def commercial_billing_pdf(delivery, cylinders, filename):
             ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
         ]))
         flow.append(reading_table)
-        total_consumption = round((delivery["current_reading"] or 0) - (delivery["previous_reading"] or 0), 2)
+        total_consumption = round(usage * (factor or 1), 4)
 
     flow.append(Spacer(1, 14))
-    unit = "kg" if delivery["billing_type"] in ("WIWO", "DR") else "unit(s)"
+    unit = "kg" if delivery["billing_type"] in ("WIWO", "DR") or delivery.get("reading_kg_factor") else "unit(s)"
     summary_rows = [["Billable (delivered - residual)" if delivery["billing_type"] == "DR" else "Total Consumption",
                      f"{total_consumption} {unit}"]]
     if delivery["price_per_kg"]:

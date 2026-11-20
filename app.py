@@ -972,7 +972,8 @@ def build_customer_ledger(conn, cid, date_from=None, date_to=None, breakdown=Fal
     """Chronological charges (sales) + payments for a customer, with running balance.
     Used for both the on-screen Account Ledger and the printable Statement of Account."""
     sales = conn.execute(
-        """SELECT s.id, s.sale_no, s.ts, s.total, s.status, s.is_opening_balance, s.is_billing, r.invoice_no
+        """SELECT s.id, s.sale_no, s.ts, s.total, s.status, s.is_opening_balance, s.is_billing, r.invoice_no,
+                  s.withholding_tax, COALESCE(s.withholding_tax_ts, s.ts) wht_ts
            FROM sales s LEFT JOIN receivables r ON r.sale_id = s.id
            WHERE s.customer_id=? AND s.status='COMPLETED' ORDER BY s.ts""",
         (cid,),
@@ -998,6 +999,14 @@ def build_customer_ledger(conn, cid, date_from=None, date_to=None, breakdown=Fal
             events.append({"date": _local_ts(s["ts"]), "type": "BILLING" if s["is_billing"] else "SALE",
                            "ref": s["invoice_no"] if s["is_billing"] and s["invoice_no"] else s["sale_no"],
                            "debit": s["total"], "credit": 0})
+    # The 1% withholding tax the customer deducted (Form 2307) settles part
+    # of the charge just like a payment; without this credit line the SOA
+    # balance stays open by the WHT amount.
+    for s in sales:
+        if (s["withholding_tax"] or 0) > 0.004:
+            ref = s["invoice_no"] if (s["is_billing"] or s["is_opening_balance"]) and s["invoice_no"] else s["sale_no"]
+            events.append({"date": _local_ts(s["wht_ts"]), "type": "WITHHOLDING TAX",
+                           "ref": f"{ref} (1% WHT / Form 2307)", "debit": 0, "credit": s["withholding_tax"]})
     for p in payments:
         events.append({"date": _local_ts(p["ts"]), "type": "PAYMENT", "ref": f"{p['sale_no']} ({p['method']})", "debit": 0, "credit": p["amount"]})
     events.sort(key=lambda e: e["date"])
@@ -4079,7 +4088,8 @@ def pay_receivable(rid):
     conn.execute("UPDATE receivables SET amount=?, paid=?, balance=? WHERE id=?",
                  (round(r["amount"] - wht, 2), new_paid, new_balance, rid))
     if wht:
-        conn.execute("UPDATE sales SET withholding_tax=?, balance = balance - ? WHERE id=?", (wht, wht, r["sale_id"]))
+        conn.execute("UPDATE sales SET withholding_tax=?, withholding_tax_ts=datetime('now'), balance = balance - ? WHERE id=?",
+                     (wht, wht, r["sale_id"]))
     conn.execute(
         "INSERT INTO payments (sale_id, method, amount, reference, user_id, payment_source) VALUES (?,?,?,?,?,'AR_COLLECTION')",
         (r["sale_id"], method, amount, d.get("reference") or f"AR-{r['invoice_no']}", session["user"]["id"]),
@@ -6359,6 +6369,22 @@ def delete_hauling(hid):
 # that into a normal credit sale + receivable, reusing all the existing AR
 # machinery (aging report, SOA, payments) rather than building a parallel one.
 
+# Meter READING billing: usage (current - previous reading) x this fixed
+# factor = kg consumed, which is billed at the account's rate per kg.
+READING_KG_FACTOR = 5.3584
+
+
+def _reading_figures(row):
+    """(usage, kg) of a READING record, or (None, None) without both readings.
+    Records billed before the kg factor existed have none (NULL) and were
+    billed per meter unit, so for them kg = usage."""
+    if row["current_reading"] is None or row["previous_reading"] is None:
+        return None, None
+    usage = round(row["current_reading"] - row["previous_reading"], 4)
+    factor = row["reading_kg_factor"] or 1
+    return usage, round(usage * factor, 4)
+
+
 @app.get("/api/commercial-deliveries")
 @roles_or_module_required("ADMIN", "MANAGER", "DISPATCHER", "ACCOUNTING", module="commercial_deliveries")
 def list_commercial_deliveries():
@@ -6384,8 +6410,7 @@ def list_commercial_deliveries():
                 "SELECT * FROM commercial_pullouts WHERE delivery_id=? ORDER BY id", (r["id"],)).fetchall()]
         elif r["billing_type"] == "READING":
             total_net_in = None
-            total_consumption = round(r["current_reading"] - r["previous_reading"], 2) \
-                if r["current_reading"] is not None and r["previous_reading"] is not None else None
+            _usage, total_consumption = _reading_figures(r)
             cyls = []
         else:
             cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (r["id"],)).fetchall()
@@ -6575,19 +6600,22 @@ def create_commercial_delivery():
         # for), so this goes straight to PICKED_UP — ready to bill.
         cur = conn.execute(
             """INSERT INTO commercial_deliveries (delivery_no, customer_id, location_id, product_id, billing_type,
-                   meter_label, previous_reading, current_reading, status, pickup_date, notes, created_by, collected_by)
-               VALUES (?,?,?,?,?,?,?,?,?,datetime('now'),?,?,?)""",
+                   meter_label, previous_reading, current_reading, status, pickup_date, notes, created_by, collected_by,
+                   reading_kg_factor)
+               VALUES (?,?,?,?,?,?,?,?,?,datetime('now'),?,?,?,?)""",
             (delivery_no, d["customer_id"], location_id, d["product_id"], "READING",
              meter_label, previous_reading, current_reading, "PICKED_UP",
-             d.get("notes", ""), u["id"], u["id"]),
+             d.get("notes", ""), u["id"], u["id"], READING_KG_FACTOR),
         )
         delivery_id = cur.lastrowid
-        consumption = round(current_reading - previous_reading, 2)
+        usage = round(current_reading - previous_reading, 4)
+        consumption = round(usage * READING_KG_FACTOR, 4)
         audit(conn, "CREATE", "COMMERCIAL_DELIVERIES", delivery_id,
-              f"{delivery_no} (READING): {previous_reading} -> {current_reading} = {consumption} consumed")
+              f"{delivery_no} (READING): {current_reading} - {previous_reading} = {usage:g} usage "
+              f"x {READING_KG_FACTOR:g} = {consumption:g}kg")
         conn.commit()
         conn.close()
-        return jsonify(id=delivery_id, delivery_no=delivery_no, consumption=consumption), 201
+        return jsonify(id=delivery_id, delivery_no=delivery_no, usage=usage, consumption=consumption), 201
 
 
 @app.get("/api/commercial-deliveries/<int:did>")
@@ -6614,12 +6642,13 @@ def get_commercial_delivery(did):
     cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (did,)).fetchall()
     conn.close()
     total_consumption = None
+    reading_usage = None
     if row["billing_type"] == "READING":
-        if row["current_reading"] is not None and row["previous_reading"] is not None:
-            total_consumption = round(row["current_reading"] - row["previous_reading"], 2)
+        reading_usage, total_consumption = _reading_figures(row)
     elif row["status"] in ("PICKED_UP", "BILLED"):
         total_consumption = round(sum(c["consumption_weight"] or 0 for c in cyls), 2)
-    return jsonify({**dict(row), "cylinders": [dict(c) for c in cyls], "total_consumption_weight": total_consumption})
+    return jsonify({**dict(row), "cylinders": [dict(c) for c in cyls], "total_consumption_weight": total_consumption,
+                    "reading_usage": reading_usage})
 
 
 @app.get("/api/commercial-deliveries/<int:did>/export/pdf")
@@ -6921,7 +6950,7 @@ def bill_commercial_delivery(did):
 
     cyls = conn.execute("SELECT * FROM commercial_delivery_cylinders WHERE delivery_id=?", (did,)).fetchall()
     if delivery["billing_type"] == "READING":
-        total_consumption = round(delivery["current_reading"] - delivery["previous_reading"], 2)
+        usage, total_consumption = _reading_figures(delivery)
     else:
         total_consumption = round(sum(c["consumption_weight"] or 0 for c in cyls), 2)
     if total_consumption <= 0:
@@ -6930,9 +6959,11 @@ def bill_commercial_delivery(did):
     billed_amount = round(total_consumption * price_per_kg, 2)
     u = session["user"]
     if delivery["billing_type"] == "READING":
+        factor = delivery["reading_kg_factor"] or 1
         billing_desc = (f"Commercial meter billing for {delivery['delivery_no']} ({delivery['meter_label'] or 'meter'}): "
-                         f"{delivery['previous_reading']} -> {delivery['current_reading']} = {total_consumption} "
-                         f"@ {money_fmt(price_per_kg)}")
+                         f"{delivery['current_reading']} - {delivery['previous_reading']} = {usage:g} usage"
+                         + (f" x {factor:g} = {total_consumption:g}kg" if factor != 1 else "")
+                         + f" @ {money_fmt(price_per_kg)}/kg")
         item_label = f"{product['name']} (meter reading)"
     else:
         billing_desc = f"Commercial weight billing for {delivery['delivery_no']}: {total_consumption}kg @ {money_fmt(price_per_kg)}/kg"
