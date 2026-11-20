@@ -108,22 +108,32 @@ def soa_pdf_response(customer, entries, beginning_balance, ending_balance, filen
                                                      textColor=colors.HexColor("#555555"))))
     flow.append(Spacer(1, 8))
 
-    headers = ["Date", "Type", "Reference", "Charges", "Payments", "Balance"]
-    data = [headers]
+    # Cells are Paragraphs so long text (e.g. "WITHHOLDING TAX", a WHT
+    # reference) wraps inside its column instead of running into the next.
+    # Columns fill the full printable width (540pt on letter).
+    cell = ParagraphStyle("SoaCell", parent=styles["Normal"], fontSize=8, leading=10)
+    num = ParagraphStyle("SoaNum", parent=cell, alignment=2)
+    head = ParagraphStyle("SoaHead", parent=cell, fontName="Helvetica-Bold", textColor=colors.white)
+    head_num = ParagraphStyle("SoaHeadNum", parent=head, alignment=2)
+    data = [[Paragraph(h, head) for h in ("Date", "Type", "Reference")]
+            + [Paragraph(h, head_num) for h in ("Charges", "Payments", "Balance")]]
     for e in entries:
+        d = str(e["date"] or "")
+        date_txt = _xml_escape(d[:10]) + (f"<br/>{_xml_escape(d[11:16])}" if len(d) > 11 else "")
         data.append([
-            e["date"], e["type"], e["ref"],
-            f"{e['debit']:,.2f}" if e["debit"] else "",
-            f"{e['credit']:,.2f}" if e["credit"] else "",
-            f"{e['balance']:,.2f}",
+            Paragraph(date_txt, cell),
+            Paragraph(_xml_escape(str(e["type"] or "")), cell),
+            Paragraph(_xml_escape(str(e["ref"] or "")), cell),
+            Paragraph(f"{e['debit']:,.2f}" if e["debit"] else "", num),
+            Paragraph(f"{e['credit']:,.2f}" if e["credit"] else "", num),
+            Paragraph(f"{e['balance']:,.2f}", num),
         ])
-    table = Table(data, repeatRows=1, colWidths=[70, 60, 100, 75, 75, 75])
+    table = Table(data, repeatRows=1, colWidths=[62, 82, 160, 76, 76, 84])
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), BLUE),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("ALIGN", (3, 1), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
     ]))
