@@ -4467,9 +4467,10 @@ async function renderKpi(c) {
 // ================================================================== BOOKED ORDERS
 async function renderBookedOrders(c) {
   const role = state.user.role;
-  const canCreate = ["ADMIN", "OPERATION_HEAD", "MANAGER", "ORDER_TAKER"].includes(role);
+  // Mirrors BOOKED_ORDER_ROUTER_ROLES on the server.
+  const canCreate = ["ADMIN", "OPERATION_HEAD", "MANAGER", "ORDER_TAKER", "SUPERVISOR"].includes(role);
   const canAssign = canCreate;
-  const isAttendant = !["ADMIN", "OPERATION_HEAD", "MANAGER", "ORDER_TAKER"].includes(role);
+  const isAttendant = !canCreate;
   const publicUrl = `${location.origin}/order`;
   c.innerHTML = `
     ${canCreate ? `<div class="card" style="margin-bottom:14px;padding:12px 16px">
