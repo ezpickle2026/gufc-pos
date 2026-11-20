@@ -1097,6 +1097,29 @@ def migrate_schema():
         conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 
+    # 32. When the 1% withholding tax was deducted, so the SOA can show it as
+    #     a credit on that date (the POS sale itself, or the AR collection it
+    #     came with). Earlier AR deductions are dated from the Audit Log.
+    if not _column_exists(conn, "sales", "withholding_tax_ts"):
+        conn.execute("ALTER TABLE sales ADD COLUMN withholding_tax_ts TEXT")
+        conn.execute("""UPDATE sales SET withholding_tax_ts = (
+                            SELECT MIN(a.ts) FROM audit_logs a JOIN receivables r ON CAST(r.id AS TEXT) = a.record_id
+                            WHERE a.module='RECEIVABLES' AND a.action='PAYMENT'
+                              AND a.details LIKE '%less 1% WHT%' AND r.sale_id = sales.id)
+                        WHERE withholding_tax > 0""")
+        conn.execute("UPDATE sales SET withholding_tax_ts = ts WHERE withholding_tax > 0 AND withholding_tax_ts IS NULL")
+        conn.commit()
+
+    # 33. Meter READING billing is in kg: usage (current - previous reading)
+    #     x the kg factor = kg, billed at the account's rate per kg. The factor
+    #     is kept on each record; bills made before this (NULL) were billed per
+    #     meter unit and stay as they are.
+    if not _column_exists(conn, "commercial_deliveries", "reading_kg_factor"):
+        conn.execute("ALTER TABLE commercial_deliveries ADD COLUMN reading_kg_factor REAL")
+        conn.execute("UPDATE commercial_deliveries SET reading_kg_factor = 5.3584 "
+                     "WHERE billing_type='READING' AND status != 'BILLED'")
+        conn.commit()
+
     conn.close()
 
 
