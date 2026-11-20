@@ -608,7 +608,7 @@ DEFAULT_ROLE_PERMISSIONS = {
     ],
     "SUPERVISOR": [
         "dashboard", "sales", "inventory", "stock_import", "staff_schedule", "incident_reports",
-        "delivery_assign",
+        "delivery_assign", "booked_orders",
     ],
     "DELIVERY_DRIVER": ["driver_deliveries"],
 }
@@ -1118,6 +1118,15 @@ def migrate_schema():
         conn.execute("ALTER TABLE commercial_deliveries ADD COLUMN reading_kg_factor REAL")
         conn.execute("UPDATE commercial_deliveries SET reading_kg_factor = 5.3584 "
                      "WHERE billing_type='READING' AND status != 'BILLED'")
+        conn.commit()
+
+    # 34. Supervisor books and assigns Booked Orders like the Order Taker:
+    #     give the built-in SUPERVISOR role the module. Runs once.
+    MIGRATION_KEY = "supervisor_booked_orders"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        if conn.execute("SELECT 1 FROM roles WHERE name='SUPERVISOR'").fetchone():
+            conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES ('SUPERVISOR', 'booked_orders')")
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 
     conn.close()

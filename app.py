@@ -1081,8 +1081,15 @@ def customer_statement_export(cid):
 # Admin/Manager/Order Taker can ever create one, regardless of what modules
 # a custom role has been ticked for, so this can't be opened up by accident.
 
+# Roles that book orders and route (assign / reassign) them to a warehouse or
+# showroom, and see every booked order. Anyone else with the Booked Orders
+# module (attendants) sees only their own location's orders and can only
+# mark them fulfilled.
+BOOKED_ORDER_ROUTER_ROLES = ("ADMIN", "OPERATION_HEAD", "MANAGER", "ORDER_TAKER", "SUPERVISOR")
+
+
 @app.get("/api/booked-orders")
-@roles_or_module_required("ADMIN", "MANAGER", "ORDER_TAKER", module="booked_orders")
+@roles_or_module_required(*BOOKED_ORDER_ROUTER_ROLES, module="booked_orders")
 def list_booked_orders():
     u = session["user"]
     conn = get_db()
@@ -1091,14 +1098,7 @@ def list_booked_orders():
               LEFT JOIN locations l ON l.id=bo.showroom_location_id
               LEFT JOIN users creator ON creator.id=bo.created_by WHERE 1=1"""
     params = []
-    if u["role"] == "ORDER_TAKER":
-        # Order Takers see orders they personally booked, plus every
-        # customer-submitted order (online form or customer portal) — whether
-        # still unassigned or already routed — so they can assign it and
-        # later reassign it to a different warehouse/showroom.
-        sql += " AND (bo.created_by=? OR bo.source='CUSTOMER' OR bo.showroom_location_id IS NULL)"
-        params.append(u["id"])
-    elif u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
+    if u["role"] not in BOOKED_ORDER_ROUTER_ROLES:
         sql += " AND bo.showroom_location_id=?"
         params.append(u["location_id"])
     sql += " ORDER BY bo.order_date DESC"
@@ -1115,7 +1115,7 @@ def list_booked_orders():
 
 
 @app.post("/api/booked-orders")
-@roles_required("ADMIN", "MANAGER", "ORDER_TAKER")
+@roles_required(*BOOKED_ORDER_ROUTER_ROLES)
 def create_booked_order():
     d = request.get_json(force=True)
     items = d.get("items") or []
@@ -1141,7 +1141,7 @@ def create_booked_order():
 
 
 @app.put("/api/booked-orders/<int:oid>")
-@roles_or_module_required("ADMIN", "MANAGER", "ORDER_TAKER", module="booked_orders")
+@roles_or_module_required(*BOOKED_ORDER_ROUTER_ROLES, module="booked_orders")
 def update_booked_order(oid):
     u = session["user"]
     d = request.get_json(force=True)
@@ -1152,7 +1152,7 @@ def update_booked_order(oid):
         return jsonify(error="Not found"), 404
 
     new_status = d.get("status", order["status"])
-    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER", "ORDER_TAKER"):
+    if u["role"] not in BOOKED_ORDER_ROUTER_ROLES:
         # Attendants: can only mark orders at their own showroom as fulfilled.
         if order["showroom_location_id"] != u["location_id"]:
             conn.close()
@@ -1163,14 +1163,9 @@ def update_booked_order(oid):
         conn.execute("UPDATE booked_orders SET status=?, fulfilled_by=?, fulfilled_at=datetime('now') WHERE id=?",
                      (new_status, u["id"], oid))
     else:
-        # Admin/Manager/Order Taker can also (re)assign which location the
-        # order goes to — this is how a customer-submitted (online form or
-        # portal) order gets routed to a specific warehouse or showroom.
-        if u["role"] == "ORDER_TAKER" and not (
-                order["created_by"] == u["id"] or order["source"] == "CUSTOMER"
-                or order["showroom_location_id"] is None):
-            conn.close()
-            return jsonify(error="Forbidden: this order was booked by another staff member"), 403
+        # Admin / Manager / Order Taker / Supervisor can also (re)assign which
+        # location any order goes to — this is how a customer-submitted
+        # (online form or portal) order gets routed to a warehouse or showroom.
         new_location = d.get("showroom_location_id", order["showroom_location_id"]) or None
         if "showroom_location_id" in d and order["status"] != "PENDING":
             conn.close()
