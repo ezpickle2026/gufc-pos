@@ -3,6 +3,7 @@ Flask responses. Kept separate from app.py so the transaction-logic file stays
 focused on business rules."""
 import io
 import os
+import re
 from xml.sax.saxutils import escape as _xml_escape
 from datetime import datetime
 
@@ -13,7 +14,8 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter, landscape
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Flowable, Image as RLImage
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "static", "images", "logo.png")
 BLUE = colors.HexColor("#0b3d66")
@@ -44,6 +46,144 @@ def xlsx_response(headers, rows, filename, sheet_title="Report"):
     )
 
 
+# ---------------------------------------------------------------- table cells that wrap
+# Plain strings in a reportlab Table never wrap: long text runs into the next
+# column. Every PDF table goes through these helpers so long text wraps inside
+# its cell, the columns always fit the page, and amounts line up on the right.
+
+_NUM_RE = re.compile(r"^[-+]?(PHP\s*)?[\d,]*\.?\d+\s*(%|kg)?$")
+_BLANKISH = {"", "-", "—", "–"}
+_CELL_PAD = 4  # left / right padding of every wrapping table cell
+
+
+def _numeric_cols(data):
+    """Columns whose body values are all numbers (or blank / dash)."""
+    if len(data) < 2:
+        return set()
+    out = set()
+    for c in range(len(data[0])):
+        vals = [str(r[c]).strip() for r in data[1:] if c < len(r) and not isinstance(r[c], Flowable)]
+        vals = [v for v in vals if v not in _BLANKISH]
+        if vals and all(_NUM_RE.match(v) for v in vals):
+            out.add(c)
+    return out
+
+
+def _fit_widths(widths, avail):
+    """Scale column widths down (never up) so the table fits `avail` points."""
+    total = sum(widths)
+    if total <= avail:
+        return list(widths)
+    return [w * avail / total for w in widths]
+
+
+def _smart_widths(data, avail, font_size=8, hint=None, max_w=220):
+    """Column widths that fit `avail` without splitting words: every column
+    is at least as wide as its longest word, and the rest of the space goes
+    to the columns with longer text. `hint` (the report's own widths) is used
+    as the preferred size; without it the table fills the page width."""
+    pad = 2 * _CELL_PAD + 3  # cell padding on both sides, plus a little slack
+    mins, natural = [], []
+    for c in range(len(data[0])):
+        word, full = 0.0, 0.0
+        for i, r in enumerate(data):
+            if c >= len(r) or isinstance(r[c], Flowable):
+                continue
+            font = "Helvetica-Bold" if i == 0 else "Helvetica"
+            text = "" if r[c] is None else str(r[c])
+            for w in text.split() or [""]:
+                word = max(word, stringWidth(w, font, font_size))
+            if i:  # a header may wrap; size by the body text
+                full = max(full, stringWidth(text, font, font_size))
+        mins.append(word + pad)
+        natural.append(min(max_w, max(full, word) + pad))
+    desired = [max(h, m) for h, m in zip(hint, mins)] if hint else [max(n, m) for n, m in zip(natural, mins)]
+    total = sum(desired)
+    if total <= avail:
+        return desired if hint else [w * avail / total for w in desired]
+    if sum(mins) >= avail:
+        return [m * avail / sum(mins) for m in mins]
+    flex = [d - m for d, m in zip(desired, mins)]
+    extra = avail - sum(mins)
+    return [m + extra * f / sum(flex) for m, f in zip(mins, flex)]
+
+
+def _cell_markup(v):
+    """Escaped Paragraph text; keeps line breaks and leading-space indents
+    (e.g. sub-lines of a summary), which a Paragraph would otherwise drop."""
+    text = "" if v is None else str(v)
+    stripped = text.lstrip(" ")
+    indent = "&nbsp;" * (2 * (len(text) - len(stripped)))
+    return indent + _xml_escape(stripped).replace("\n", "<br/>")
+
+
+def _cells(data, font_size=8, right_cols=(), header=True, bold_rows=(), bold_cols=()):
+    """Turn every cell into a wrapping Paragraph. Row 0 is the (white, bold)
+    header when `header`; `bold_rows` / `bold_cols` are bold (negative row
+    indexes count from the end)."""
+    n = len(data)
+    bold_rows = {i % n for i in bold_rows} if n else set()
+    styles = {}
+
+    def style(bold, right, head):
+        key = (bold, right, head)
+        if key not in styles:
+            styles[key] = ParagraphStyle(
+                f"Cell{font_size}-{int(bold)}{int(right)}{int(head)}", fontSize=font_size, leading=font_size + 2,
+                fontName="Helvetica-Bold" if bold else "Helvetica", alignment=2 if right else 0,
+                textColor=colors.white if head else colors.black)
+        return styles[key]
+
+    out = []
+    for i, row in enumerate(data):
+        head = header and i == 0
+        out.append([v if isinstance(v, Flowable) else
+                    Paragraph(_cell_markup(v),
+                              style(head or i in bold_rows or c in bold_cols, c in right_cols, head))
+                    for c, v in enumerate(row)])
+    return out
+
+
+def _grid_table(data, widths, avail, font_size=8, right_cols=None, total_row=False):
+    """Standard GUFC report table: blue header, striped rows, wrapping cells,
+    columns fitted to the page. `right_cols` defaults to the numeric columns."""
+    if right_cols is None:
+        right_cols = _numeric_cols(data)
+    widths = _smart_widths(data, avail, font_size, hint=widths)
+    t = Table(_cells(data, font_size, right_cols, bold_rows=(-1,) if total_row else ()),
+              repeatRows=1, colWidths=widths)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), BLUE),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), _CELL_PAD),
+        ("RIGHTPADDING", (0, 0), (-1, -1), _CELL_PAD),
+    ]
+    if total_row:
+        style.append(("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e8f5ee")))
+    t.setStyle(TableStyle(style))
+    return t
+
+
+def _kv_table(rows, widths, avail, font_size=9.5, grid=True, total_color=None):
+    """Label / value table (no header): bold labels, wrapping values. With
+    `total_color` the last value is bold in that color (e.g. the billed amount)."""
+    cells = _cells(rows, font_size, header=False, bold_cols=(0,))
+    if total_color is not None and rows:
+        cells[-1][-1] = Paragraph(_xml_escape(str(rows[-1][-1])), ParagraphStyle(
+            f"KvTotal{font_size}", fontName="Helvetica-Bold", fontSize=font_size,
+            leading=font_size + 2, textColor=total_color))
+    t = Table(cells, colWidths=_fit_widths(widths, avail))
+    style = [("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]
+    if grid:
+        style.append(("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")))
+    t.setStyle(TableStyle(style))
+    return t
+
+
 def _header_flowables(title, subtitle=None):
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle("TitleGUFC", parent=styles["Title"], textColor=BLUE, fontSize=16)
@@ -70,20 +210,11 @@ def pdf_table_response(title, headers, rows, filename, subtitle=None, col_widths
     doc = SimpleDocTemplate(buf, pagesize=page_size, topMargin=36, bottomMargin=36, leftMargin=36, rightMargin=36)
     flow = _header_flowables(title, subtitle)
 
-    data = [headers] + [[str(c) for c in row] for row in rows]
-    table = Table(data, repeatRows=1, colWidths=col_widths)
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), BLUE),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    flow.append(table)
+    cell = lambda c: "" if c is None else f"{c:,.2f}" if isinstance(c, float) else str(c)
+    data = [list(headers)] + [[cell(c) for c in row] for row in rows]
+    total_row = bool(rows) and str(rows[-1][0]).strip().upper().startswith("TOTAL")
+    flow.append(_grid_table(data, col_widths, page_size[0] - 72, font_size=7.5 if len(headers) > 10 else 8,
+                            total_row=total_row))
     doc.build(flow)
     buf.seek(0)
     return send_file(buf, as_attachment=True, download_name=filename, mimetype="application/pdf")
@@ -169,12 +300,7 @@ def commercial_billing_pdf(delivery, cylinders, filename):
     ]
     if delivery["billing_type"] == "DR":
         info_rows.insert(0, ["DR No.", (delivery.get("dr_ref") or "—") + (f"  (system {delivery['sale_dr_no']})" if delivery.get("sale_dr_no") else "")])
-    info_table = Table(info_rows, colWidths=[100, 380])
-    info_table.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
+    info_table = _kv_table(info_rows, [100, 440], 540, font_size=9, grid=False)
     flow.append(info_table)
     flow.append(Spacer(1, 14))
 
@@ -186,13 +312,7 @@ def commercial_billing_pdf(delivery, cylinders, filename):
             c["net_weight_out"] if c["net_weight_out"] is not None else "—",
             c["consumption_weight"] if c["consumption_weight"] is not None else "—",
         ] for c in cylinders]
-        table = Table(data, repeatRows=1, colWidths=[90, 65, 60, 60, 65, 60, 65])
-        table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), BLUE), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTSIZE", (0, 0), (-1, -1), 8), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
-        ]))
+        table = _grid_table(data, [90, 75, 70, 70, 75, 75, 85], 540, font_size=8)
         flow.append(table)
         total_consumption = round(sum(c["consumption_weight"] or 0 for c in cylinders), 2)
     elif delivery["billing_type"] == "DR":
@@ -201,11 +321,7 @@ def commercial_billing_pdf(delivery, cylinders, filename):
             ["Delivered", f"{delivery['delivered_qty']} cylinder(s) x {delivery['kg_per_cylinder']} kg = {delivered_kg} kg"],
             ["Pulled out", f"{len(cylinders)} cylinder(s), residual {delivery['total_residual_kg'] or 0} kg"],
         ]
-        dr_table = Table(dr_rows, colWidths=[150, 330])
-        dr_table.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 9.5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5), ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
-        ]))
+        dr_table = _kv_table(dr_rows, [150, 390], 540)
         flow.append(dr_table)
         if cylinders:
             flow.append(Spacer(1, 10))
@@ -215,13 +331,7 @@ def commercial_billing_pdf(delivery, cylinders, filename):
                 c["tare_weight"] if c["tare_weight"] is not None else "—",
                 c["residual_kg"],
             ] for c in cylinders]
-            table = Table(data, repeatRows=1, colWidths=[160, 90, 90, 100])
-            table.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), BLUE), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
-            ]))
+            table = _grid_table(data, [200, 110, 110, 120], 540, font_size=8.5)
             flow.append(table)
         total_consumption = round(delivered_kg - (delivery["total_residual_kg"] or 0), 2)
     else:
@@ -237,13 +347,7 @@ def commercial_billing_pdf(delivery, cylinders, filename):
         ]
         if factor:
             reading_rows.append(["Usage in kg", f"{usage:g} x {factor:g} = {round(usage * factor, 4):g} kg"])
-        reading_table = Table(reading_rows, colWidths=[150, 330])
-        reading_table.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9.5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
-        ]))
+        reading_table = _kv_table(reading_rows, [150, 390], 540)
         flow.append(reading_table)
         total_consumption = round(usage * (factor or 1), 4)
 
@@ -255,14 +359,7 @@ def commercial_billing_pdf(delivery, cylinders, filename):
         summary_rows.append(["Rate", f"PHP {delivery['price_per_kg']:,.2f} per {unit[:-1] if unit.endswith('s') else unit}"])
     if delivery["billed_amount"]:
         summary_rows.append(["Billed Amount", f"PHP {delivery['billed_amount']:,.2f}"])
-    summary_table = Table(summary_rows, colWidths=[210, 200])
-    summary_table.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-        ("FONTNAME", (1, -1), (1, -1), "Helvetica-Bold"),
-        ("TEXTCOLOR", (1, -1), (1, -1), GREEN),
-        ("FONTSIZE", (0, 0), (-1, -1), 11),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ]))
+    summary_table = _kv_table(summary_rows, [210, 260], 540, font_size=11, grid=False, total_color=GREEN if delivery["billed_amount"] else None)
     flow.append(summary_table)
 
     if delivery["notes"]:
@@ -288,7 +385,7 @@ def _eod_for_delivery_rows(data):
     rows = [(f"Orders taken for delivery ({fd['taken']['count']})", fd["taken"]["total"]),
             (f"Delivered & counted in sales ({fd['delivered']['count']})", fd["delivered"]["total"]),
             (f"Still not delivered, not in sales ({fd['open']['count']})", fd["open"]["total"])]
-    rows += [(f"  {o['pending_no']} - {(o['customer_name'] or 'Walk-in')[:30]}", o["total"]) for o in fd["open_list"]]
+    rows += [(f"  {o['pending_no']} - {o['customer_name'] or 'Walk-in'}", o["total"]) for o in fd["open_list"]]
     return rows
 
 
@@ -303,21 +400,8 @@ def eod_pdf_response(data, filename):
     flow = _header_flowables(title, subtitle=sub)
 
     def styled(table_data, widths, total_row=False, right_from=1):
-        t = Table(table_data, repeatRows=1, colWidths=widths)
-        style = [
-            ("BACKGROUND", (0, 0), (-1, 0), BLUE),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
-            ("ALIGN", (right_from, 1), (-1, -1), "RIGHT"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
-        ]
-        if total_row:
-            style += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-                      ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e8f5ee"))]
-        t.setStyle(TableStyle(style))
-        return t
+        return _grid_table(table_data, widths, 540, font_size=8.5,
+                           right_cols=set(range(right_from, len(table_data[0]))), total_row=total_row)
 
     m = lambda n: f"{(n or 0):,.2f}"
 
@@ -370,12 +454,12 @@ def eod_pdf_response(data, filename):
     rows = [["Time", "Sale / Invoice", "Customer", "Type", "Method", "Reference", "Amount"]]
     for p in data["payments"]:
         rows.append([p["ts"][11:16], p["invoice_no"] if p["payment_source"] == "AR_COLLECTION" and p["invoice_no"] else p["sale_no"],
-                     (p["customer_name"] or "Walk-in")[:22],
+                     p["customer_name"] or "Walk-in",
                      "AR" if p["payment_source"] == "AR_COLLECTION" else "POS",
-                     p["method"], (p["reference"] or "")[:18], m(p["amount"])])
+                     p["method"], p["reference"] or "", m(p["amount"])])
     if len(rows) == 1:
         rows.append(["—", "No payments received", "", "", "", "", ""])
-    flow.append(styled(rows, [40, 100, 110, 35, 70, 90, 70], right_from=6))
+    flow.append(styled(rows, [40, 100, 115, 35, 70, 105, 75], right_from=6))
 
     flow.append(Spacer(1, 30))
     sig = Table([["______________________________", "______________________________"],
@@ -454,23 +538,10 @@ def eod_xlsx_response(data, filename):
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
-def _styled_table(table_data, widths, total_row=False, right_from=None):
-    t = Table(table_data, repeatRows=1, colWidths=widths)
-    style = [
-        ("BACKGROUND", (0, 0), (-1, 0), BLUE),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e6ea")),
-    ]
-    if right_from is not None:
-        style.append(("ALIGN", (right_from, 1), (-1, -1), "RIGHT"))
-    if total_row:
-        style += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-                  ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e8f5ee"))]
-    t.setStyle(TableStyle(style))
-    return t
+def _styled_table(table_data, widths, total_row=False, right_from=None, avail=720):
+    """Landscape-letter report table (720pt wide by default)."""
+    right = set(range(right_from, len(table_data[0]))) if right_from is not None else None
+    return _grid_table(table_data, widths, avail, font_size=8, right_cols=right, total_row=total_row)
 
 
 def swapped_pdf_response(data, subtitle, filename):
@@ -494,8 +565,8 @@ def swapped_pdf_response(data, subtitle, filename):
     flow.append(Paragraph("Swap Transactions", h3))
     rows = [["Date", "Sale #", "Location", "Cashier", "Customer", "Brand", "Size", "Qty", "Fee / Unit", "Swap Fees", "Amount"]]
     for r in data["rows"]:
-        rows.append([r["ts"][:16], r["sale_no"], r["location_name"][:17], r["cashier"][:16], (r["customer_name"] or "Walk-in")[:18],
-                     r["swap_brand"][:12], r["product_name"][:18], str(r["qty"]), m(r["swap_fee"]), m(r["swap_fee_total"]), m(r["amount"])])
+        rows.append([r["ts"][:16], r["sale_no"], r["location_name"], r["cashier"], r["customer_name"] or "Walk-in",
+                     r["swap_brand"], r["product_name"], str(r["qty"]), m(r["swap_fee"]), m(r["swap_fee_total"]), m(r["amount"])])
     if len(rows) == 1:
         rows.append(["—", "No swap sales in this period", "", "", "", "", "", "", "", "", ""])
     flow.append(_styled_table(rows, [68, 92, 80, 74, 82, 56, 82, 26, 46, 50, 64], right_from=7))
@@ -593,7 +664,7 @@ def customer_growth_pdf_response(data, subtitle, filename):
     flow.append(Paragraph(f"New Customers — {cur['label']} ({len(data['new_customers'])})", h3))
     rows = [["Account #", "Customer", "Business", "Category", "Phone", "First LPG Purchase", "Cylinders", "Amount"]]
     for c in data["new_customers"]:
-        rows.append([c["account_no"], c["name"][:28], (c.get("business_name") or "")[:28], c.get("category") or "",
+        rows.append([c["account_no"], c["name"], c.get("business_name") or "", c.get("category") or "",
                      c.get("phone") or "", c["first_purchase"], str(c["cylinders"]), m(c["amount"])])
     if len(rows) == 1:
         rows.append(["—", "No new customers in this period", "", "", "", "", "", ""])
@@ -602,7 +673,7 @@ def customer_growth_pdf_response(data, subtitle, filename):
     flow.append(Paragraph(f"Lapsed Customers — bought last period, not in {cur['label']} ({len(data['lapsed_customers'])})", h3))
     rows = [["Account #", "Customer", "Business", "Category", "Phone", "Last LPG Purchase", "Cylinders Last Period"]]
     for c in data["lapsed_customers"]:
-        rows.append([c["account_no"], c["name"][:28], (c.get("business_name") or "")[:28], c.get("category") or "",
+        rows.append([c["account_no"], c["name"], c.get("business_name") or "", c.get("category") or "",
                      c.get("phone") or "", c["last_purchase"] or "", str(c["prev_cylinders"])])
     if len(rows) == 1:
         rows.append(["—", "No lapsed customers", "", "", "", "", ""])
@@ -692,7 +763,7 @@ def customer_kg_pdf_response(data, subtitle, filename):
     rows = [["#", "Customer", "Category"] + short + ["Total kg", "Cyl.", "Avg kg/mo"]]
     for i, r in enumerate(data["rows"], 1):
         label = _xml_escape(r["name"]) + (f" <font color='#6b7785'>({_xml_escape(r['account_no'])})</font>" if r["account_no"] else "")
-        rows.append([str(i), Paragraph(label, cell_style), (r["category"] or "")[:12]] + [_kg(r["months"][ym]) for ym in months]
+        rows.append([str(i), Paragraph(label, cell_style), Paragraph(_xml_escape(r["category"] or ""), cell_style)] + [_kg(r["months"][ym]) for ym in months]
                     + [_kg(r["total_kg"]), str(r["cylinders"]), _kg(r["avg_kg_per_month"])])
     if not data["rows"]:
         rows.append(["", "No completed LPG orders by customers in this period", ""] + [""] * len(months) + ["", "", ""])
