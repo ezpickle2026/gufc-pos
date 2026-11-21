@@ -7226,16 +7226,24 @@ def _sale_commercial_qty(conn, sale_id):
                         (sale_id,)).fetchone()["q"]
 
 
+# The Assign Deliveries feature went live on this (local) date. Orders and
+# sales dated before it were already delivered the old way, so they are left
+# out of Assign Deliveries / My Deliveries (the records themselves are kept).
+DELIVERY_ASSIGN_START = "2026-11-20"
+
+
 def _open_commercial_deliveries(conn, loc):
     """Commercial 50kg deliveries with no signed record yet: For Delivery
     orders and POS sales (last 30 days) not yet billed. With the driver
     each one is assigned to (driver_id / driver_name, None if unassigned)."""
     todo = []
+    local_shift = f"{int(round(APP_TZ_OFFSET_HOURS * 60)):+d} minutes"
     sql = """SELECT ps.*, c.name customer_name, c.account_no, c.address customer_address, c.category
              FROM pending_sales ps JOIN customers c ON c.id=ps.customer_id
              WHERE ps.status='PENDING' AND LOWER(TRIM(COALESCE(c.category,'')))=?
-                   AND NOT EXISTS (SELECT 1 FROM delivery_records dr WHERE dr.pending_id=ps.id AND dr.status='SIGNED')"""
-    params = [COMMERCIAL_CATEGORY]
+                   AND NOT EXISTS (SELECT 1 FROM delivery_records dr WHERE dr.pending_id=ps.id AND dr.status='SIGNED')
+                   AND date(ps.ts, ?) >= ?"""
+    params = [COMMERCIAL_CATEGORY, local_shift, DELIVERY_ASSIGN_START]
     if loc:
         sql += " AND ps.location_id=?"; params.append(loc)
     for r in conn.execute(sql + " ORDER BY ps.ts", params).fetchall():
@@ -7248,11 +7256,12 @@ def _open_commercial_deliveries(conn, loc):
                     (SELECT COALESCE(SUM(x.qty),0) FROM sale_items x WHERE x.sale_id=s.id AND x.bill_later=1) qty
              FROM sales s JOIN customers c ON c.id=s.customer_id
              WHERE s.status='COMPLETED' AND COALESCE(s.is_billing,0)=0 AND date(s.ts) >= date('now','-30 day')
+                   AND date(s.ts, ?) >= ?
                    AND EXISTS (SELECT 1 FROM sale_items x WHERE x.sale_id=s.id AND x.bill_later=1 AND x.qty>0)
                    AND NOT EXISTS (SELECT 1 FROM commercial_deliveries cd WHERE cd.source_sale_id=s.id AND cd.status!='CANCELLED')
                    AND NOT EXISTS (SELECT 1 FROM delivery_records dr WHERE dr.status='SIGNED' AND (dr.sale_id=s.id OR
                        dr.pending_id IN (SELECT id FROM pending_sales WHERE sale_id=s.id)))"""
-    params = []
+    params = [local_shift, DELIVERY_ASSIGN_START]
     if loc:
         sql += " AND s.location_id=?"; params.append(loc)
     for r in conn.execute(sql + " ORDER BY s.ts", params).fetchall():
