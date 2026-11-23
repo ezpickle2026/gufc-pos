@@ -1818,6 +1818,7 @@ async function renderCustomers(c) {
   const categories = await api("/customer-categories");
   c.innerHTML = `<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
     <input type="text" id="custSearch" placeholder="Search customers..." style="flex:1;min-width:180px">
+    <a class="btn" id="exportCustBtn" href="/api/customers/export">Export to Excel</a>
     ${isAdmin ? `
       <button class="btn green" id="newCustBtn">+ New Customer</button>
       <button class="btn" id="manageCatBtn">Manage Categories</button>
@@ -1833,6 +1834,8 @@ async function renderCustomers(c) {
 
   let custList = [];
   async function load(q = "") {
+    const exportBtn = document.getElementById("exportCustBtn");
+    if (exportBtn) exportBtn.href = "/api/customers/export" + (q ? "?q=" + encodeURIComponent(q) : "");
     const list = custList = await api("/customers?q=" + encodeURIComponent(q));
     document.getElementById("custTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
       <th>Account #</th><th>Name</th><th>Category</th><th>Phone</th><th>Terms</th><th>Credit Limit</th><th>Status</th><th></th>

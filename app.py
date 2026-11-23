@@ -764,6 +764,35 @@ def list_customers():
     return jsonify([dict(r) for r in rows])
 
 
+@app.get("/api/customers/export")
+@login_required
+def export_customers():
+    """Every customer (or those matching the search box) as an Excel sheet."""
+    q = request.args.get("q", "").strip()
+    conn = get_db()
+    base = """SELECT c.*, ca.username portal_username, ca.active portal_active
+               FROM customers c LEFT JOIN customer_accounts ca ON ca.customer_id = c.id"""
+    if q:
+        like = f"%{q}%"
+        rows = conn.execute(
+            base + " WHERE c.name LIKE ? OR c.business_name LIKE ? OR c.account_no LIKE ? OR c.phone LIKE ? ORDER BY c.name",
+            (like, like, like, like),
+        ).fetchall()
+    else:
+        rows = conn.execute(base + " ORDER BY c.name").fetchall()
+    conn.close()
+    headers = ["Account #", "Name", "Business Name", "Phone", "Address", "Category", "Terms (days)",
+               "Credit Limit", "Commercial Rate / kg", "Status", "Portal Username", "Portal Active", "Created"]
+    data = [(r["account_no"], r["name"], r["business_name"] or "", r["phone"] or "", r["address"] or "",
+             r["category"] or "", r["terms_days"], r["credit_limit"],
+             r["commercial_rate"] if r["commercial_rate"] is not None else "",
+             r["status"], r["portal_username"] or "",
+             ("Yes" if r["portal_active"] else "No") if r["portal_username"] else "",
+             r["created_at"] or "") for r in rows]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    return xlsx_response(headers, data, f"customers-{stamp}.xlsx", "Customers")
+
+
 def _next_account_no(conn):
     row = conn.execute(
         "SELECT account_no FROM customers WHERE account_no LIKE 'ACC-%' ORDER BY CAST(SUBSTR(account_no,5) AS INTEGER) DESC LIMIT 1"
