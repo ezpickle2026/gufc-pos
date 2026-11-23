@@ -1521,6 +1521,15 @@ window.openEditSale = async (saleId) => {
     const missing = sel && !list.some(p => p.id === sel) ? `<option value="${sel}" selected>${esc(selName || "Product #" + sel)}</option>` : "";
     return missing + list.map(p => `<option value="${p.id}" ${p.id === sel ? "selected" : ""}>${esc(p.name)}</option>`).join("");
   };
+  // Valve swaps read empty-to-full: an A/S product takes a POL empty
+  // (SWAP POL-A/S), a POL product an A/S empty (SWAP A/S-POL).
+  const modeOpts = (pid, sel) => {
+    const p = state.products.find(x => x.id === pid) || {};
+    const dir = p.valve && p.valve_pair_valve ? `${p.valve_pair_valve}-${p.valve}` : "A/S-POL";
+    return [["REFILL", "REFILL"], ["DEPOSIT", "DEPOSIT"], ["SWAP", "SWAP (other brand)"],
+      ["SWAP|VALVE_OTHER", `SWAP ${dir} (other brand)`], ["SWAP|VALVE_SOLANE", `SWAP ${dir} (Solane)`]].map(([v, l]) =>
+      `<option value="${v}" ${v === sel ? "selected" : ""}>${l}</option>`).join("");
+  };
   // Commercial account on credit: 50kg gas is billed later, so its line price is only the deposit / swap fee.
   const is50 = p => /(^|[^0-9.])50\s*-?\s*kg/i.test(`${p.name || ""} ${p.sku || ""}`);
   const billLater = (p) => {
@@ -1590,10 +1599,8 @@ window.openEditSale = async (saleId) => {
       row.dataset.packageId = it.package_id || "";
       row.dataset.packageName = it.package_name || "";
       row.innerHTML = `<select class="esProd" style="flex:2.2;min-width:0;width:auto">${prodOpts(it.product_id, it.product_name)}</select>
-        <select class="esMode" style="flex:1.1;min-width:0;width:auto">
-          ${[["REFILL", "REFILL"], ["DEPOSIT", "DEPOSIT"], ["SWAP", "SWAP (other brand)"],
-             ["SWAP|VALVE_OTHER", "SWAP A/S-POL (other brand)"], ["SWAP|VALVE_SOLANE", "SWAP A/S-POL (Solane)"]].map(([v, l]) =>
-            `<option value="${v}" ${v === ((it.sale_mode || "REFILL") + (it.swap_type ? "|" + it.swap_type : "")) ? "selected" : ""}>${l}</option>`).join("")}</select>
+        <select class="esMode" style="flex:1.1;min-width:0;width:auto">${modeOpts(it.product_id,
+          (it.sale_mode || "REFILL") + (it.swap_type ? "|" + it.swap_type : ""))}</select>
         <input type="number" class="esQty" min="1" step="1" value="${it.qty || 1}" style="width:64px;flex:none">
         <input type="number" class="esPrice" min="0" step="0.01" value="${it.price ?? ""}" style="flex:1;min-width:0">
         <input type="number" class="esDisc" min="0" step="0.01" value="${it.discount_amount || 0}" style="flex:1;min-width:0">
@@ -1605,7 +1612,9 @@ window.openEditSale = async (saleId) => {
         priceIn.value = ((billLater(p) ? 0 : Number(p.price || 0)) + (modeSel.value === "DEPOSIT" ? Number(p.deposit_price || 0) : 0)).toFixed(2);
       };
       if (it.price === undefined) defaultPrice();
-      prodSel.addEventListener("change", () => { defaultPrice(); recalc(); });
+      prodSel.addEventListener("change", () => {
+        modeSel.innerHTML = modeOpts(parseInt(prodSel.value), modeSel.value); defaultPrice(); recalc();
+      });
       modeSel.addEventListener("change", () => { defaultPrice(); recalc(); });
       row.querySelectorAll("input").forEach(i => i.addEventListener("input", recalc));
       row.querySelector("button").addEventListener("click", () => { row.remove(); recalc(); });
