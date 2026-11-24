@@ -1522,12 +1522,21 @@ window.openEditSale = async (saleId) => {
     return missing + list.map(p => `<option value="${p.id}" ${p.id === sel ? "selected" : ""}>${esc(p.name)}</option>`).join("");
   };
   // Valve swaps read empty-to-full: an A/S product takes a POL empty
-  // (SWAP POL-A/S), a POL product an A/S empty (SWAP A/S-POL).
+  // (SWAP POL-A/S), a POL product an A/S empty (SWAP A/S-POL). Both
+  // directions are listed; picking the other one ("|FLIP") switches the line
+  // to the counterpart product, since the line is always the full given out.
   const modeOpts = (pid, sel) => {
     const p = state.products.find(x => x.id === pid) || {};
-    const dir = p.valve && p.valve_pair_valve ? `${p.valve_pair_valve}-${p.valve}` : "A/S-POL";
-    return [["REFILL", "REFILL"], ["DEPOSIT", "DEPOSIT"], ["SWAP", "SWAP (other brand)"],
-      ["SWAP|VALVE_OTHER", `SWAP ${dir} (other brand)`], ["SWAP|VALVE_SOLANE", `SWAP ${dir} (Solane)`]].map(([v, l]) =>
+    const valve = [];
+    if (p.valve && p.valve_pair_id) {
+      const own = `${p.valve_pair_valve}-${p.valve}`, other = `${p.valve}-${p.valve_pair_valve}`;
+      const dirs = [[own, ""], [other, "|FLIP"]].sort((a, b) => (a[0] === "A/S-POL" ? -1 : 1) - (b[0] === "A/S-POL" ? -1 : 1));
+      dirs.forEach(([d, f]) => valve.push(["SWAP|VALVE_OTHER" + f, `SWAP ${d} (other brand)`],
+                                           ["SWAP|VALVE_SOLANE" + f, `SWAP ${d} (Solane)`]));
+    } else {
+      valve.push(["SWAP|VALVE_OTHER", "SWAP A/S-POL (other brand)"], ["SWAP|VALVE_SOLANE", "SWAP A/S-POL (Solane)"]);
+    }
+    return [["REFILL", "REFILL"], ["DEPOSIT", "DEPOSIT"], ["SWAP", "SWAP (other brand)"], ...valve].map(([v, l]) =>
       `<option value="${v}" ${v === sel ? "selected" : ""}>${l}</option>`).join("");
   };
   // Commercial account on credit: 50kg gas is billed later, so its line price is only the deposit / swap fee.
@@ -1615,7 +1624,21 @@ window.openEditSale = async (saleId) => {
       prodSel.addEventListener("change", () => {
         modeSel.innerHTML = modeOpts(parseInt(prodSel.value), modeSel.value); defaultPrice(); recalc();
       });
-      modeSel.addEventListener("change", () => { defaultPrice(); recalc(); });
+      modeSel.addEventListener("change", () => {
+        if (modeSel.value.endsWith("|FLIP")) {  // other direction: line becomes the counterpart product
+          const p = state.products.find(x => x.id === parseInt(prodSel.value)) || {};
+          const mode = modeSel.value.replace("|FLIP", "");
+          if (p.valve_pair_id) {
+            if (![...prodSel.options].some(o => parseInt(o.value) === p.valve_pair_id)) {
+              const q = state.products.find(x => x.id === p.valve_pair_id) || {};
+              prodSel.insertAdjacentHTML("beforeend", `<option value="${p.valve_pair_id}">${esc(q.name || "")}</option>`);
+            }
+            prodSel.value = String(p.valve_pair_id);
+          }
+          modeSel.innerHTML = modeOpts(parseInt(prodSel.value), mode);
+        }
+        defaultPrice(); recalc();
+      });
       row.querySelectorAll("input").forEach(i => i.addEventListener("input", recalc));
       row.querySelector("button").addEventListener("click", () => { row.remove(); recalc(); });
       rowsEl.appendChild(row);
