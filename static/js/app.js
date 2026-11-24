@@ -390,6 +390,13 @@ async function renderPOS(c) {
     drawCart(locationId);
   }
 
+  function cartProductFields(prod) {
+    return {
+      product_id: prod.id, name: prod.name, base_price: prod.price, deposit_price: prod.deposit_price || 0,
+      is_cylinder: (prod.deposit_price || 0) > 0 || /cylinder|lpg/i.test(prod.category || ""),
+      valve: prod.valve || null, valve_pair_valve: prod.valve_pair_id ? prod.valve_pair_valve : null,
+    };
+  }
   function addToCart(pid, stockMap) {
     const prod = state.products.find(p => p.id === pid);
     const stock = stockMap[pid] ?? 0;
@@ -397,12 +404,7 @@ async function renderPOS(c) {
     const currentQty = existing ? existing.qty : 0;
     if (currentQty + 1 > stock) { toast(`Only ${stock} in stock for ${prod.name}`, "error"); return; }
     if (existing) existing.qty += 1;
-    else state.cart.push({
-      product_id: pid, name: prod.name, base_price: prod.price, deposit_price: prod.deposit_price || 0,
-      is_cylinder: (prod.deposit_price || 0) > 0 || /cylinder|lpg/i.test(prod.category || ""),
-      valve: prod.valve || null, valve_pair_valve: prod.valve_pair_id ? prod.valve_pair_valve : null,
-      sale_mode: "REFILL", price: prod.price, qty: 1,
-    });
+    else state.cart.push({ ...cartProductFields(prod), sale_mode: "REFILL", price: prod.price, qty: 1 });
     drawCart(locationId);
   }
 
@@ -426,6 +428,31 @@ async function renderPOS(c) {
   window.__posMode = (pid, oldMode, newMode) => {
     const item = state.cart.find(i => i.product_id === pid && i.sale_mode === oldMode);
     if (!item) return;
+    if (newMode.endsWith("|FLIP")) {
+      // Other valve direction: the full given out is the counterpart product.
+      drawCart(locationId);
+      const mode = newMode.replace("|FLIP", "");
+      const cur = state.products.find(p => p.id === pid) || {};
+      const pair = state.products.find(p => p.id === cur.valve_pair_id);
+      if (!pair) { toast(`${item.name} has no A/S or POL counterpart product`, "error"); return; }
+      const inCart = state.cart.filter(i => i.product_id === pair.id).reduce((n, i) => n + i.qty, 0);
+      const stock = stockMap[pair.id] ?? 0;
+      if (inCart + item.qty > stock) { toast(`Only ${stock} in stock for ${pair.name}`, "error"); return; }
+      const fields = cartProductFields(pair);
+      const preview = { ...item, ...fields, swap_brand: item.swap_brand, swap_fee: item.swap_fee };
+      openSwapDialog(preview, mode, (brand, fee) => {
+        const target = state.cart.find(i => i.product_id === pair.id && i.sale_mode === mode);
+        if (target) {
+          target.qty += item.qty; target.swap_brand = brand; target.swap_fee = fee;
+          target.price = target.base_price + fee;
+          state.cart = state.cart.filter(i => i !== item);
+        } else {
+          Object.assign(item, fields, { sale_mode: mode, swap_brand: brand, swap_fee: fee, price: pair.price + fee, discount_id: null });
+        }
+        drawCart(locationId);
+      });
+      return;
+    }
     if (isSwapMode(newMode)) {
       drawCart(locationId); // keep the dropdown on the old mode until confirmed
       // ask which brand is being swapped in and the swap fee first; the line
@@ -483,6 +510,17 @@ function swapModeLabel(i, m) {
   if (m === "SWAP_VALVE_OTHER") return `Swap ${valveText(i)} (other brand)`;
   if (m === "SWAP_VALVE_SOLANE") return `Swap ${valveText(i)} (Solane)`;
   return "Swap (other brand)";
+}
+// Swap options for a cart line. Valve swaps are listed both ways; the other
+// direction ("|FLIP") turns the line into the counterpart product, because a
+// line is always the full cylinder given out (an A/S full takes a POL empty).
+function cartSwapOptions(i) {
+  const out = [["SWAP", swapModeLabel(i, "SWAP")]];
+  if (!i.valve_pair_valve) return out;
+  const own = [["SWAP_VALVE_OTHER", swapModeLabel(i, "SWAP_VALVE_OTHER")], ["SWAP_VALVE_SOLANE", swapModeLabel(i, "SWAP_VALVE_SOLANE")]];
+  const flipped = [["SWAP_VALVE_OTHER|FLIP", `Swap ${i.valve} to ${i.valve_pair_valve} (other brand)`],
+                   ["SWAP_VALVE_SOLANE|FLIP", `Swap ${i.valve} to ${i.valve_pair_valve} (Solane)`]];
+  return out.concat(i.valve_pair_valve === "A/S" ? own.concat(flipped) : flipped.concat(own));
 }
 function swapLineText(i) {
   if (i.sale_mode === "SWAP_VALVE_SOLANE") return `Solane ${valveText(i)}`;
@@ -606,8 +644,8 @@ function drawCart(locationId) {
           ${i.is_cylinder ? `<select style="margin-left:6px;font-size:11px;padding:2px 4px" onchange="__posMode(${i.product_id}, '${i.sale_mode}', this.value)">
             <option value="REFILL" ${i.sale_mode === 'REFILL' ? 'selected' : ''}>Refill (exchange empty)</option>
             ${i.deposit_price > 0 ? `<option value="DEPOSIT" ${i.sale_mode === 'DEPOSIT' ? 'selected' : ''}>New/Deposit (+${money(i.deposit_price)})</option>` : ""}
-            ${["SWAP"].concat(i.valve_pair_valve ? ["SWAP_VALVE_OTHER", "SWAP_VALVE_SOLANE"] : []).map(m =>
-              `<option value="${m}" ${i.sale_mode === m ? 'selected' : ''}>${esc(swapModeLabel(i, m))}</option>`).join("")}
+            ${cartSwapOptions(i).map(([m, l]) =>
+              `<option value="${m}" ${i.sale_mode === m ? 'selected' : ''}>${esc(l)}</option>`).join("")}
           </select>` : ""}
           ${isSwapMode(i.sale_mode) ? `<br><span style="font-size:12px">Swap from <b>${esc(swapLineText(i))}</b>${i.swap_fee > 0 ? ` &middot; fee ${money(i.swap_fee)}/cyl` : " &middot; no fee"}</span>
             <button class="btn small" type="button" style="font-size:11px;padding:1px 6px" onclick="__posEditSwap(${i.product_id}, '${i.sale_mode}')">Edit</button>` : ""}
