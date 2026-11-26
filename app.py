@@ -335,7 +335,7 @@ ALL_LOCATION_FINANCE_ROLES = ("ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING"
 # Roles that dispatch between any locations (e.g. Soliven -> Madamba and
 # back), so they may read the stock of a location other than their own when
 # they ask for it by location_id.
-CROSS_LOCATION_DISPATCH_ROLES = ("SUPERVISOR",)
+CROSS_LOCATION_DISPATCH_ROLES = ("SUPERVISOR", "DISPATCHER")
 
 
 def can_view_receivables_summary(conn, role):
