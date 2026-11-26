@@ -332,6 +332,11 @@ def get_permitted_modules(conn, role):
 # just their own assigned branch.
 ALL_LOCATION_FINANCE_ROLES = ("ADMIN", "OPERATION_HEAD", "MANAGER", "ACCOUNTING")
 
+# Roles that dispatch between any locations (e.g. Soliven -> Madamba and
+# back), so they may read the stock of a location other than their own when
+# they ask for it by location_id.
+CROSS_LOCATION_DISPATCH_ROLES = ("SUPERVISOR",)
+
 
 def can_view_receivables_summary(conn, role):
     """Outstanding / overdue receivables totals on the dashboard are limited
@@ -2056,7 +2061,8 @@ def delete_incident_attachment(aid):
 def get_inventory():
     location_id = request.args.get("location_id", type=int)
     u = session["user"]
-    if not is_admin_like(u["role"]) and location_id and location_id != u["location_id"]:
+    if not is_admin_like(u["role"]) and u["role"] not in CROSS_LOCATION_DISPATCH_ROLES \
+            and location_id and location_id != u["location_id"]:
         return jsonify(error="Forbidden: not your location"), 403
     if not location_id and not is_admin_like(u["role"]):
         location_id = u["location_id"]
@@ -2175,7 +2181,8 @@ def export_inventory_movements():
 def get_empty_cylinders():
     u = session["user"]
     location_id = request.args.get("location_id", type=int)
-    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER") and location_id and location_id != u["location_id"]:
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER") + CROSS_LOCATION_DISPATCH_ROLES \
+            and location_id and location_id != u["location_id"]:
         return jsonify(error="Forbidden: not your location"), 403
     if not location_id and u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
         location_id = u["location_id"]
@@ -2200,7 +2207,8 @@ def get_swapped_empties():
     """Other-brand empties taken in on swap sales, per location / brand / size."""
     u = session["user"]
     location_id = request.args.get("location_id", type=int)
-    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER") and location_id and location_id != u["location_id"]:
+    if u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER") + CROSS_LOCATION_DISPATCH_ROLES \
+            and location_id and location_id != u["location_id"]:
         return jsonify(error="Forbidden: not your location"), 403
     if not location_id and u["role"] not in ("ADMIN", "OPERATION_HEAD", "MANAGER"):
         location_id = u["location_id"]
@@ -4389,7 +4397,7 @@ def delete_opening_balance(rid):
 # ---------------------------------------------------------------- transfers (dispatch-lite)
 
 @app.get("/api/transfers")
-@roles_or_module_required("ADMIN", "DISPATCHER", module="transfers")
+@roles_or_module_required("ADMIN", "DISPATCHER", "SUPERVISOR", module="transfers")
 def list_transfers():
     conn = get_db()
     rows = conn.execute(
@@ -4500,7 +4508,7 @@ def _dest_label(to_location, to_external):
 
 
 @app.post("/api/transfers")
-@roles_or_module_required("ADMIN", "DISPATCHER", module="transfers")
+@roles_or_module_required("ADMIN", "DISPATCHER", "SUPERVISOR", module="transfers")
 def create_transfer():
     """Dispatch full, empty and/or swapped (other-brand) empty cylinders from
     one location to another location, or out to a plant (to_external)."""
@@ -4613,7 +4621,7 @@ def cancel_transfer(tid):
 
 
 @app.post("/api/transfers/<int:tid>/receive")
-@roles_or_module_required("ADMIN", "DISPATCHER", module="transfers")
+@roles_or_module_required("ADMIN", "DISPATCHER", "SUPERVISOR", module="transfers")
 def receive_transfer(tid):
     conn = get_db()
     t = conn.execute("SELECT * FROM transfers WHERE id=?", (tid,)).fetchone()

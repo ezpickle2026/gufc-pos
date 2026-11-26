@@ -608,7 +608,7 @@ DEFAULT_ROLE_PERMISSIONS = {
     ],
     "SUPERVISOR": [
         "dashboard", "sales", "inventory", "stock_import", "staff_schedule", "incident_reports",
-        "delivery_assign", "booked_orders",
+        "delivery_assign", "booked_orders", "transfers",
     ],
     "DELIVERY_DRIVER": ["driver_deliveries"],
 }
@@ -1126,6 +1126,15 @@ def migrate_schema():
     if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
         if conn.execute("SELECT 1 FROM roles WHERE name='SUPERVISOR'").fetchone():
             conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES ('SUPERVISOR', 'booked_orders')")
+        conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
+        conn.commit()
+
+    # 35. Supervisor dispatches between any locations (Soliven <-> Madamba):
+    #     give the built-in SUPERVISOR role the Dispatch module. Runs once.
+    MIGRATION_KEY = "supervisor_transfers"
+    if not conn.execute("SELECT 1 FROM schema_migrations WHERE migration_key=?", (MIGRATION_KEY,)).fetchone():
+        if conn.execute("SELECT 1 FROM roles WHERE name='SUPERVISOR'").fetchone():
+            conn.execute("INSERT OR IGNORE INTO role_permissions (role_name, module_key) VALUES ('SUPERVISOR', 'transfers')")
         conn.execute("INSERT INTO schema_migrations (migration_key) VALUES (?)", (MIGRATION_KEY,))
         conn.commit()
 
